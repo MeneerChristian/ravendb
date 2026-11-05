@@ -9,11 +9,14 @@ public sealed class JoinIndexValidator
 {
     private readonly Func<string, JoinIndexFacts> _getIndex;
     private readonly bool _isShardedDatabase;
+    private readonly bool _indirectEnabled;
 
     /// <param name="getIndex">The index with this name, null when there is none.</param>
     /// <param name="isShardedDatabase">Whether the database is sharded.</param>
-    public JoinIndexValidator(Func<string, JoinIndexFacts> getIndex, bool isShardedDatabase)
+    /// <param name="indirectEnabled">Whether the server allows the storage mode <see cref="JoinStorageMode.Indirect"/> (Join.IndirectEnabled).</param>
+    public JoinIndexValidator(Func<string, JoinIndexFacts> getIndex, bool isShardedDatabase, bool indirectEnabled = false)
     {
+        _indirectEnabled = indirectEnabled;
         _getIndex = getIndex ?? throw new ArgumentNullException(nameof(getIndex));
         _isShardedDatabase = isShardedDatabase;
     }
@@ -27,6 +30,12 @@ public sealed class JoinIndexValidator
         List<JoinValidationError> errors = joinIndex.ValidateShape();
         if (errors.Count > 0)
             return errors;
+
+        if (joinIndex.StorageMode == JoinStorageMode.Indirect && _indirectEnabled == false)
+        {
+            errors.Add(new JoinValidationError(JoinValidationCode.InvalidDefinition, $"The storage mode {nameof(JoinStorageMode.Indirect)} is not enabled on this server (Join.IndirectEnabled)."));
+            return errors;
+        }
 
         if (_isShardedDatabase)
         {

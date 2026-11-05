@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using Raven.Client.Documents.Indexes;
 using Sparrow;
 using Voron;
 using Voron.Data.BTrees;
@@ -17,10 +18,10 @@ public static unsafe class JoinFileRows
     public static void Initialize(Transaction tx, JoinSchema schema, long seed)
     {
         Tree meta = tx.CreateTree(JoinNames.Meta);
-        meta.Add(JoinNames.FormatRow, (long)JoinStorageFormat.Version);
+        meta.Add(JoinNames.FormatRow, (long)JoinStorageFormat.VersionOf(schema.Mode));
         meta.Add(JoinNames.SchemaRow, schema.Hash);
         meta.Add(JoinNames.SeedRow, seed);
-        meta.Add(JoinNames.GenerationRow, JoinIndexGeneration.Initial.Serialize());
+        meta.Add(JoinNames.GenerationRow, JoinIndexGeneration.InitialOf(schema.Mode).Serialize());
         meta.Add(JoinNames.SeveralRow, 0L);
 
         tx.OpenContainer(JoinStorageFormat.Lists);
@@ -34,6 +35,8 @@ public static unsafe class JoinFileRows
             tx.LookupFor<Int64LookupKey>(JoinStorageFormat.InnerKeys);
             tx.LookupFor<Int64LookupKey>(JoinStorageFormat.KeyAtoms);
             tx.LookupFor<Int64LookupKey>(JoinStorageFormat.KeyCounts);
+            if (schema.HasOuterFingerprints)
+                tx.LookupFor<Int64LookupKey>(JoinStorageFormat.OuterFingerprints);
         }
 
         for (int field = 0; field < schema.FieldCount; field++)
@@ -42,6 +45,16 @@ public static unsafe class JoinFileRows
             tx.LookupFor<Int64LookupKey>(JoinStorageFormat.ListHandles(field));
             tx.LookupFor<Int64LookupKey>(JoinStorageFormat.InnerTerms(field));
         }
+    }
+
+    /// <summary>The mode of the file of the transaction: <see cref="JoinStorageMode.Auto"/> when the file has no format row or one that this build does not know, null when there is no file.</summary>
+    public static JoinStorageMode? ReadMode(Transaction tx)
+    {
+        Tree meta = tx.ReadTree(JoinNames.Meta);
+        if (meta == null)
+            return null;
+
+        return meta.TryRead(JoinNames.FormatRow, out ValueReader reader) ? JoinStorageFormat.ModeOf(*(long*)reader.Base) : JoinStorageMode.Auto;
     }
 
     public static long ReadInt64(Tree meta, Slice row)

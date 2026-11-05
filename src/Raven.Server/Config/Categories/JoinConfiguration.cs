@@ -1,5 +1,6 @@
 using System;
 using System.ComponentModel;
+using Raven.Client.Documents.Indexes;
 using Raven.Server.Config.Attributes;
 using Raven.Server.Config.Settings;
 using Sparrow;
@@ -27,6 +28,9 @@ public sealed class JoinConfiguration : ConfigurationCategory
         // 1/128 of the machine, in changes of 128 bytes: 8 MiB (65,536 changes) at 1 GB, and the million changes that a refresh always queued from 16 GB on
         // the queue of a build is a sixteenth of the machine at most: 64 MiB (524,288 changes) at 1 GB, the million changes that a build always queued from 2 GB on
         MaxQueuedListChangesInBuild = (int)Math.Clamp(totalPhysicalMemory.GetValue(SizeUnit.Bytes) / 16 / BytesPerQueuedListChange, 1024, MaxDefaultMinQueuedListChanges);
+
+        // what the resident caches may hold together: a sixteenth of the machine, at most 256 MB. The caches take what they hold, the budget only caps them
+        ResidentCacheMaxMemory = Size.Min(new Size(256, SizeUnit.Megabytes), totalPhysicalMemory / 16);
 
         // the estimated memory of a build that an auto join index may have: half of the machine at most, and at most the 512 MB of before. Not less: the estimate starts at 192 MB (Join.AutoBuildMemoryBase), so a quarter would refuse every build below 1 GB
         AutoMaxBuildMemory = Size.Min(new Size(512, SizeUnit.Megabytes), totalPhysicalMemory / 2);
@@ -105,6 +109,12 @@ public sealed class JoinConfiguration : ConfigurationCategory
     [ConfigurationEntry("Join.MaxResidualRows", ConfigurationEntryScope.ServerWideOrPerDatabase)]
     public long MaxResidualRows { get; set; }
 
+    [Description("An AND or a NOT in the sub-query of a join on a field of a join index in the storage mode Indirect checks the keys whose group has several inner entries against the inner index. " +
+                 "A query that may have more such keys than this is read by the server instead.")]
+    [DefaultValue(20_000L)]
+    [ConfigurationEntry("Join.MaxResidualKeys", ConfigurationEntryScope.ServerWideOrPerDatabase)]
+    public long MaxResidualKeys { get; set; }
+
     [Description("How long a query waits (in milliseconds) for the join index to catch up with the indexes before it reads the join as usual.")]
     [DefaultValue(100)]
     [TimeUnit(TimeUnit.Milliseconds)]
@@ -153,4 +163,28 @@ public sealed class JoinConfiguration : ConfigurationCategory
     [TimeUnit(TimeUnit.Milliseconds)]
     [ConfigurationEntry("Join.AutoBuildWaitForNonStaleInMs", ConfigurationEntryScope.ServerWideOrPerDatabase)]
     public TimeSetting AutoBuildWaitForNonStale { get; set; }
+
+    [Description("The storage mode of the lists of a join index whose definition does not name one. Expanded lists hold the outer entries of the keys that match. Indirect lists hold the keys and are only used while Join.IndirectEnabled is true. " +
+                 "A join index that was built keeps its mode; this applies to the join indexes that are built or reset afterwards. Auto (the default) chooses when the join index is built: Indirect for a join index on a field whose outer entries share their keys (Join.AutoIndirectMinRowsPerKey rows per key or more) " +
+                 "when its resident cache fits the budget and the server is not short of memory, else Expanded. Indirect is used only while Join.IndirectEnabled is true.")]
+    [DefaultValue(JoinStorageMode.Auto)]
+    [ConfigurationEntry("Join.StorageModeDefault", ConfigurationEntryScope.ServerWideOrPerDatabase)]
+    public JoinStorageMode StorageModeDefault { get; set; }
+
+    [Description("The memory (in megabytes) that the resident key-list caches of all Indirect join indexes of the server may hold together; the cache of one join index is limited by it too. 0 switches the caches off. " +
+                 "The auto join indexes are not built when the memory that the cache of the new join index would need is not left. The caches are shared by the databases of the server, so this can only be set for the server, not for a database. The default is 256 MB, or a sixteenth of the memory of the machine (or of its container limit) when that is less.")]
+    [DefaultValue(DefaultValueSetInConstructor)]
+    [SizeUnit(SizeUnit.Megabytes)]
+    [ConfigurationEntry("Join.ResidentCacheMaxMemoryInMb", ConfigurationEntryScope.ServerWideOnly)]
+    public Size ResidentCacheMaxMemory { get; set; }
+
+    [Description("The number of outer entries per key of a join index on a field from which a join index whose storage mode is Auto is built Indirect.")]
+    [DefaultValue(30)]
+    [ConfigurationEntry("Join.AutoIndirectMinRowsPerKey", ConfigurationEntryScope.ServerWideOrPerDatabase)]
+    public int AutoIndirectMinRowsPerKey { get; set; }
+
+    [Description("Allows the storage mode Indirect for a join index on a field or on the id of the inner documents: in its definition, and (for a join index on a field) as Join.StorageModeDefault. It is not released: leave it false outside of tests.")]
+    [DefaultValue(false)]
+    [ConfigurationEntry("Join.IndirectEnabled", ConfigurationEntryScope.ServerWideOrPerDatabase)]
+    public bool IndirectEnabled { get; set; }
 }

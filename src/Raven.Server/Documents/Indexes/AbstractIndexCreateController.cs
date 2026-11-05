@@ -104,7 +104,7 @@ public abstract class AbstractIndexCreateController
 
         ValidateConfiguration(definition);
 
-        List<JoinValidationError> errors = new JoinIndexValidator(GetJoinIndexFacts, IsShardedDatabase).Validate(definition.Join);
+        List<JoinValidationError> errors = new JoinIndexValidator(GetJoinIndexFacts, IsShardedDatabase, GetDatabaseConfiguration().Join.IndirectEnabled).Validate(definition.Join);
         if (errors.Count > 0)
             throw new IndexInvalidException($"Could not create the join index '{definition.Name}'.{Environment.NewLine}{JoinValidationException.BuildMessage(errors)}");
     }
@@ -237,7 +237,7 @@ public abstract class AbstractIndexCreateController
         if (IndexStore.IsValidIndexName(definition.Name, false, out var errorMessage) == false)
             throw new ArgumentException(errorMessage);
 
-        List<JoinValidationError> errors = new JoinIndexValidator(GetJoinIndexFacts, IsShardedDatabase).Validate(definition.Join);
+        List<JoinValidationError> errors = new JoinIndexValidator(GetJoinIndexFacts, IsShardedDatabase, GetDatabaseConfiguration().Join.IndirectEnabled).Validate(definition.Join);
         if (errors.Count > 0)
             throw new IndexInvalidException($"Could not create the auto join index '{definition.Name}'.{Environment.NewLine}{JoinValidationException.BuildMessage(errors)}");
 

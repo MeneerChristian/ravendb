@@ -27,5 +27,6 @@ public enum JoinRebuildReason
     EmptyTerms,
     FileReset,
     Unsupported,
-    Requested
+    Requested,
+    FormatChanged
 }

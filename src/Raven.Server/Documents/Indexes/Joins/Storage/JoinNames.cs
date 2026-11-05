@@ -10,6 +10,7 @@ public static class JoinNames
     public static readonly Slice OuterDocuments;
     public static readonly Slice InnerDocuments;
     public static readonly Slice OuterToInner;
+    public static readonly Slice OuterFingerprints;
     public static readonly Slice KeyTerms;
     public static readonly Slice InnerKeys;
     public static readonly Slice KeyAtoms;
@@ -34,6 +35,7 @@ public static class JoinNames
             OuterDocuments = Create(context, JoinStorageFormat.OuterDocuments);
             InnerDocuments = Create(context, JoinStorageFormat.InnerDocuments);
             OuterToInner = Create(context, JoinStorageFormat.OuterToInner);
+            OuterFingerprints = Create(context, JoinStorageFormat.OuterFingerprints);
             KeyTerms = Create(context, JoinStorageFormat.KeyTerms);
             InnerKeys = Create(context, JoinStorageFormat.InnerKeys);
             KeyAtoms = Create(context, JoinStorageFormat.KeyAtoms);

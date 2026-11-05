@@ -2,6 +2,7 @@ using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Text;
+using Raven.Client.Documents.Indexes;
 
 namespace Raven.Server.Documents.Indexes.Joins.Storage;
 
@@ -12,6 +13,12 @@ namespace Raven.Server.Documents.Indexes.Joins.Storage;
 public sealed class JoinIndexGeneration : IEquatable<JoinIndexGeneration>
 {
     public static readonly JoinIndexGeneration Initial = new(0, Guid.Empty, JoinCursors.Empty, Guid.Empty, JoinCursors.Empty, 0, 0);
+
+    /// <summary>The generation of a file that was initialized but not built, in the format of the mode.</summary>
+    public static JoinIndexGeneration InitialOf(JoinStorageMode mode)
+    {
+        return mode == JoinStorageMode.Indirect ? new JoinIndexGeneration(0, Guid.Empty, JoinCursors.Empty, Guid.Empty, JoinCursors.Empty, 0, 0, JoinStorageMode.Indirect, false, false) : Initial;
+    }
 
     /// <summary>The number of commits that published a generation.</summary>
     public long Serial { get; }
@@ -33,11 +40,34 @@ public sealed class JoinIndexGeneration : IEquatable<JoinIndexGeneration>
     /// The lists are an exact intermediate state of a refresh that was cut at the budget of a commit: the cursors say how far it got. It is never served, whatever the cursors say, because it
     /// holds the entries of a newer snapshot of an index than the cursors name.
     /// </summary>
-    public bool IsPartial { get; }
+    public bool IsPartial => InnerPartial || OuterPartial;
+
+    /// <summary>How the atom lists of the file hold their members. Expanded generations have the format 2, Indirect ones the format 3, which an older build refuses.</summary>
+    public JoinStorageMode Mode { get; }
+
+    /// <summary>The refresh was cut on the inner side: the atom lists are an intermediate state (see <see cref="IsPartial"/>). In the format 2 both flags are the one flag of the generation.</summary>
+    public bool InnerPartial { get; }
+
+    /// <summary>The refresh was cut on the outer side. An Indirect file serves it as it is: the atom lists do not depend on the outer entries.</summary>
+    public bool OuterPartial { get; }
 
     public JoinIndexGeneration(long serial, Guid outerEnvironmentId, JoinCursors outer, Guid innerEnvironmentId, JoinCursors inner, long innerWatermark, long publishedAtTicks, bool isPartial = false)
+        : this(serial, outerEnvironmentId, outer, innerEnvironmentId, inner, innerWatermark, publishedAtTicks, JoinStorageMode.Expanded, isPartial, isPartial)
     {
-        IsPartial = isPartial;
+    }
+
+    public JoinIndexGeneration(long serial, Guid outerEnvironmentId, JoinCursors outer, Guid innerEnvironmentId, JoinCursors inner, long innerWatermark, long publishedAtTicks,
+        JoinStorageMode mode, bool innerPartial, bool outerPartial)
+    {
+        if (mode is not (JoinStorageMode.Expanded or JoinStorageMode.Indirect))
+            throw new ArgumentOutOfRangeException(nameof(mode), mode, "A generation has a resolved storage mode.");
+
+        if (mode == JoinStorageMode.Expanded && innerPartial != outerPartial)
+            throw new ArgumentException("The format of an Expanded generation has one flag for a partial refresh.", nameof(outerPartial));
+
+        Mode = mode;
+        InnerPartial = innerPartial;
+        OuterPartial = outerPartial;
         Serial = serial;
         OuterEnvironmentId = outerEnvironmentId;
         Outer = outer;
@@ -49,7 +79,7 @@ public sealed class JoinIndexGeneration : IEquatable<JoinIndexGeneration>
 
     public JoinIndexGeneration WithSerial(long serial, long publishedAtTicks)
     {
-        return new JoinIndexGeneration(serial, OuterEnvironmentId, Outer, InnerEnvironmentId, Inner, InnerWatermark, publishedAtTicks, IsPartial);
+        return new JoinIndexGeneration(serial, OuterEnvironmentId, Outer, InnerEnvironmentId, Inner, InnerWatermark, publishedAtTicks, Mode, InnerPartial, OuterPartial);
     }
 
     /// <summary>Whether both indexes are the very ones the lists were built from, so the cursors can be compared at all.</summary>
@@ -58,20 +88,33 @@ public sealed class JoinIndexGeneration : IEquatable<JoinIndexGeneration>
     public bool Equals(JoinIndexGeneration other)
     {
         return other is not null && Serial == other.Serial && OuterEnvironmentId == other.OuterEnvironmentId && InnerEnvironmentId == other.InnerEnvironmentId &&
-               InnerWatermark == other.InnerWatermark && IsPartial == other.IsPartial && Outer.Equals(other.Outer) && Inner.Equals(other.Inner);
+               InnerWatermark == other.InnerWatermark && Mode == other.Mode && InnerPartial == other.InnerPartial && OuterPartial == other.OuterPartial && Outer.Equals(other.Outer) && Inner.Equals(other.Inner);
     }
 
     public override bool Equals(object obj) => Equals(obj as JoinIndexGeneration);
 
     public override int GetHashCode() => Serial.GetHashCode();
 
-    public override string ToString() => $"#{Serial}{(IsPartial ? " partial" : "")} outer[{OuterEnvironmentId:N}: {Outer}] inner[{InnerEnvironmentId:N}: {Inner}] watermark {InnerWatermark}";
+    public override string ToString() => $"#{Serial}{Flags()} outer[{OuterEnvironmentId:N}: {Outer}] inner[{InnerEnvironmentId:N}: {Inner}] watermark {InnerWatermark}";
 
-    private const int Format = 2;
+    private string Flags()
+    {
+        if (Mode == JoinStorageMode.Expanded)
+            return IsPartial ? " partial" : "";
+
+        return $" indirect{(InnerPartial ? " inner-partial" : "")}{(OuterPartial ? " outer-partial" : "")}";
+    }
+
+    private const int ExpandedFormat = 2;
+
+    private const int IndirectFormat = 3;
+
+    /// <summary>The format this generation is written in.</summary>
+    public int Format => Mode == JoinStorageMode.Indirect ? IndirectFormat : ExpandedFormat;
 
     public byte[] Serialize()
     {
-        int size = sizeof(int) + 2 * 16 + 3 * sizeof(long) + 1 + CursorsSize(Outer) + CursorsSize(Inner);
+        int size = sizeof(int) + 2 * 16 + 3 * sizeof(long) + 1 + CursorsSize(Outer) + CursorsSize(Inner) + (Mode == JoinStorageMode.Indirect ? 2 : 0);
         byte[] buffer = new byte[size];
         Span<byte> span = buffer;
         int pos = 0;
@@ -90,7 +133,12 @@ public sealed class JoinIndexGeneration : IEquatable<JoinIndexGeneration>
         pos += sizeof(long);
         WriteCursors(span, ref pos, Outer);
         WriteCursors(span, ref pos, Inner);
-        span[pos++] = IsPartial ? (byte)1 : (byte)0;
+        span[pos++] = InnerPartial ? (byte)1 : (byte)0;
+        if (Mode == JoinStorageMode.Indirect)
+        {
+            span[pos++] = OuterPartial ? (byte)1 : (byte)0;
+            span[pos++] = (byte)Mode;
+        }
 
         return buffer;
     }
@@ -102,8 +150,8 @@ public sealed class JoinIndexGeneration : IEquatable<JoinIndexGeneration>
     {
         int pos = 0;
         int format = BinaryPrimitives.ReadInt32LittleEndian(span.Slice(pos));
-        if (format != Format)
-            throw new InvalidOperationException($"The generation has the format {format}, expected {Format}.");
+        if (format is not (ExpandedFormat or IndirectFormat))
+            throw new InvalidOperationException($"The generation has the format {format}, expected {ExpandedFormat} or {IndirectFormat}.");
 
         pos += sizeof(int);
         long serial = BinaryPrimitives.ReadInt64LittleEndian(span.Slice(pos));
@@ -118,9 +166,16 @@ public sealed class JoinIndexGeneration : IEquatable<JoinIndexGeneration>
         pos += sizeof(long);
         JoinCursors outer = ReadCursors(span, ref pos);
         JoinCursors inner = ReadCursors(span, ref pos);
-        bool isPartial = span[pos] != 0;
+        bool innerPartial = span[pos++] != 0;
+        if (format == ExpandedFormat)
+            return new JoinIndexGeneration(serial, outerId, outer, innerId, inner, watermark, publishedAt, innerPartial);
 
-        return new JoinIndexGeneration(serial, outerId, outer, innerId, inner, watermark, publishedAt, isPartial);
+        bool outerPartial = span[pos++] != 0;
+        var mode = (JoinStorageMode)span[pos];
+        if (mode != JoinStorageMode.Indirect)
+            throw new InvalidOperationException($"The generation of the format {format} has the storage mode {(int)mode}, expected {nameof(JoinStorageMode.Indirect)}.");
+
+        return new JoinIndexGeneration(serial, outerId, outer, innerId, inner, watermark, publishedAt, mode, innerPartial, outerPartial);
     }
 
     private static int CursorsSize(JoinCursors cursors)

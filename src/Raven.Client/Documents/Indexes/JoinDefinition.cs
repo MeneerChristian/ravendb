@@ -57,6 +57,9 @@ public class JoinDefinition
         return string.IsNullOrWhiteSpace(collection) == false ? "auto:" + collection.ToLowerInvariant() : (index ?? string.Empty).ToLowerInvariant();
     }
 
+    /// <summary>How the lists of the join index hold what a sub-query matches. <see cref="JoinStorageMode.Auto"/>, the default, leaves the choice to the server.</summary>
+    public JoinStorageMode StorageMode { get; set; }
+
     /// <summary>The fields of the inner index that sub-queries filter by, at most 8. The order is part of the definition.</summary>
     public List<JoinField> Fields { get; set; } = new();
 
@@ -100,7 +103,8 @@ public class JoinDefinition
             string.Equals(OuterField, other.OuterField, StringComparison.Ordinal) == false ||
             string.Equals(InnerField, other.InnerField, StringComparison.Ordinal) == false ||
             string.Equals(InnerIndex, other.InnerIndex, StringComparison.OrdinalIgnoreCase) == false ||
-            string.Equals(InnerCollection, other.InnerCollection, StringComparison.OrdinalIgnoreCase) == false)
+            string.Equals(InnerCollection, other.InnerCollection, StringComparison.OrdinalIgnoreCase) == false ||
+            StorageMode != other.StorageMode)
             return false;
 
         return SameItems(Fields, other.Fields, static (a, b) => a.Kind == b.Kind && string.Equals(a.Field, b.Field, StringComparison.Ordinal)) &&
@@ -142,6 +146,7 @@ public class JoinDefinition
         hash.Add(InnerField, StringComparer.Ordinal);
         hash.Add(InnerIndex, StringComparer.OrdinalIgnoreCase);
         hash.Add(InnerCollection, StringComparer.OrdinalIgnoreCase);
+        hash.Add(StorageMode);
         foreach (JoinField field in Fields)
             hash.Add(field?.Field, StringComparer.Ordinal);
 
@@ -168,6 +173,7 @@ public class JoinDefinition
         copy.InnerField = InnerField;
         copy.InnerIndex = InnerIndex;
         copy.InnerCollection = InnerCollection;
+        copy.StorageMode = StorageMode;
         copy.Fields = new List<JoinField>(Fields.Count);
         copy.Groupings = new List<JoinGrouping>(Groupings.Count);
 
@@ -205,6 +211,9 @@ public class JoinDefinition
 
         json[nameof(InnerIndex)] = InnerIndex;
         json[nameof(InnerCollection)] = InnerCollection;
+        if (StorageMode != JoinStorageMode.Auto)
+            json[nameof(StorageMode)] = StorageMode.ToString();
+
         json[nameof(Fields)] = fields;
         json[nameof(Groupings)] = groupings;
     }
@@ -232,6 +241,15 @@ public class JoinDefinition
         definition.OuterCollection = outerCollection;
         json.TryGet(nameof(InnerCollection), out string innerCollection);
         definition.InnerCollection = innerCollection;
+
+        definition.StorageMode = JoinStorageMode.Auto;
+        if (json.TryGet(nameof(StorageMode), out string storageMode) && string.IsNullOrEmpty(storageMode) == false)
+        {
+            if (Enum.TryParse(storageMode, ignoreCase: false, out JoinStorageMode mode) == false || Enum.IsDefined(typeof(JoinStorageMode), mode) == false)
+                throw new JoinValidationException(JoinValidationCode.InvalidDefinition, $"The storage mode '{storageMode}' is unknown. Expected one of: {string.Join(", ", Enum.GetNames(typeof(JoinStorageMode)))}.");
+
+            definition.StorageMode = mode;
+        }
 
         definition.Fields = new List<JoinField>();
         if (json.TryGet(nameof(Fields), out BlittableJsonReaderArray fields))
@@ -272,6 +290,11 @@ public class JoinDefinition
             errors.Add(new JoinValidationError(JoinValidationCode.InvalidDefinition, $"A join on the id of the outer document ({nameof(OuterField)} '{OuterIdKey}') joins it with a field of the inner index: {nameof(InnerField)} is required."));
 
         ValidateSide(errors, InnerIndex, InnerCollection, nameof(InnerIndex), nameof(InnerCollection));
+
+        if (Enum.IsDefined(typeof(JoinStorageMode), StorageMode) == false)
+            errors.Add(new JoinValidationError(JoinValidationCode.InvalidDefinition, $"The storage mode {(int)StorageMode} is unknown."));
+        else if (StorageMode == JoinStorageMode.Indirect && JoinsOnOuterId)
+            errors.Add(new JoinValidationError(JoinValidationCode.InvalidDefinition, $"The storage mode {nameof(JoinStorageMode.Indirect)} is for a join of a field of the outer index with a field of the inner index or with the id of the inner documents, not for a join on the id of the outer document."));
 
         if (Fields == null || Groupings == null)
         {

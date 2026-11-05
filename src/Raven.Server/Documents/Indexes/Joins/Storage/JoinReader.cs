@@ -27,6 +27,7 @@ public abstract unsafe class JoinReader : IDisposable
     private Lookup<Int64LookupKey> _outerDocuments;
     private Lookup<Int64LookupKey> _innerDocuments;
     private Lookup<Int64LookupKey> _outerToInner;
+    private Lookup<Int64LookupKey> _outerFingerprints;
     private CompactTree[] _terms;
     private Lookup<Int64LookupKey>[] _innerTerms;
     private Lookup<Int64LookupKey>[] _listHandles;
@@ -80,6 +81,9 @@ public abstract unsafe class JoinReader : IDisposable
 
     public static long AtomOfGrouping(int grouping) => SlotKeyBit | (long)GroupingListSlot(grouping);
 
+    /// <summary>The atom of the list of <see cref="SeveralInnerSlot"/>: in an Indirect file the keys whose group has two or more inner entries.</summary>
+    public long AtomOfSeveralInner => SlotKeyBit | (long)SeveralInnerSlot;
+
     public static bool IsTermAtom(long atom) => (atom & SlotKeyBit) == 0;
 
     public static int FieldOfAtom(long atom) => (int)(atom >> FieldShift);
@@ -118,6 +122,16 @@ public abstract unsafe class JoinReader : IDisposable
     {
         int tag = (int)(code >> CodeShift);
         return tag == 8 ? SlotKeyBit | (code & CodeMask) : TermListKey(tag, code & CodeMask);
+    }
+
+    /// <summary>The most a key reference can be in an Indirect file: the atoms of a key are coded with 48 bits for the reference of a term, and a key is addressed the same way.</summary>
+    public const long MaxKeyRef = CodeMask;
+
+    /// <summary>Refuses a key reference that the lists of an Indirect file cannot hold.</summary>
+    public static void CheckKeyRef(long keyRef)
+    {
+        if ((ulong)keyRef > (ulong)MaxKeyRef)
+            throw new JoinUnsupportedException("The keys of the join index file are too many.");
     }
 
     private long[] LoadSlots()
@@ -164,6 +178,12 @@ public abstract unsafe class JoinReader : IDisposable
     /// <summary>Appends the keys of the inner documents that the key field of the outer entry names, ascending and without repeats, whether the documents exist or not.</summary>
     public bool TryGetOuterKeys(long outerEntryId, ref ContextBoundNativeList<long> keys) => TryReadKeyList(OuterToInner, outerEntryId, ref keys);
 
+    /// <summary>
+    /// The fingerprint of the keys of an outer entry of an Indirect file that joins on a field (see <see cref="JoinWriter.SetOuterKeys"/>). False for an entry without keys and for one whose fingerprint
+    /// is not known (a row that the build wrote in two parts).
+    /// </summary>
+    public bool TryGetOuterKeysFingerprint(long outerEntryId, out long fingerprint) => OuterFingerprints.TryGetValue(outerEntryId, out fingerprint);
+
     /// <summary>Appends the values of a row of a lookup that holds one value shifted left or the container item of several, see <see cref="JoinStorageFormat.OuterToInner"/>.</summary>
     private bool TryReadKeyList(Lookup<Int64LookupKey> lookup, long id, ref ContextBoundNativeList<long> keys)
     {
@@ -198,6 +218,9 @@ public abstract unsafe class JoinReader : IDisposable
 
     public long NumberOfJoined => OuterToInner.NumberOfEntries;
 
+    /// <summary>The number of outer entries whose fingerprint the file keeps (see <see cref="TryGetOuterKeysFingerprint"/>).</summary>
+    public long NumberOfOuterFingerprints => Schema.HasOuterFingerprints ? OuterFingerprints.NumberOfEntries : 0;
+
     public long NumberOfTerms(int field) => TermsOf(field).NumberOfEntries;
 
     /// <summary>The number of terms of the field that have a list. A term that lost its last entry stays in the dictionary but has no list.</summary>
@@ -228,6 +251,8 @@ public abstract unsafe class JoinReader : IDisposable
     protected Lookup<Int64LookupKey> InnerDocuments => _innerDocuments ??= Tx.LookupFor<Int64LookupKey>(JoinNames.InnerDocuments);
 
     protected Lookup<Int64LookupKey> OuterToInner => _outerToInner ??= Tx.LookupFor<Int64LookupKey>(JoinNames.OuterToInner);
+
+    protected Lookup<Int64LookupKey> OuterFingerprints => _outerFingerprints ??= Tx.LookupFor<Int64LookupKey>(JoinNames.OuterFingerprints);
 
     #region field join
 
@@ -294,9 +319,21 @@ public abstract unsafe class JoinReader : IDisposable
         Lists.Read(handle, ref codes);
     }
 
-    /// <summary>The number of the inner entries of the group of the key that have the atom (by its code), 0 when none has.</summary>
+    /// <summary>Whether the key has a group: some inner entry has it. A file whose keys are the ids of its inner documents has a group for the key of every document that has atoms.</summary>
+    public bool KeyHasGroup(long keyRef)
+    {
+        if (Schema.KeysAreInnerIds)
+            return KeyAtomHandles.TryGetValue(keyRef, out _);
+
+        return GetPairCount(keyRef, CodeOfAny()) > 0;
+    }
+
+    /// <summary>The number of the inner entries of the group of the key that have the atom (by its code), 0 when none has. A file whose keys are the ids of its inner documents keeps no counts.</summary>
     public int GetPairCount(long keyRef, long code)
     {
+        if (Schema.KeysAreInnerIds)
+            throw new InvalidOperationException("A file whose keys are the ids of its inner documents keeps no counts of pairs of a key and an atom: a group is one document.");
+
         long key = PairKey(keyRef, code, out long check);
         if (KeyCounts.TryGetValue(key, out long value) == false)
             return 0;
@@ -373,6 +410,27 @@ public abstract unsafe class JoinReader : IDisposable
     /// <summary>Appends the entry ids of a list, ascending.</summary>
     public void ReadList(long handle, ref ContextBoundNativeList<long> output) => Lists.Read(handle, ref output);
 
+    /// <summary>The handle of the list of an atom (see <see cref="AtomOfTerm"/>), <see cref="ListStore.EmptyHandle"/> when it has none.</summary>
+    public long AtomHandle(long atom) => IsTermAtom(atom) ? GetListHandle(FieldOfAtom(atom), TermOfAtom(atom)) : SlotHandles[SlotOfAtom(atom)];
+
+    /// <summary>Appends the references of the keys in the list of an atom, ascending (an Indirect file). Changes that a writer has queued are not in the list until it flushes.</summary>
+    public void ReadAtomKeys(long atom, ref ContextBoundNativeList<long> keyRefs)
+    {
+        if (Schema.IsIndirect == false)
+            throw new InvalidOperationException("The atom lists of an Expanded file hold outer entries, not keys.");
+
+        Lists.Read(AtomHandle(atom), ref keyRefs);
+    }
+
+    /// <summary>The number of the keys in the list of an atom (an Indirect file).</summary>
+    public long CountOfAtomKeys(long atom)
+    {
+        if (Schema.IsIndirect == false)
+            throw new InvalidOperationException("The atom lists of an Expanded file hold outer entries, not keys.");
+
+        return CountOf(AtomHandle(atom));
+    }
+
     public long CountOf(long handle) => ListStore.Count(Tx.LowLevelTransaction, handle);
 
     /// <summary>Opens a large list for the matches of Corax. The handle must be of a large list.</summary>
@@ -394,6 +452,9 @@ public abstract unsafe class JoinReader : IDisposable
             [JoinStorageFormat.InnerDocuments] = InnerDocuments.State.PageCount,
             [JoinStorageFormat.OuterToInner] = OuterToInner.State.PageCount
         };
+
+        if (Schema.HasOuterFingerprints)
+            pages[JoinStorageFormat.OuterFingerprints] = OuterFingerprints.State.PageCount;
 
         for (int field = 0; field < Schema.FieldCount; field++)
         {
