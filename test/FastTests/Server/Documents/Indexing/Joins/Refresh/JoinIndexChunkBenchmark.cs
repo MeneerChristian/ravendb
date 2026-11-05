@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
+using NativeMemory = Sparrow.Utils.NativeMemory;
 using System.Threading.Tasks;
 using Raven.Client.Documents.Operations.Indexes;
 using Raven.Server.Config;
@@ -260,6 +262,178 @@ public class JoinIndexChunkBenchmark(ITestOutputHelper output) : RavenTestBase(o
         }
     }
 
+    // Opt-in: RAVEN_JOIN_QUEUE_BENCH=<outer documents>,<outer entries per key>,<queue limit in list changes>,<setup|change>[,<Join.MinAtomEntriesForDirectWrite, default 1>[,<file>]]
+    // One process per case: "setup" writes the documents and builds the lists and stops, "change" does the same and then changes the Country of every inner document in one transaction (two list changes for each outer entry of its key), which the join index follows in one refresh.
+    // The cost of the change is the cost of the "change" process minus the cost of the "setup" process (measured from outside, for example with /usr/bin/time -l). The line it reports has the exact counters of the refresh.
+    [RavenFact(RavenTestCategory.Indexes)]
+    public async Task QueueLimitOfOneInnerChange()
+    {
+        string[] parts = (Environment.GetEnvironmentVariable("RAVEN_JOIN_QUEUE_BENCH") ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 4)
+            return;
+
+        int outer = int.Parse(parts[0]);
+        int rows = int.Parse(parts[1]);
+        int queue = int.Parse(parts[2]);
+        bool change = parts[3] == "change";
+        int inner = outer / rows;
+        string minAtomEntries = parts.Length > 4 ? parts[4] : "1";
+
+        using JoinIndexHarness h = await JoinIndexHarness.CreateFieldJoinAsync(this, new Dictionary<string, string>
+        {
+            [RavenConfiguration.GetKey(x => x.Join.MaxInnerListChangesPerOuterEntry)] = "0",
+            [RavenConfiguration.GetKey(x => x.Join.MaxQueuedListChanges)] = queue.ToString(),
+            [RavenConfiguration.GetKey(x => x.Join.MinAtomEntriesForDirectWrite)] = minAtomEntries,
+            ["Indexing.MapBatchSize"] = "5000000"
+        }, putJoin: false, runInMemory: false);
+
+        JoinIndexHarness.Context Inner(int i, int version) => new() { Code = "u" + i, Country = (i + version) % 2 == 0 ? "nl" : "de", Name = "n" + i % 5, Rank = i % 10, IsActive = i % 3 != 0, Title = "tag" + i % 3 };
+
+        await using (var bulk = h.Store.BulkInsert())
+        {
+            for (int i = 0; i < inner; i++)
+                await bulk.StoreAsync(Inner(i, 0), $"contexts/{i}");
+
+            for (int i = 0; i < outer; i++)
+                await bulk.StoreAsync(new JoinIndexHarness.Conversation { ContextId = "u" + i % inner, Title = "t" }, $"conversations/{i}");
+        }
+
+        await h.PutJoinAsync(JoinIndexHarness.FieldJoinIndexDefinition());
+        try
+        {
+            await WaitJoinAsync(h);
+        }
+        catch (TimeoutException)
+        {
+            throw new InvalidOperationException("errors of the join index: " + string.Join(" | ", h.Join().GetErrors().Select(x => x.Error)));
+        }
+
+        await WaitIndexesAsync(h);
+        JoinIndex joinIndex = h.Join();
+        JoinCounters c = joinIndex.Counters;
+        long refreshes = c.Refreshes, commits = c.Commits, flushes = c.ListFlushes, threshold = c.ThresholdFlushes, queued = c.QueuedOps, updates = c.ListUpdates, allocated = c.RefreshAllocatedBytes, ids = c.IdsProcessed;
+
+        if (change)
+        {
+            using (var session = h.Store.OpenSession())
+            {
+                for (int i = 0; i < inner; i++)
+                    session.Store(Inner(i, 1), $"contexts/{i}");
+
+                session.SaveChanges();
+            }
+
+            await WaitIndexesAsync(h);
+            await WaitJoinAsync(h);
+            Assert.True(ReferenceEquals(joinIndex, h.Join()), "the join index was reset");
+            await h.AssertCurrentAsync();
+        }
+
+        string line = $"QUEUE outer {outer} rows {rows} queue {queue} direct-write from {minAtomEntries} entries {parts[3]}: refreshes {c.Refreshes - refreshes}, commits {c.Commits - commits}, ids {c.IdsProcessed - ids}, list flushes {c.ListFlushes - flushes} (threshold {c.ThresholdFlushes - threshold}), queued ops {c.QueuedOps - queued}, list updates {c.ListUpdates - updates}, " +
+                      $"estimate of the last refresh {c.LastListChangeEstimate}, queue limit {c.LastQueueLimit}, allocated by the refreshes {c.RefreshAllocatedBytes - allocated}";
+        Report(line);
+        if (parts.Length > 5)
+            File.AppendAllText(parts[5], line + Environment.NewLine);
+    }
+
+    // Opt-in: RAVEN_JOIN_QUEUE_ROUNDS=<outer documents>,<outer entries per key>,<rounds>,<queue limits separated by ;>,<Join.MinAtomEntriesForDirectWrite>[,<file>] (macOS: the instructions retired are read from proc_pid_rusage)
+    // One process builds the lists once and then changes the Country of every inner document <rounds> times for every queue limit (the order of the limits rotates from round to round), each change being one refresh. The join index is stopped while
+    // the documents and the upstream indexes are written and started for the refresh, so what is measured, the instructions retired and the cycles of the process from the start of the join index until it is current, is the refresh and the polling of the test.
+    // The first round is a warm-up and is not reported. Every line has the exact counters of the refresh.
+    [RavenFact(RavenTestCategory.Indexes)]
+    public async Task QueueLimitsOfInnerChangesInOneProcess()
+    {
+        string[] parts = (Environment.GetEnvironmentVariable("RAVEN_JOIN_QUEUE_ROUNDS") ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 5)
+            return;
+
+        int outer = int.Parse(parts[0]);
+        int rows = int.Parse(parts[1]);
+        int rounds = int.Parse(parts[2]);
+        int[] queues = parts[3].Split(';').Select(int.Parse).ToArray();
+        int inner = outer / rows;
+
+        using JoinIndexHarness h = await JoinIndexHarness.CreateFieldJoinAsync(this, new Dictionary<string, string>
+        {
+            [RavenConfiguration.GetKey(x => x.Join.MaxInnerListChangesPerOuterEntry)] = "0",
+            [RavenConfiguration.GetKey(x => x.Join.MinAtomEntriesForDirectWrite)] = parts[4],
+            ["Indexing.MapBatchSize"] = "5000000"
+        }, putJoin: false, runInMemory: false);
+
+        JoinIndexHarness.Context Inner(int i, int version) => new() { Code = "u" + i, Country = (i + version) % 2 == 0 ? "nl" : "de", Name = "n" + i % 5, Rank = i % 10, IsActive = i % 3 != 0, Title = "tag" + i % 3 };
+
+        await using (var bulk = h.Store.BulkInsert())
+        {
+            for (int i = 0; i < inner; i++)
+                await bulk.StoreAsync(Inner(i, 0), $"contexts/{i}");
+
+            for (int i = 0; i < outer; i++)
+                await bulk.StoreAsync(new JoinIndexHarness.Conversation { ContextId = "u" + i % inner, Title = "t" }, $"conversations/{i}");
+        }
+
+        await h.PutJoinAsync(JoinIndexHarness.FieldJoinIndexDefinition());
+        await WaitJoinAsync(h);
+        await WaitIndexesAsync(h);
+        JoinIndex joinIndex = h.Join();
+        JoinCounters c = joinIndex.Counters;
+
+        int version = 0;
+        for (int round = 0; round <= rounds; round++)
+        {
+            for (int k = 0; k < queues.Length; k++)
+            {
+                int queue = queues[(k + round) % queues.Length];
+                version++;
+                await h.Store.Maintenance.SendAsync(new StopIndexOperation(JoinIndexHarness.JoinName));
+                await Task.Delay(300);
+                using (var session = h.Store.OpenSession())
+                {
+                    for (int i = 0; i < inner; i++)
+                        session.Store(Inner(i, version), $"contexts/{i}");
+
+                    session.SaveChanges();
+                }
+
+                await WaitIndexesAsync(h);
+                await Task.Delay(300);
+                joinIndex.Options.MaxQueuedListChanges = queue;
+                long refreshes = c.Refreshes, commits = c.Commits, flushes = c.ListFlushes, threshold = c.ThresholdFlushes, queued = c.QueuedOps, updates = c.ListUpdates, allocated = c.RefreshAllocatedBytes, ids = c.IdsProcessed;
+                (ulong instructions, ulong cycles) = ProcessCounters();
+                var sw = Stopwatch.StartNew();
+                await h.Store.Maintenance.SendAsync(new StartIndexOperation(JoinIndexHarness.JoinName));
+                await WaitJoinAsync(h, pollMilliseconds: 50);
+                (ulong instructionsAfter, ulong cyclesAfter) = ProcessCounters();
+                double wall = sw.Elapsed.TotalSeconds;
+                Assert.True(ReferenceEquals(joinIndex, h.Join()), "the join index was reset");
+                Assert.Equal(queue, c.LastQueueLimit);
+                if (round == 0)
+                    continue;
+
+                string line = $"ROUND {round} outer {outer} rows {rows} direct-write from {parts[4]} queue {queue}: instructions {instructionsAfter - instructions}, cycles {cyclesAfter - cycles}, wall {wall:F2} s, refreshes {c.Refreshes - refreshes}, commits {c.Commits - commits}, ids {c.IdsProcessed - ids}, " +
+                              $"list flushes {c.ListFlushes - flushes} (threshold {c.ThresholdFlushes - threshold}), queued ops {c.QueuedOps - queued}, list updates {c.ListUpdates - updates}, allocated by the refreshes {c.RefreshAllocatedBytes - allocated}";
+                Report(line);
+                if (parts.Length > 5)
+                    File.AppendAllText(parts[5], line + Environment.NewLine);
+            }
+        }
+
+        await h.AssertCurrentAsync();
+    }
+
+    [DllImport("libproc", EntryPoint = "proc_pid_rusage")]
+    private static extern unsafe int ProcPidRusage(int pid, int flavor, byte* buffer);
+
+    /// <summary>The instructions retired and the cycles of all threads of the process since it started (RUSAGE_INFO_V4 of macOS, fields 29 and 30 after the 16 bytes of the uuid).</summary>
+    private static unsafe (ulong Instructions, ulong Cycles) ProcessCounters()
+    {
+        const int RusageInfoV4 = 4;
+        ulong* buffer = stackalloc ulong[64];
+        if (ProcPidRusage(Environment.ProcessId, RusageInfoV4, (byte*)buffer) != 0)
+            throw new InvalidOperationException("proc_pid_rusage failed");
+
+        return (buffer[2 + 29], buffer[2 + 30]);
+    }
+
     /// <summary>The native memory that Raven allocated and the anonymous memory of the cgroup (in a container) above what they were at the start, sampled every 100 ms.</summary>
     private sealed class MemorySampler : IDisposable
     {
@@ -354,7 +528,7 @@ public class JoinIndexChunkBenchmark(ITestOutputHelper output) : RavenTestBase(o
         throw new TimeoutException("the indexes stayed stale");
     }
 
-    private static async Task<TimeSpan> WaitJoinAsync(JoinIndexHarness h)
+    private static async Task<TimeSpan> WaitJoinAsync(JoinIndexHarness h, int pollMilliseconds = 20)
     {
         var sw = Stopwatch.StartNew();
         var until = DateTime.UtcNow.AddMinutes(5);
@@ -364,7 +538,7 @@ public class JoinIndexChunkBenchmark(ITestOutputHelper output) : RavenTestBase(o
             if (stats.IsStale == false && stats.Status == Raven.Client.Documents.Indexes.IndexRunningStatus.Running)
                 return sw.Elapsed;
 
-            await Task.Delay(20);
+            await Task.Delay(pollMilliseconds);
         }
 
         JoinCounters c = h.Join().Counters;
