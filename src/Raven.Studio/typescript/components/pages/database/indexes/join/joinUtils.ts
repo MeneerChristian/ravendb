@@ -1,6 +1,7 @@
 import IndexDefinition = Raven.Client.Documents.Indexes.IndexDefinition;
 import JoinDefinition = Raven.Client.Documents.Indexes.JoinDefinition;
 import JoinFieldKind = Raven.Client.Documents.Indexes.JoinFieldKind;
+import JoinStorageMode = Raven.Client.Documents.Indexes.JoinStorageMode;
 
 // the limits of Raven.Client.Documents.Indexes.JoinLimits
 export const joinLimits = {
@@ -14,6 +15,8 @@ export const joinLimits = {
 export const joinOuterIdKey = "id()";
 
 export const joinFieldKinds: JoinFieldKind[] = ["Exact", "Long", "Text"];
+
+export const joinStorageModes: JoinStorageMode[] = ["Auto", "Expanded", "Indirect"];
 
 export interface JoinFieldFormData {
     field: string;
@@ -32,6 +35,7 @@ export interface JoinFormData {
     outerOnId: boolean;
     innerIndex: string;
     innerField: string;
+    storageMode: JoinStorageMode;
     fields: JoinFieldFormData[];
     groupings: JoinGroupingFormData[];
 }
@@ -44,6 +48,7 @@ export function emptyJoinForm(): JoinFormData {
         outerOnId: false,
         innerIndex: "",
         innerField: "",
+        storageMode: "Auto",
         fields: [],
         groupings: [],
     };
@@ -60,6 +65,7 @@ export function joinFormFromDefinition(definition: IndexDefinition): JoinFormDat
         outerOnId,
         innerIndex: joinIndex.InnerIndex ?? "",
         innerField: joinIndex.InnerField ?? "",
+        storageMode: joinIndex.StorageMode ?? "Auto",
         fields: (joinIndex.Fields ?? []).map((x) => ({ field: x.Field, kind: x.Kind })),
         groupings: (joinIndex.Groupings ?? []).map((x) => ({ field: x.Field, value: x.Value })),
     };
@@ -73,6 +79,7 @@ export function joinDefinitionFromForm(form: JoinFormData): JoinDefinition {
         InnerIndex: form.innerIndex.trim(),
         InnerCollection: null,
         InnerField: form.innerField.trim() === "" ? null : form.innerField.trim(),
+        StorageMode: form.storageMode,
         Fields: form.fields.map((x) => ({ Field: x.field.trim(), Kind: x.kind })),
         Groupings: form.groupings.map((x) => ({ Field: x.field.trim(), Value: x.value })),
     };
@@ -145,6 +152,11 @@ export function formatJoinFallbackReason(reason: string): string {
 }
 
 function formatKindDetail(detail: string): string {
+    const undeclaredField = "UndeclaredField:";
+    if (detail.startsWith(undeclaredField)) {
+        return `the field ${detail.slice(undeclaredField.length)} is not declared by the join index`;
+    }
+
     if (detail.startsWith("OrderBy:")) {
         return `order by ${detail.slice("OrderBy:".length)}`;
     }
@@ -160,6 +172,8 @@ function formatKindDetail(detail: string): string {
             return "ordered where clause";
         case "OrderByMissingValues":
             return "order by a field with missing values";
+        case "OrderByIndirect":
+            return "order by a field of the joined documents of an Indirect join index";
         case "OrderByMultiKey":
             return "order by a field of an outer entry that has several joined documents";
         case "ScoresDiffer":

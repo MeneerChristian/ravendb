@@ -11,7 +11,7 @@ export default {
     decorators: [withStorybookContexts, withBootstrap5],
 } satisfies Meta;
 
-function init(options: { auto?: boolean; sharded?: boolean } = {}) {
+function init(options: { auto?: boolean; sharded?: boolean; indirect?: boolean } = {}) {
     const { databases } = mockStore;
     const { indexesService } = mockServices;
 
@@ -28,6 +28,16 @@ function init(options: { auto?: boolean; sharded?: boolean } = {}) {
         definition.Type = "AutoJoin";
     }
 
+    if (options.indirect) {
+        definition.Join.StorageMode = "Indirect";
+        stats.Join.RefusedReason = "The outer index 'Orders/ByCompany' has a definition that a join index cannot read";
+        stats.Join.ResidentBytes = 3 * 1024 * 1024;
+        stats.Join.ResidentKeys = 1200;
+        stats.Join.ResidentHits = 5000;
+        stats.Join.ResidentMisses = 40;
+        stats.Join.ResidentPartialDrops = 2;
+    }
+
     const plainIndexes = IndexesStubs.getSampleStats().filter((x) => x.Type === "Map");
     indexesService.withGetStats([...plainIndexes, stats]);
     indexesService.withGetDefinitions([definition]);
@@ -38,6 +48,11 @@ function init(options: { auto?: boolean; sharded?: boolean } = {}) {
 
 export const StaticJoin: StoryFn = () => {
     const name = init();
+    return <JoinIndexPage pathParams={[name]} />;
+};
+
+export const IndirectJoin: StoryFn = () => {
+    const name = init({ indirect: true });
     return <JoinIndexPage pathParams={[name]} />;
 };
 

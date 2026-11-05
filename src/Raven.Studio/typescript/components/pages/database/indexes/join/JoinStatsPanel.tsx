@@ -2,10 +2,12 @@ import React from "react";
 import Card from "react-bootstrap/Card";
 import Table from "react-bootstrap/Table";
 import Badge from "react-bootstrap/Badge";
+import Alert from "react-bootstrap/Alert";
 import { Icon } from "components/common/Icon";
 import { useStudioTranslation } from "hooks/useStudioTranslation";
 import { formatJoinFallbackReason } from "./joinUtils";
 import IndexStats = Raven.Client.Documents.Indexes.IndexStats;
+import JoinIndexStats = Raven.Client.Documents.Indexes.JoinIndexStats;
 import genUtils from "common/generalUtils";
 
 interface JoinStatsPanelProps {
@@ -33,6 +35,11 @@ export function JoinStatsPanel({ stats }: JoinStatsPanelProps) {
                 <Icon icon="stats" /> {t("stats.header")}
             </Card.Header>
             <Card.Body>
+                {joinIndex.RefusedReason && (
+                    <Alert variant="danger" data-testid="join-refused">
+                        {t("stats.refused", { reason: joinIndex.RefusedReason })}
+                    </Alert>
+                )}
                 <div className="d-flex flex-wrap gap-4 mb-3">
                     <StatItem label={t("stats.state")} testId="join-state">
                         {joinIndex.PendingReason ? (
@@ -65,6 +72,39 @@ export function JoinStatsPanel({ stats }: JoinStatsPanelProps) {
                     <StatItem label={t("stats.queryWaitMax")}>{formatMs(joinIndex.QueryWaitMaxInMs)}</StatItem>
                 </div>
 
+                {hasResidentCache(joinIndex) && (
+                    <div className="mb-3" data-testid="join-resident">
+                        <div className="small-label">{t("stats.residentCache")}</div>
+                        <div className="d-flex flex-wrap gap-4">
+                            <StatItem label={t("stats.residentSize")}>
+                                {genUtils.formatBytesToSize(joinIndex.ResidentBytes)}
+                            </StatItem>
+                            <StatItem label={t("stats.residentKeys")}>{format(joinIndex.ResidentKeys)}</StatItem>
+                            <StatItem label={t("stats.residentHits")}>{format(joinIndex.ResidentHits)}</StatItem>
+                            <StatItem label={t("stats.residentMisses")}>{format(joinIndex.ResidentMisses)}</StatItem>
+                            <StatItem label={t("stats.residentEpochMisses")}>
+                                {format(joinIndex.ResidentEpochMisses)}
+                            </StatItem>
+                            <StatItem label={t("stats.residentEvictions")}>{format(joinIndex.ResidentEvictions)}</StatItem>
+                            <StatItem label={t("stats.residentWarmUpKeys")}>
+                                {format(joinIndex.ResidentWarmUpKeys)}
+                            </StatItem>
+                            <StatItem label={t("stats.residentPatchesApplied")}>
+                                {format(joinIndex.ResidentPatchesApplied)}
+                            </StatItem>
+                            <StatItem label={t("stats.residentPartialDrops")} testId="join-partial-drops">
+                                {format(joinIndex.ResidentPartialDrops)}
+                            </StatItem>
+                            <StatItem label={t("stats.residentInvalidations")}>
+                                {format(joinIndex.ResidentInvalidations)}
+                            </StatItem>
+                            <StatItem label={t("stats.residentLowMemoryDrops")}>
+                                {format(joinIndex.ResidentLowMemoryDrops)}
+                            </StatItem>
+                        </div>
+                    </div>
+                )}
+
                 {joinIndex.LastRefreshBreakdown && (
                     <div className="mb-3">
                         <div className="small-label">{t("stats.lastRefresh")}</div>
@@ -93,6 +133,19 @@ export function JoinStatsPanel({ stats }: JoinStatsPanelProps) {
                 </div>
             </Card.Body>
         </Card>
+    );
+}
+
+// only an Indirect join index has a resident cache of its key lists; an Expanded one reads zeros
+function hasResidentCache(joinIndex: JoinIndexStats) {
+    return (
+        joinIndex.ResidentBytes > 0 ||
+        joinIndex.ResidentKeys > 0 ||
+        joinIndex.ResidentHits > 0 ||
+        joinIndex.ResidentMisses > 0 ||
+        joinIndex.ResidentEpochMisses > 0 ||
+        joinIndex.ResidentInvalidations > 0 ||
+        joinIndex.ResidentPartialDrops > 0
     );
 }
 

@@ -7,7 +7,7 @@ import { Control, useFieldArray, useWatch } from "react-hook-form";
 import { FormGroup, FormInput, FormLabel, FormSelect, FormSwitch } from "components/common/Form";
 import { Icon } from "components/common/Icon";
 import { useStudioTranslation } from "hooks/useStudioTranslation";
-import { joinFieldKinds, joinLimits, JoinFormData } from "./joinUtils";
+import { joinFieldKinds, joinLimits, joinStorageModes, JoinFormData } from "./joinUtils";
 
 interface JoinDefinitionFormProps {
     control: Control<JoinFormData>;
@@ -38,6 +38,13 @@ export function JoinDefinitionForm({ control, indexNames, isNew, readOnly }: Joi
     };
 
     const kindOptions: Option[] = joinFieldKinds.map((x) => ({ value: x, label: x }));
+
+    const storageModeLabels: Record<(typeof joinStorageModes)[number], string> = {
+        Auto: t("definition.storageModeAuto"),
+        Expanded: t("definition.storageModeExpanded"),
+        Indirect: t("definition.storageModeIndirect"),
+    };
+    const storageModeOptions: Option[] = joinStorageModes.map((x) => ({ value: x, label: storageModeLabels[x] }));
 
     return (
         <Card data-testid="join-definition">
@@ -115,6 +122,23 @@ export function JoinDefinitionForm({ control, indexNames, isNew, readOnly }: Joi
                                 placeholder={innerField ? "" : t("definition.joinOnInnerId")}
                             />
                             <div className="small text-muted mt-1">{t("definition.innerFieldHelp")}</div>
+                        </FormGroup>
+                    </Col>
+                </Row>
+
+                <Row>
+                    <Col md={6}>
+                        <FormGroup>
+                            <FormLabel>{t("definition.storageMode")}</FormLabel>
+                            <FormSelect
+                                control={control}
+                                name="storageMode"
+                                options={storageModeOptions}
+                                isDisabled={readOnly}
+                                isSearchable={false}
+                                inputId="join-storage-mode"
+                            />
+                            <div className="small text-muted mt-1">{t("definition.storageModeHelp")}</div>
                         </FormGroup>
                     </Col>
                 </Row>

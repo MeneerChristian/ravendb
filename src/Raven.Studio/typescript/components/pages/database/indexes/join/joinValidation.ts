@@ -1,6 +1,6 @@
 import * as yup from "yup";
 import { yupResolver } from "@hookform/resolvers/yup";
-import { joinLimits, joinFieldKinds, utf8ByteLength } from "./joinUtils";
+import { joinLimits, joinFieldKinds, joinStorageModes, utf8ByteLength } from "./joinUtils";
 import { StudioTranslate } from "common/i18n/resources";
 
 type T = StudioTranslate<"joinIndex">;
@@ -28,6 +28,13 @@ export function createJoinSchema(t: T) {
         innerField: yup.string().test("needed", t("validation.innerFieldRequiredForOuterId"), function (value) {
             return !this.parent.outerOnId || (value ?? "").trim() !== "";
         }),
+        storageMode: yup
+            .string()
+            .oneOf(joinStorageModes)
+            .required()
+            .test("indirect", t("validation.indirectOnOuterId"), function (value) {
+                return value !== "Indirect" || !this.parent.outerOnId;
+            }),
         fields: yup
             .array()
             .of(

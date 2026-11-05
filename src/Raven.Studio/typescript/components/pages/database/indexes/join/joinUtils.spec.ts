@@ -21,6 +21,16 @@ describe("joinUtils", () => {
         expect(joinDefinitionFromForm(form)).toEqual(definition.Join);
     });
 
+    it("keeps the storage mode of the definition and sends Auto for a new form", () => {
+        const definition = IndexesStubs.getJoinIndexDefinition();
+        definition.Join.StorageMode = "Indirect";
+
+        const form = joinFormFromDefinition(definition);
+        expect(form.storageMode).toBe("Indirect");
+        expect(joinDefinitionFromForm(form).StorageMode).toBe("Indirect");
+        expect(emptyJoinForm().storageMode).toBe("Auto");
+    });
+
     it("maps a join on the id of the outer document", () => {
         const definition = IndexesStubs.getJoinIndexDefinition();
         definition.Join.OuterField = joinOuterIdKey;
@@ -75,6 +85,13 @@ describe("joinUtils", () => {
         it("explains the kinds that are not served", () => {
             expect(formatJoinFallbackReason("KindNotServed:Or")).toContain("OR");
             expect(formatJoinFallbackReason("KindNotServed:OrderBy:Title")).toContain("order by Title");
+        });
+
+        it("names the undeclared field and the Indirect order", () => {
+            expect(formatJoinFallbackReason("KindNotServed:UndeclaredField:Title")).toContain(
+                "the field Title is not declared"
+            );
+            expect(formatJoinFallbackReason("KindNotServed:OrderByIndirect")).toContain("Indirect");
         });
 
         it("explains the other reasons", () => {
