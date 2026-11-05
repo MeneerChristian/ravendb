@@ -432,12 +432,22 @@ public sealed class JoinIndex : Index<JoinIndexDefinition, JoinIndexField>
             OuterBatches = Interlocked.Read(ref _outerBatches),
             InnerBatches = Interlocked.Read(ref _innerBatches),
             Refreshes = Counters.Refreshes,
+            PartialRefreshes = Counters.PartialRefreshes,
             NoOpRefreshes = Counters.NoOps,
             Builds = Counters.Builds,
             IdsProcessed = Counters.IdsProcessed,
             ListUpdates = Counters.ListUpdates,
             LastRefreshBreakdown = Counters.LastBreakdown
         };
+        if (TryOpenJoinSnapshot(out JoinIndexSnapshot published))
+        {
+            using (published)
+            {
+                stats.Join.Generation = published.Generation.Serial;
+                stats.Join.IsPartial = published.Generation.IsPartial;
+            }
+        }
+
         foreach ((string reason, long count) in Counters.RebuildsByReason)
             stats.Join.RebuildsByReason[reason] = count;
 

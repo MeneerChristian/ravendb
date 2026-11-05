@@ -4,6 +4,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using FastTests.Server.Documents.Indexing.Joins.Query;
+using Raven.Client.Documents.Indexes;
 using Raven.Client.Documents.Operations.Indexes;
 using Raven.Client.ServerWide.Operations;
 using Raven.Server.Config;
@@ -144,6 +145,33 @@ public class JoinIndexChunkTests(ITestOutputHelper output) : RavenTestBase(outpu
         Assert.True(chunks >= Conversations / Budget, $"{chunks} commits");
         Assert.True(h.Join().Counters.PartialRefreshes >= Conversations / Budget - 1);
         Assert.True(h.Join().Counters.Refreshes > refreshes);
+    }
+
+    [RavenFact(RavenTestCategory.Indexes)]
+    public async Task TheStatisticsShowThePartialRefreshesAndThePublishedGeneration()
+    {
+        using JoinIndexHarness h = await CreateAsync(this);
+        Seed(h);
+        await h.AssertCurrentAsync();
+        JoinIndexStats before = h.Stats().Join;
+        Assert.True(before.Generation > 0, "the built lists have a generation");
+        Assert.False(before.IsPartial);
+
+        await RunChunksAsync(h, () => h.Save(s =>
+        {
+            for (int i = 0; i < Conversations; i++)
+                s.Store(new JoinIndexHarness.Conversation { ContextId = $"contexts/{i % Contexts}", Title = "changed" }, $"conversations/{i}");
+        }));
+        await h.AssertCurrentAsync();
+
+        JoinIndexStats after = h.Stats().Join;
+        Assert.True(after.PartialRefreshes > 0, "the refresh was cut at the budget of a commit");
+        Assert.Equal(h.Join().Counters.PartialRefreshes, after.PartialRefreshes);
+        Assert.True(after.Generation > before.Generation, $"generation {before.Generation} then {after.Generation}");
+        Assert.False(after.IsPartial, "a join index that caught up publishes a complete generation");
+
+        using (h.Join().TryOpenJoinSnapshot(out JoinIndexSnapshot snapshot) ? snapshot : null)
+            Assert.Equal(snapshot.Generation.Serial, after.Generation);
     }
 
     [RavenFact(RavenTestCategory.Indexes)]

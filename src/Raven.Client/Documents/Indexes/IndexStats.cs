@@ -235,6 +235,15 @@ namespace Raven.Client.Documents.Indexes
         /// <summary>The number of refreshes that found nothing to do.</summary>
         public long NoOpRefreshes { get; set; }
 
+        /// <summary>The number of refreshes that were cut at the budget of a commit and published a partial generation.</summary>
+        public long PartialRefreshes { get; set; }
+
+        /// <summary>The serial of the generation of the lists that queries read now; 0 when the lists are not built yet.</summary>
+        public long Generation { get; set; }
+
+        /// <summary>Whether the published generation is partial: a refresh that is cut at the budget of a commit has not caught up with the indexes yet.</summary>
+        public bool IsPartial { get; set; }
+
         /// <summary>The number of times the lists were built from scratch.</summary>
         public long Builds { get; set; }
 
