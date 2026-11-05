@@ -38,11 +38,16 @@ function init(
 
     if (options.notBuilt) {
         stats.Join.Generation = 0;
+        stats.Join.ResolvedStorageMode = null;
+        stats.Join.RowsPerKey = null;
         stats.Join.PendingReason = "The inner index 'Companies/ByName' is disabled";
     }
 
     if (options.indirect) {
         definition.Join.StorageMode = "Indirect";
+        stats.Join.StorageMode = "Indirect";
+        stats.Join.ResolvedStorageMode = "Indirect";
+        stats.Join.RowsPerKey = null;
         stats.Join.RefusedReason = "The outer index 'Orders/ByCompany' has a definition that a join index cannot read";
         stats.Join.ResidentBytes = 3 * 1024 * 1024;
         stats.Join.ResidentKeys = 1200;

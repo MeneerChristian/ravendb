@@ -5,7 +5,7 @@ import Badge from "react-bootstrap/Badge";
 import Alert from "react-bootstrap/Alert";
 import { Icon } from "components/common/Icon";
 import { useStudioTranslation } from "hooks/useStudioTranslation";
-import { formatJoinFallbackReason } from "./joinUtils";
+import { formatJoinFallbackReason, getJoinStorageModeView } from "./joinUtils";
 import IndexStats = Raven.Client.Documents.Indexes.IndexStats;
 import JoinIndexStats = Raven.Client.Documents.Indexes.JoinIndexStats;
 import genUtils from "common/generalUtils";
@@ -26,6 +26,7 @@ export function JoinStatsPanel({ stats }: JoinStatsPanelProps) {
         );
     }
 
+    const storageMode = getJoinStorageModeView(joinIndex.StorageMode, [joinIndex.ResolvedStorageMode]);
     const format = (value: number) => genUtils.formatAsCommaSeperatedString(value, 0);
     const formatMs = (value: number) => `${genUtils.formatAsCommaSeperatedString(value, 1)} ms`;
 
@@ -72,6 +73,27 @@ export function JoinStatsPanel({ stats }: JoinStatsPanelProps) {
                             </span>
                         )}
                     </StatItem>
+                    <StatItem label={t("stats.storageMode")} testId="join-storage-mode">
+                        {storageMode.notBuiltYet ? (
+                            <span className="text-muted" title={t("stats.storageModeNotBuiltHelp")}>
+                                {t("stats.notBuilt")}
+                            </span>
+                        ) : (
+                            <>
+                                {storageMode.modes[0]}
+                                {storageMode.chosenByAuto && (
+                                    <span className="fs-6 text-muted"> {t("stats.chosenByAuto")}</span>
+                                )}
+                            </>
+                        )}
+                    </StatItem>
+                    {joinIndex.RowsPerKey != null && (
+                        <StatItem label={t("stats.rowsPerKey")} testId="join-rows-per-key">
+                            <span title={t("stats.rowsPerKeyHelp")}>
+                                {genUtils.formatAsCommaSeperatedString(joinIndex.RowsPerKey, 1)}
+                            </span>
+                        </StatItem>
+                    )}
                     <StatItem label={t("stats.size")}>{stats.Memory?.DiskSize?.HumaneSize ?? "-"}</StatItem>
                     <StatItem label={t("stats.served")} testId="join-served">
                         {format(joinIndex.Served)}

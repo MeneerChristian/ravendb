@@ -100,6 +100,13 @@ export default {
         partial: "Partial",
         partialHelp:
             "A refresh was cut at the budget of a commit, so the lists have not caught up with the indexes yet; the next refresh continues",
+        storageMode: "Storage mode",
+        chosenByAuto: "(chosen by Auto)",
+        storageModeNotBuiltHelp:
+            "The definition leaves the choice between Expanded and Indirect to the server. It chooses when it builds the lists, which are not built yet",
+        rowsPerKey: "Outer entries per key",
+        rowsPerKeyHelp:
+            "What Auto measured when it last built the lists: the outer entries divided by their distinct keys. From 30 on it builds Indirect, else Expanded",
         notBuilt: "Not built yet",
         notBuiltHelp: "The lists are built from scratch before the first generation is published",
         partialRefreshes: "Partial refreshes",

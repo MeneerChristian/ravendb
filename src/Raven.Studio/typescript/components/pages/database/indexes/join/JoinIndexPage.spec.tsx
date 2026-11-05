@@ -73,6 +73,30 @@ describe("JoinIndexPage", () => {
         expect(screen.getByTestId("join-state")).toHaveTextContent("Pending");
     });
 
+    it("shows the storage mode that the server built the lists as and the rows per key that Auto saw", async () => {
+        const { screen } = rtlRender(<StaticJoin />);
+
+        await screen.findByTestId("join-stats");
+        expect(screen.getByTestId("join-storage-mode")).toHaveTextContent("Expanded (chosen by Auto)");
+        expect(screen.getByTestId("join-rows-per-key")).toHaveTextContent("8.2");
+    });
+
+    it("shows the storage mode of the definition and no rows per key when the definition names it", async () => {
+        const { screen } = rtlRender(<IndirectJoin />);
+
+        await screen.findByTestId("join-stats");
+        expect(screen.getByTestId("join-storage-mode")).toHaveTextContent(/^Indirect$/);
+        expect(screen.queryByTestId("join-rows-per-key")).not.toBeInTheDocument();
+    });
+
+    it("says that Auto has not chosen while the lists are not built", async () => {
+        const { screen } = rtlRender(<NotBuiltJoin />);
+
+        await screen.findByTestId("join-stats");
+        expect(screen.getByTestId("join-storage-mode")).toHaveTextContent("Not built yet");
+        expect(screen.queryByTestId("join-rows-per-key")).not.toBeInTheDocument();
+    });
+
     it("shows no resident cache and no refusal for a join index that has none", async () => {
         const { screen } = rtlRender(<StaticJoin />);
 
@@ -85,7 +109,7 @@ describe("JoinIndexPage", () => {
         const { screen } = rtlRender(<IndirectJoin />);
 
         await screen.findByTestId("join-stats");
-        expect(screen.getByText("Indirect")).toBeInTheDocument();
+        expect(screen.getByTestId("join-storage-mode")).toHaveTextContent("Indirect");
         expect(screen.getByTestId("join-refused")).toHaveTextContent("a join index cannot read");
 
         const resident = screen.getByTestId("join-resident");
