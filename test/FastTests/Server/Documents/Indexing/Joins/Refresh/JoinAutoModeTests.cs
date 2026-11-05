@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Threading.Tasks;
 using Raven.Client.Documents.Indexes;
+using Raven.Client.Documents.Operations.Indexes;
 using Raven.Server.Config;
 using Raven.Server.Documents.Indexes.Joins;
 using Raven.Server.Documents.Indexes.Joins.Refresh;
@@ -118,7 +119,7 @@ public class JoinAutoModeTests(ITestOutputHelper output) : RavenTestBase(output)
         if (cacheMb != null)
             test.DoNotReuseServer(new Dictionary<string, string> { [RavenConfiguration.GetKey(x => x.Join.ResidentCacheMaxMemory)] = cacheMb });
 
-        var settings = new Dictionary<string, string> { [RavenConfiguration.GetKey(x => x.Join.IndirectEnabled)] = indirectEnabled.ToString() };
+        var settings = new Dictionary<string, string> { [RavenConfiguration.GetKey(x => x.Join.IndirectEnabled)] = indirectEnabled.ToString(), [RavenConfiguration.GetKey(x => x.Join.AutoMinimumAvailableMemory)] = "0" };
         JoinIndexHarness h = idJoin ? await JoinIndexHarness.CreateAsync(test, settings, putJoin: false) : await JoinIndexHarness.CreateFieldJoinAsync(test, settings, putJoin: false);
         test._harness = h;
         for (int k = 0; k < keys; k++)
@@ -191,6 +192,65 @@ public class JoinAutoModeTests(ITestOutputHelper output) : RavenTestBase(output)
             Assert.Equal(JoinStorageMode.Expanded, mode);
             Assert.Equal(1, joinIndex.Counters.AutoModeExpanded);
             Assert.Contains("resident cache", joinIndex.Counters.LastAutoModeReason);
+        }
+    }
+
+    [RavenTheory(RavenTestCategory.Indexes)]
+    [InlineData(29, JoinStorageMode.Expanded)]
+    [InlineData(30, JoinStorageMode.Indirect)]
+    [InlineData(40, JoinStorageMode.Indirect)]
+    public async Task TheStatsSayWhatTheRuleOfTheAutoModeChose(int rowsPerKey, JoinStorageMode expected)
+    {
+        await BuildAsync(this, keys: 3, rowsPerKey);
+        using (_harness)
+        {
+            JoinIndexStats joinIndex = _harness.Stats().Join;
+            Assert.Equal(JoinStorageMode.Auto, joinIndex.StorageMode);
+            Assert.Equal(expected, joinIndex.ResolvedStorageMode);
+            Assert.Equal(rowsPerKey, joinIndex.RowsPerKey.Value, 6);
+        }
+    }
+
+    [RavenFact(RavenTestCategory.Indexes)]
+    public async Task TheStatsOfAJoinWhoseDefinitionNamesTheModeSayTheModeAndNoRowsPerKey()
+    {
+        (_, _) = await BuildAsync(this, keys: 3, rowsPerKey: 40);
+        using (_harness)
+        {
+            IndexDefinition definition = JoinIndexHarness.FieldJoinIndexDefinition();
+            definition.Join.StorageMode = JoinStorageMode.Expanded;
+            _harness.Store.Maintenance.Send(new PutIndexesOperation(definition));
+            await _harness.AssertCurrentAsync();
+
+            JoinIndexStats joinIndex = _harness.Stats().Join;
+            Assert.Equal(JoinStorageMode.Expanded, joinIndex.StorageMode);
+            Assert.Equal(JoinStorageMode.Expanded, joinIndex.ResolvedStorageMode);
+            Assert.Null(joinIndex.RowsPerKey);
+        }
+    }
+
+    [RavenFact(RavenTestCategory.Indexes)]
+    public async Task TheStatsFollowTheModeOfTheGenerationAfterAReset()
+    {
+        await BuildAsync(this, keys: 3, rowsPerKey: 40);
+        using (_harness)
+        {
+            Assert.Equal(JoinStorageMode.Indirect, _harness.Stats().Join.ResolvedStorageMode);
+
+            // the rows per key fall below the threshold; the mode stays with the generation until the lists are built again
+            for (int i = 0; i < 300; i++)
+                _harness.PutConversation(100_000 + i, $"x{i}");
+
+            await _harness.AssertCurrentAsync();
+            Assert.Equal(JoinStorageMode.Indirect, _harness.Stats().Join.ResolvedStorageMode);
+
+            _harness.Store.Maintenance.Send(new ResetIndexOperation(JoinIndexHarness.JoinName));
+            await _harness.AssertCurrentAsync();
+
+            JoinIndexStats joinIndex = _harness.Stats().Join;
+            Assert.Equal(JoinStorageMode.Auto, joinIndex.StorageMode);
+            Assert.Equal(JoinStorageMode.Expanded, joinIndex.ResolvedStorageMode);
+            Assert.InRange(joinIndex.RowsPerKey.Value, 1, 29);
         }
     }
 }

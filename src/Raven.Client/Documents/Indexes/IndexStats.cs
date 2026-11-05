@@ -217,6 +217,15 @@ namespace Raven.Client.Documents.Indexes
         /// <summary>The name of the inner index.</summary>
         public string InnerIndex { get; set; }
 
+        /// <summary>The storage mode of the definition of the join index; Auto leaves the choice to the server, see <see cref="ResolvedStorageMode"/>.</summary>
+        public JoinStorageMode StorageMode { get; set; }
+
+        /// <summary>The storage mode (Expanded or Indirect) that the current generation of the lists was built as, whatever the definition says; null while the lists are not built.</summary>
+        public JoinStorageMode? ResolvedStorageMode { get; set; }
+
+        /// <summary>The outer entries per key that the server found when it chose the mode of the last build of an Auto join index, the figure its rule compares with the threshold; null when the mode of the last build was not chosen by that rule or there were no keys to count.</summary>
+        public double? RowsPerKey { get; set; }
+
         /// <summary>Why the join index cannot read the indexes it joins now (one is missing, disabled or in error); null when it can.</summary>
         public string PendingReason { get; set; }
 

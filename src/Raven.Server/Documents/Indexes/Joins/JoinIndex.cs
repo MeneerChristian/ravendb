@@ -119,6 +119,7 @@ public sealed class JoinIndex : Index<JoinIndexDefinition, JoinIndexField>
         plan.ChooseBuildMode(mode);
         Counters.Add(ref mode == JoinStorageMode.Indirect ? ref Counters.AutoModeIndirect : ref Counters.AutoModeExpanded, 1);
         Counters.LastAutoModeReason = reason;
+        Volatile.Write(ref Counters.LastAutoRowsPerKey, keys > 0 && entries > 0 ? entries / (double)keys : double.NaN);
     }
 
     internal JoinOptions Options => _options ??= JoinOptions.From(DocumentDatabase.Configuration);
@@ -524,6 +525,7 @@ public sealed class JoinIndex : Index<JoinIndexDefinition, JoinIndexField>
         {
             OuterIndex = OuterName,
             InnerIndex = InnerName,
+            StorageMode = Join.StorageMode,
             PendingReason = Volatile.Read(ref _pendingReason),
             RefusedReason = Refusal,
             OuterBatches = Interlocked.Read(ref _outerBatches),
@@ -542,8 +544,14 @@ public sealed class JoinIndex : Index<JoinIndexDefinition, JoinIndexField>
             {
                 stats.Join.Generation = published.Generation.Serial;
                 stats.Join.IsPartial = published.Generation.IsPartial;
+                if (published.Generation.Serial > 0)
+                    stats.Join.ResolvedStorageMode = published.Generation.Mode;
             }
         }
+
+        double rowsPerKey = Volatile.Read(ref Counters.LastAutoRowsPerKey);
+        if (double.IsNaN(rowsPerKey) == false)
+            stats.Join.RowsPerKey = rowsPerKey;
 
         foreach ((string reason, long count) in Counters.RebuildsByReason)
             stats.Join.RebuildsByReason[reason] = count;

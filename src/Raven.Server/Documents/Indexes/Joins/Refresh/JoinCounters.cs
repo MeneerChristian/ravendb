@@ -56,6 +56,9 @@ public sealed class JoinCounters
     public long AutoModeIndirect;
     public long AutoModeExpanded;
     public string LastAutoModeReason;
+
+    /// <summary>The outer entries per key that the rule of the Auto mode saw at the last build that it chose the mode of; NaN when there was none.</summary>
+    public double LastAutoRowsPerKey = double.NaN;
     public long LastBuildQueuedAtoms;
     public long LastBuildListFlushes;
     public long LastBuildListUpdates;
