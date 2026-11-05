@@ -13,6 +13,7 @@ using Raven.Server.Config;
 using Raven.Server.Documents.Includes;
 using Raven.Server.Documents.Indexes.Configuration;
 using Raven.Server.Documents.Indexes.Debugging;
+using Raven.Server.Documents.Indexes.Joins.Auto;
 using Raven.Server.Documents.Indexes.Joins.Refresh;
 using Raven.Server.Documents.Indexes.Joins.Serving;
 using Raven.Server.Documents.Indexes.Joins.Serving.Resident;
@@ -112,9 +113,18 @@ public sealed class JoinIndex : Index<JoinIndexDefinition, JoinIndexField>
             keys = view.TermsOf(plan.OuterKeyField)?.NumberOfEntries ?? 0;
         }
 
-        ResidentCacheRegistry registry = ResidentCacheRegistry.Instance;
-        long available = Engine.AvailableMemoryBytes();
-        var facts = new JoinOptions.ModeFacts(entries, keys, available, Math.Min(options.ResidentCacheMaxBytes, registry.FreeBytes), registry.IsLowMemory || LowMemoryNotification.Instance.LowMemoryState);
+        AutoJoinManager hooks = DocumentDatabase.IndexStore.AutoJoins;
+        long available = hooks.AvailableMemoryForTesting?.Invoke().GetValue(SizeUnit.Bytes) ?? Engine.AvailableMemoryBytes();
+        JoinOptions.ResidentInputs resident;
+        if (hooks.ResidentInputsForTesting != null)
+            resident = hooks.ResidentInputsForTesting();
+        else
+        {
+            ResidentCacheRegistry registry = ResidentCacheRegistry.Instance;
+            resident = new JoinOptions.ResidentInputs(registry.FreeBytes, registry.IsLowMemory || LowMemoryNotification.Instance.LowMemoryState);
+        }
+
+        var facts = new JoinOptions.ModeFacts(entries, keys, available, Math.Min(options.ResidentCacheMaxBytes, resident.CacheFreeBytes), resident.LowMemory);
         JoinStorageMode mode = options.ResolveBuildMode(plan.Definition, facts, out string reason);
         plan.ChooseBuildMode(mode);
         Counters.Add(ref mode == JoinStorageMode.Indirect ? ref Counters.AutoModeIndirect : ref Counters.AutoModeExpanded, 1);

@@ -1,12 +1,15 @@
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using System.Threading.Tasks;
 using Raven.Client.Documents.Indexes;
 using Raven.Client.Documents.Operations.Indexes;
 using Raven.Server.Config;
 using Raven.Server.Documents.Indexes.Joins;
+using Raven.Server.Documents.Indexes.Joins.Auto;
 using Raven.Server.Documents.Indexes.Joins.Refresh;
 using Raven.Server.Documents.Indexes.Joins.Storage;
+using Sparrow;
 using Tests.Infrastructure;
 using Xunit;
 
@@ -114,14 +117,29 @@ public class JoinAutoModeTests(ITestOutputHelper output) : RavenTestBase(output)
         Assert.Equal(JoinStorageMode.Expanded, Options().ResolveBuildMode(Definition(), Facts(1_000, 0), out _));
     }
 
-    private static async Task<(JoinStorageMode Mode, JoinIndex Join)> BuildAsync(JoinAutoModeTests test, int keys, int rowsPerKey, bool indirectEnabled = true, string cacheMb = null, bool idJoin = false)
+    /// <summary>What the server tells the choice of the mode, so that no test depends on the memory of the machine, on its low memory flag or on the resident caches of other tests of the process.</summary>
+    private sealed record ServerInputs(long AvailableBytes = 64L << 30, long CacheFreeBytes = 1L << 30, bool LowMemory = false)
     {
+        public int Reads;
+    }
+
+    private static async Task<(JoinStorageMode Mode, JoinIndex Join)> BuildAsync(JoinAutoModeTests test, int keys, int rowsPerKey, bool indirectEnabled = true, string cacheMb = null, bool idJoin = false, ServerInputs server = null, string floorMb = "100")
+    {
+        server ??= new ServerInputs();
+        test._server = server;
         if (cacheMb != null)
             test.DoNotReuseServer(new Dictionary<string, string> { [RavenConfiguration.GetKey(x => x.Join.ResidentCacheMaxMemory)] = cacheMb });
 
-        var settings = new Dictionary<string, string> { [RavenConfiguration.GetKey(x => x.Join.IndirectEnabled)] = indirectEnabled.ToString(), [RavenConfiguration.GetKey(x => x.Join.AutoMinimumAvailableMemory)] = "0" };
+        var settings = new Dictionary<string, string> { [RavenConfiguration.GetKey(x => x.Join.IndirectEnabled)] = indirectEnabled.ToString(), [RavenConfiguration.GetKey(x => x.Join.AutoMinimumAvailableMemory)] = floorMb };
         JoinIndexHarness h = idJoin ? await JoinIndexHarness.CreateAsync(test, settings, putJoin: false) : await JoinIndexHarness.CreateFieldJoinAsync(test, settings, putJoin: false);
         test._harness = h;
+        AutoJoinManager hooks = h.Database.IndexStore.AutoJoins;
+        hooks.AvailableMemoryForTesting = () =>
+        {
+            Interlocked.Increment(ref server.Reads);
+            return new Size(server.AvailableBytes, SizeUnit.Bytes);
+        };
+        hooks.ResidentInputsForTesting = () => new JoinOptions.ResidentInputs(server.CacheFreeBytes, server.LowMemory);
         for (int k = 0; k < keys; k++)
         {
             if (idJoin)
@@ -142,6 +160,7 @@ public class JoinAutoModeTests(ITestOutputHelper output) : RavenTestBase(output)
     }
 
     private JoinIndexHarness _harness;
+    private ServerInputs _server;
 
     [RavenTheory(RavenTestCategory.Indexes)]
     [InlineData(29, JoinStorageMode.Expanded, false)]
@@ -155,7 +174,8 @@ public class JoinAutoModeTests(ITestOutputHelper output) : RavenTestBase(output)
         (JoinStorageMode mode, JoinIndex joinIndex) = await BuildAsync(this, keys: 3, rowsPerKey, idJoin: idJoin);
         using (_harness)
         {
-            Assert.Equal(expected, mode);
+            Assert.True(expected == mode, $"expected {expected} got {mode}: {joinIndex.Counters.LastAutoModeReason}");
+            Assert.True(_server.Reads > 0, "the choice of the mode did not read the memory through the seam");
             Assert.Equal(expected == JoinStorageMode.Indirect ? 1 : 0, joinIndex.Counters.AutoModeIndirect);
             Assert.Equal(expected == JoinStorageMode.Expanded ? 1 : 0, joinIndex.Counters.AutoModeExpanded);
             Assert.Contains($"{rowsPerKey}.0 rows per key", joinIndex.Counters.LastAutoModeReason);
@@ -192,6 +212,24 @@ public class JoinAutoModeTests(ITestOutputHelper output) : RavenTestBase(output)
             Assert.Equal(JoinStorageMode.Expanded, mode);
             Assert.Equal(1, joinIndex.Counters.AutoModeExpanded);
             Assert.Contains("resident cache", joinIndex.Counters.LastAutoModeReason);
+        }
+    }
+
+    [RavenTheory(RavenTestCategory.Indexes)]
+    [InlineData(1L << 40, 1L << 30, false, JoinStorageMode.Indirect, "rows per key")]
+    [InlineData(1L << 40, 1L << 30, true, JoinStorageMode.Expanded, "low memory")]
+    [InlineData(1L << 40, 0L, false, JoinStorageMode.Expanded, "resident cache")]
+    [InlineData(1L << 40, 100L, false, JoinStorageMode.Expanded, "resident cache")]
+    [InlineData(1L << 20, 1L << 30, false, JoinStorageMode.Expanded, "available")]
+    [InlineData(200L << 20, 1L << 30, false, JoinStorageMode.Indirect, "rows per key")]
+    public async Task EachRefusalOfIndirectIsDecidedByTheInputsOfTheServerAndNotByTheMemoryOfTheMachine(long available, long cacheFree, bool lowMemory, JoinStorageMode expected, string reason)
+    {
+        // 3 keys of 40 rows: the rows per key allow Indirect, so the mode is decided by the three inputs of the server; the floor is 100 MB and the cache of the join index needs about 1 KB
+        (JoinStorageMode mode, JoinIndex joinIndex) = await BuildAsync(this, keys: 3, rowsPerKey: 40, server: new ServerInputs(available, cacheFree, lowMemory));
+        using (_harness)
+        {
+            Assert.True(expected == mode, $"expected {expected} got {mode}: {joinIndex.Counters.LastAutoModeReason}");
+            Assert.Contains(reason, joinIndex.Counters.LastAutoModeReason);
         }
     }
 

@@ -52,6 +52,9 @@ internal sealed class AutoJoinManager
     /// <summary>For tests: the available memory that the gate sees.</summary>
     internal Func<Size> AvailableMemoryForTesting { get; set; }
 
+    /// <summary>For tests: the budget of the resident caches that is left and the low memory flag that the choice of the mode of a join index at its build sees.</summary>
+    internal Func<JoinOptions.ResidentInputs> ResidentInputsForTesting { get; set; }
+
     /// <summary>
     /// Asks for the join index of every join of the query that has none and that one could answer. Returns when the creation was started, or, for a query that waits for non stale results,
     /// when the join index is a join index of this node (or the creation failed, the query is then read as usual).

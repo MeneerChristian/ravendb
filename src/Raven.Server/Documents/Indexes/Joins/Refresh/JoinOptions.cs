@@ -85,6 +85,9 @@ public sealed class JoinOptions
     /// <summary>What the choice of the mode at the build looks at.</summary>
     public readonly record struct ModeFacts(long OuterEntries, long DistinctKeys, long AvailableBytes, long CacheFreeBytes, bool LowMemory);
 
+    /// <summary>What the choice of the mode reads from the process: the bytes that the budget of the resident caches has left and whether the server is in low memory.</summary>
+    public readonly record struct ResidentInputs(long CacheFreeBytes, bool LowMemory);
+
     /// <summary>The bytes that the resident cache of an Indirect join index takes for the outer entries and the keys.</summary>
     public static long ResidentEstimateOf(long outerEntries, long distinctKeys) => (long)(distinctKeys * ResidentBytesPerKey + outerEntries * ResidentBytesPerRow);
 
