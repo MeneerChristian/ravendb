@@ -78,7 +78,8 @@
         "refused": "Indeks łączący jest w stanie błędu: {{reason}}",
         "pending": "Indeks łączący czeka: {{reason}}",
         "storageMode": "Przechowywanie",
-        "storageModeHelp": "Sposób, w jaki listy przechowują to, co pasuje do podzapytania. Auto zostawia serwerowi wybór między Expanded i Indirect; serwer nie podaje, który wybrał",
+        "storageModeNotBuiltHelp": "Definicja zostawia serwerowi wybór między Expanded i Indirect. Serwer wybiera przy budowie list, a listy nie są jeszcze zbudowane",
+        "chosenByAuto": "(wybrany przez Auto)",
         "storageModes": {
             "Auto": "Auto",
             "Expanded": "Expanded",

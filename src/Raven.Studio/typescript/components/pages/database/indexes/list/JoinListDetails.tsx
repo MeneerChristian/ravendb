@@ -1,15 +1,14 @@
 import React from "react";
-import { useAsync } from "react-async-hook";
 import Badge from "react-bootstrap/Badge";
 import { IndexSharedInfo } from "components/models/indexes";
 import { RichPanelDetailItem } from "components/common/RichPanel";
 import { Icon } from "components/common/Icon";
-import { useServices } from "components/hooks/useServices";
 import { useStudioTranslation } from "hooks/useStudioTranslation";
-import { useAppSelector } from "components/store";
-import { databaseSelectors } from "components/common/shell/databaseSliceSelectors";
-import { getJoinListStatus, JoinListState } from "components/pages/database/indexes/join/joinUtils";
-import JoinStorageMode = Raven.Client.Documents.Indexes.JoinStorageMode;
+import {
+    getJoinListStatus,
+    getJoinListStorageModeView,
+    JoinListState,
+} from "components/pages/database/indexes/join/joinUtils";
 
 const stateBadges: Record<JoinListState, { bg: string; text?: string }> = {
     refused: { bg: "danger" },
@@ -24,11 +23,11 @@ interface JoinListDetailsProps {
     index: IndexSharedInfo;
 }
 
-// the join index specific details of a row of the indexes list: the state and the storage mode
+// the join index specific details of a row of the indexes list: the state and the storage mode that the lists were built as
 export function JoinListDetails({ index }: JoinListDetailsProps) {
     const t = useStudioTranslation("joinIndex");
     const status = getJoinListStatus(index);
-    const storageMode = useJoinStorageMode(index.name);
+    const storageMode = getJoinListStorageModeView(index);
 
     return (
         <>
@@ -44,11 +43,14 @@ export function JoinListDetails({ index }: JoinListDetailsProps) {
                 </RichPanelDetailItem>
             )}
             {storageMode && (
-                <RichPanelDetailItem title={t("list.storageModeHelp")}>
+                <RichPanelDetailItem title={storageMode.notBuiltYet ? t("list.storageModeNotBuiltHelp") : undefined}>
                     <Icon icon="storage" />
                     {t("list.storageMode")}
                     <div className="value" data-testid="join-list-storage-mode">
-                        {t(`list.storageModes.${storageMode}`)}
+                        {storageMode.notBuiltYet
+                            ? t("list.storageModes.Auto")
+                            : storageMode.modes.map((mode) => t(`list.storageModes.${mode}`)).join(" / ")}
+                        {storageMode.chosenByAuto && <span className="text-muted"> {t("list.chosenByAuto")}</span>}
                     </div>
                 </RichPanelDetailItem>
             )}
@@ -75,24 +77,4 @@ export function JoinListReason({ index }: JoinListDetailsProps) {
                 : t("list.pending", { reason: status.reason })}
         </div>
     );
-}
-
-// the list has no definitions, so the storage mode is read once per join index row
-function useJoinStorageMode(indexName: string): JoinStorageMode | null {
-    const { indexesService } = useServices();
-    const activeDatabase = useAppSelector(databaseSelectors.activeDatabase);
-
-    const asyncMode = useAsync(async (): Promise<JoinStorageMode | null> => {
-        const definitions = await indexesService.getDefinitions(activeDatabase.name, { indexNames: [indexName] });
-        const definition = definitions?.find((x) => x.Name === indexName);
-
-        if (!definition?.Join) {
-            return null;
-        }
-
-        // the server leaves the storage mode out of the definition of a join index when it is Auto
-        return definition.Join.StorageMode ?? "Auto";
-    }, [indexName, activeDatabase.name]);
-
-    return asyncMode.result ?? null;
 }

@@ -81,8 +81,9 @@ export default {
         refused: "The join index is in the error state: {{reason}}",
         pending: "The join index waits: {{reason}}",
         storageMode: "Storage",
-        storageModeHelp:
-            "How the lists of the join index hold what a sub-query matches. Auto leaves the choice between Expanded and Indirect to the server; the server does not report which one it chose",
+        storageModeNotBuiltHelp:
+            "The definition leaves the choice between Expanded and Indirect to the server. It chooses when it builds the lists, which are not built yet",
+        chosenByAuto: "(chosen by Auto)",
         storageModes: {
             Auto: "Auto",
             Expanded: "Expanded",

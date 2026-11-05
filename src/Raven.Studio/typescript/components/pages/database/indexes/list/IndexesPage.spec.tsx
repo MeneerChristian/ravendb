@@ -106,16 +106,34 @@ describe("IndexesPage", function () {
             expect(within(row).getByTestId("join-list-state")).toHaveTextContent("Partial");
         });
 
-        it("shows the storage mode of the definition of each join index", async () => {
+        it("shows the storage mode that the lists were built as, and says when Auto chose it", async () => {
             const { screen } = rtlRender(<JoinIndexStates />);
 
             const ready = await findRow(screen, "Joins/Ready");
             const refused = await findRow(screen, "Joins/Refused");
             const pending = await findRow(screen, "Joins/Pending");
+            const partial = await findRow(screen, "Joins/Partial");
 
-            expect(await within(ready).findByTestId("join-list-storage-mode")).toHaveTextContent("Auto");
-            expect(await within(refused).findByTestId("join-list-storage-mode")).toHaveTextContent("Expanded");
-            expect(await within(pending).findByTestId("join-list-storage-mode")).toHaveTextContent("Indirect");
+            expect(within(ready).getByTestId("join-list-storage-mode")).toHaveTextContent(
+                "Indirect (chosen by Auto)"
+            );
+            expect(within(refused).getByTestId("join-list-storage-mode")).toHaveTextContent(/^Expanded$/);
+            expect(within(pending).getByTestId("join-list-storage-mode")).toHaveTextContent(/^Indirect$/);
+            expect(within(partial).getByTestId("join-list-storage-mode")).toHaveTextContent(
+                "Expanded (chosen by Auto)"
+            );
+        });
+
+        it("shows Auto with an explanation for a join index that is not built yet, and does not read definitions", async () => {
+            const { screen } = rtlRender(<JoinIndexStates />);
+
+            const building = await findRow(screen, "Joins/Building");
+            const mode = within(building).getByTestId("join-list-storage-mode");
+            expect(mode).toHaveTextContent(/^Auto$/);
+            expect(mode.closest("[title]")).toHaveAttribute("title", expect.stringContaining("not built yet"));
+
+            const ready = await findRow(screen, "Joins/Ready");
+            expect(within(ready).getByTestId("join-list-storage-mode").closest("[title]")).toBeNull();
         });
 
         it("shows no join index details on a row of another index type", async () => {
