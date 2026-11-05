@@ -4,6 +4,7 @@ using System.Threading;
 using Corax.Mappings;
 using Corax.Querying;
 using Corax.Querying.Matches;
+using Corax.Querying.Matches.Meta;
 using Raven.Server.Documents.Queries;
 using Raven.Server.Documents.Queries.AST;
 using Raven.Server.Documents.Queries.Timings;
@@ -41,6 +42,15 @@ public partial class CoraxQueryBuilder
         public readonly bool DeduplicationDisabled;
         public readonly IndexReadOperationBase IndexReadOperation;
         public StreamingOptimization StreamingDisabled;
+        public bool JoinScoresNeeded;
+
+        // Only a query that reads a page of the matches (and not all of them) may take the first entries of a join in its order, see JoinOrderedWalk
+        public bool AllowJoinOrderedWalk;
+
+        // A query that reads a page of the matches in the order of the ids of the entries may test the entries one by one instead of reading the whole join, see JoinFirstEntries
+        public bool AllowJoinFirstEntries;
+        // Gives the match of the more-like-this condition of a query with a JOIN
+        public Func<IQueryMatch> MoreLikeThisMatch;
         public readonly bool IsVectorSingleClause;
         public readonly QueryTimeScope QueryTime;
         public readonly QueryTimingsScope QueryTimings;
@@ -77,19 +87,36 @@ public partial class CoraxQueryBuilder
                                              || (Metadata.HasVectorSearch && index.Configuration.CoraxVectorSearchOrderByScoreAutomatically));
 
             // in case when we've implicit boosting we've built primitives with scoring enabled
-            QueryHasBoost = (index.HasBoostedFields
+            // A join adds the scores of its sub-queries to the outer rows, so it asks for scores whether or not the page is ordered by them
+            var joinNeedsScores = (query.Metadata.Query.Joins != null && query.Metadata.OrderBy is null && query.Metadata.HasFacet == false)
+                                  || query.IsJoinSource
+                                  || (index.Configuration.CoraxIncludeDocumentScore && HasJoinOrdering(query.Metadata.OrderBy));
+            QueryHasBoost = ((index.HasBoostedFields
                         || query.Metadata.HasBoost
                         || IsVectorSingleClause
                         || (query.Metadata.HasVectorSearch && index.Configuration.CoraxVectorSearchOrderByScoreAutomatically)
                         || HasBoostingAsOrderingType(query.Metadata.OrderBy))
-                       && (IsVectorSingleClause || ScoresAreConsumed(query, AllowImplicitScoreOrdering));
+                       && (IsVectorSingleClause || ScoresAreConsumed(query, AllowImplicitScoreOrdering)))
+                       || joinNeedsScores;
             Allocator = allocator;
             IndexReadOperation = indexReadOperation;
             DeduplicationDisabled = deduplicationDisabled;
         }
         
         public bool NeedsScoresBuffer() => HasBoost
-            && (Index.Configuration.CoraxIncludeDocumentScore || (IndexReadOperation.IsSharded && Metadata.HasVectorSearch));
+            && (Index.Configuration.CoraxIncludeDocumentScore || Query.IsJoinSource || (IndexReadOperation?.IsSharded == true && Metadata.HasVectorSearch));
+
+        private static bool HasJoinOrdering(OrderByField[] orderBy)
+        {
+            if (orderBy is null)
+                return false;
+
+            foreach (var field in orderBy)
+                if (field.JoinAlias != null)
+                    return true;
+
+            return false;
+        }
 
         // AndNotMatch never scores its excluded side
         public bool HasBoost => QueryHasBoost && NegationDepth == 0;

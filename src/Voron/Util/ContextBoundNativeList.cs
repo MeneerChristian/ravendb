@@ -99,6 +99,12 @@ namespace Voron.Util
             Inner.Grow(_ctx, addition);
         }
 
+        // Grows to hold at least this many items in all, without the waste of a power of two
+        public void GrowFitting(int minCapacity)
+        {
+            Inner.GrowFitting(_ctx, minCapacity);
+        }
+
         public int CopyTo(Span<T> destination, int startFrom)
         {
             return Inner.CopyTo(destination, startFrom);

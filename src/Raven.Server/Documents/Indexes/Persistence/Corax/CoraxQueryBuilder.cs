@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text;
 using Corax;
@@ -26,8 +27,13 @@ using Spatial4n.Shapes;
 using ArgumentException = System.ArgumentException;
 using RavenConstants = Raven.Client.Constants;
 using IndexSearcher = Corax.Querying.IndexSearcher;
+using CompositeJoinKeys = Corax.Querying.CompositeJoinKeys;
+using JoinTermScores = Corax.Querying.JoinTermScores;
+using CompositeKeyLimitException = Corax.Querying.CompositeKeyLimitException;
+using CompositeKeyBuilder = Corax.Querying.CompositeKeyBuilder;
 using CoraxConstants = Corax.Constants;
 using SpatialUnits = Raven.Client.Documents.Indexes.Spatial.SpatialUnits;
+using FieldIndexing = Raven.Client.Documents.Indexes.FieldIndexing;
 using MoreLikeThisQuery = Raven.Server.Documents.Queries.MoreLikeThis.Corax;
 
 namespace Raven.Server.Documents.Indexes.Persistence.Corax;
@@ -187,8 +193,11 @@ public static partial class CoraxQueryBuilder
             sortMetadata = GetSortMetadata(builderParameters, out var hasEmptySortingMatches);
             var dynamicFieldsMayBypassMarker = builderParameters.HasDynamics
                                                && IndexDefinitionBaseServerSide.IndexVersion.IsPerEntryMultipleTermsMarkerSupported(builderParameters.Index.Definition.Version) == false;
-            var streamingOptimization = new StreamingOptimization(indexSearcher, sortMetadata, builderParameters.HasBoost, dynamicFieldsMayBypassMarker);
-            
+            builderParameters.JoinScoresNeeded = metadata.Query.Joins != null && (builderParameters.NeedsScoresBuffer() || HasScoreOrdering(sortMetadata) || metadata.HasMoreLikeThis);
+            // a LEFT JOIN that nothing scores does not change which entries match or in which order
+            var joinsChangeMatches = HasJoinThatChangesMatches(builderParameters);
+            var streamingOptimization = new StreamingOptimization(indexSearcher, sortMetadata, builderParameters.HasBoost || joinsChangeMatches, dynamicFieldsMayBypassMarker);
+
             if (metadata.Query.Where is not null)
             {
                 coraxQuery = ToCoraxQuery(builderParameters, metadata.Query.Where, ref streamingOptimization);
@@ -198,6 +207,7 @@ public static partial class CoraxQueryBuilder
             }
             else if (sortMetadata is [{ FieldType: MatchCompareFieldType.Floating or MatchCompareFieldType.Integer or MatchCompareFieldType.Sequence } sortBy, ..]
                      && dynamicFieldsMayBypassMarker == false
+                     && joinsChangeMatches == false // the join is applied on top of the matches, the sort field cannot be streamed
                      && indexSearcher.SortFieldTreeCoversAllEntries(sortBy.Field, sortBy.FieldType))
             {
                 // The cap counts terms, so it may only be applied while every scanned term yields a returned document.
@@ -251,6 +261,68 @@ public static partial class CoraxQueryBuilder
                 coraxQuery = indexSearcher.Memoize(indexSearcher.AllEntries()).Replay();
             }
 
+            if (metadata.Query.Joins != null)
+            {
+                var whereMatch = metadata.Query.Where is null ? null : coraxQuery;
+                var walk = JoinOrderedWalkOf(builderParameters, sortMetadata, whereMatch) ?? JoinFirstEntriesOf(builderParameters, sortMetadata, whereMatch);
+                if (walk != null)
+                {
+                    coraxQuery = walk;
+                    streamingOptimization.SkipOrderByClause = true;
+                }
+                else
+                {
+                // the join matches are not ordered by the sort field
+                ScoreMapMatch? ranks = null;
+                var ranksAreRelevance = false;
+                var coraxIsAllEntries = metadata.Query.Where is null;
+                for (var i = 0; i < metadata.Query.Joins.Count; i++)
+                {
+                    if (metadata.Query.Joins[i].ReferencedInWhere)
+                        continue;
+
+                    if (metadata.Query.Joins[i].IsLeft)
+                    {
+                        // an optional join: every entry stays, the score of the joined document is added to the entries that have one
+                        var leftMatch = BuildJoinMatch(builderParameters, i, leftJoin: true);
+                        if (leftMatch is ScoreMapMatch scores)
+                        {
+                            if (scores.Count > 0)
+                            {
+                                coraxQuery = new ScoreAddMatch<IQueryMatch>(coraxQuery, scores);
+                                coraxIsAllEntries = false;
+                            }
+
+                            // the entries without a joined document have no rank: they sort last
+                            if (builderParameters.Query.JoinResults[i].RankedByInnerOrder)
+                            {
+                                ranks = scores;
+                                ranksAreRelevance = builderParameters.Query.JoinResults[i].Keys.HasRanks;
+                            }
+                        }
+
+                        continue;
+                    }
+
+                    var joinMatch = BuildJoinMatch(builderParameters, i);
+                    coraxQuery = indexSearcher.And(coraxQuery, joinMatch);
+                    coraxIsAllEntries = false;
+                    if (builderParameters.Query.JoinResults[i].RankedByInnerOrder && joinMatch is ScoreMapMatch joinRanks)
+                    {
+                        ranks = joinRanks;
+                        ranksAreRelevance = builderParameters.Query.JoinResults[i].Keys.HasRanks;
+                    }
+                }
+
+                // the position in the order of the join is the sort key, the score stays the relevance
+                if (ranks != null)
+                    coraxQuery = new RankedMatch<IQueryMatch>(coraxQuery, ranks.Value, ranksAreRelevance);
+
+                if (joinsChangeMatches)
+                    streamingOptimization.SkipOrderByClause = false;
+                }
+            }
+
             if (sortMetadata is not null)
             {
                 // In the case of ordering by multiple fields, we still want to benefit from the streaming
@@ -267,6 +339,366 @@ public static partial class CoraxQueryBuilder
             return DeduplicationMatch(builderParameters, coraxQuery);
         }
     }
+
+    private static bool HasScoreOrdering(OrderMetadata[] sortMetadata)
+    {
+        if (sortMetadata is null)
+            return false;
+
+        foreach (var sort in sortMetadata)
+        {
+            if (sort.FieldType is MatchCompareFieldType.Score or MatchCompareFieldType.Rank)
+                return true;
+        }
+
+        return false;
+    }
+
+    private static bool HasJoinThatChangesMatches(Parameters builderParameters)
+    {
+        var joins = builderParameters.Metadata.Query.Joins;
+        if (joins == null)
+            return false;
+
+        for (var i = 0; i < joins.Count; i++)
+        {
+            if (joins[i].Filters)
+                return true;
+
+            if (builderParameters.JoinScoresNeeded && (builderParameters.Query.JoinResults?[i].Boost != 0f || builderParameters.Query.JoinResults[i].RankedByInnerOrder))
+                return true;
+        }
+
+        return false;
+    }
+
+    // The join that orders by its sub-query, answered by the first entries of the order of the joined index. Null when the rank of every entry is needed.
+    private static IQueryMatch JoinOrderedWalkOf(Parameters builderParameters, OrderMetadata[] sortMetadata, IQueryMatch outer)
+    {
+        var metadata = builderParameters.Metadata;
+        var join = metadata.Query.Joins[0];
+        var joinResult = builderParameters.Query.JoinResults?[0];
+        if (joinResult?.OrderedKeys == null || builderParameters.AllowJoinOrderedWalk == false || metadata.Query.Joins.Count != 1)
+            return null;
+
+        if (sortMetadata is not [{ FieldType: MatchCompareFieldType.Rank }] || builderParameters.Take < 0 || (metadata.Query.Where is not null && outer is null))
+            return null;
+
+        if (builderParameters.NeedsScoresBuffer() || metadata.HasMoreLikeThis || metadata.HasVectorSearch || metadata.HasHighlightings || metadata.HasFacet || metadata.HasExplanations)
+            return null;
+
+        var (fieldName, fieldMetadata) = OuterJoinField(builderParameters, join);
+
+        // an entry under several keys would be counted and returned once for each of them
+        if (IndexDefinitionBaseServerSide.IndexVersion.IsPerEntryMultipleTermsMarkerSupported(builderParameters.Index.Definition.Version) == false
+            || builderParameters.IndexSearcher.HasMultipleTermsInField(fieldMetadata))
+            return null;
+
+        var keysAreTerms = ResolveJoinKeyCase(builderParameters, join, joinResult, fieldName, fieldMetadata) == false && joinResult.KeysAreTerms;
+        var timings = joinResult.Timings;
+        var stopwatch = Stopwatch.StartNew();
+        var match = builderParameters.IndexSearcher.JoinOrderedWalk(fieldMetadata, joinResult.Keys, joinResult.OrderedKeys, keysAreTerms, outer, builderParameters.Take);
+        timings?.AddCounter("JoinOrderedWalkCountMicroseconds", stopwatch.ElapsedTicks * 1_000_000 / Stopwatch.Frequency);
+        timings?.AddCounter("JoinOrderedWalk", 1);
+        builderParameters.BuildSteps?.Add($"Join ordered walk: {join.On} ({joinResult.Keys.Count} keys, {match.TotalResults} entries)");
+        return match;
+    }
+
+    // The join of a query without an order whose page is read from the first matches: the entries are tested in the order of their ids, the lists of the keys are not merged. Null when the join has to be read whole.
+    // A query that has a join and no ORDER BY orders its matches by score, which does not order them when every key of the join has the same score
+    private static IQueryMatch JoinFirstEntriesOf(Parameters builderParameters, OrderMetadata[] sortMetadata, IQueryMatch outer)
+    {
+        var metadata = builderParameters.Metadata;
+        if (JoinFirstEntriesSettings.Enabled == false || builderParameters.AllowJoinFirstEntries == false || metadata.Query.Joins.Count != 1)
+            return null;
+
+        var orderedByScoreOnly = sortMetadata is [{ FieldType: MatchCompareFieldType.Score }] && metadata.OrderBy == null;
+        if (sortMetadata != null && orderedByScoreOnly == false)
+            return null;
+
+        var join = metadata.Query.Joins[0];
+        var joinResult = builderParameters.Query.JoinResults?[0];
+        if (joinResult == null || joinResult.RankedByInnerOrder || joinResult.OrderedKeys != null)
+            return null;
+
+        if (join.IsLeft || join.IsComposite || join.ReferencedInWhere || join.Compare != null || join.Query.Joins != null)
+            return null;
+
+        if (builderParameters.Take < 0 || builderParameters.Take > JoinFirstEntriesSettings.MaximumTake || metadata.FilterScript is not null)
+            return null;
+
+        // the scores of the entries of a where, and the scores that are returned, are not the ones of the keys
+        if (orderedByScoreOnly ? outer != null || builderParameters.NeedsScoresBuffer() || KeysScoreDiffer(joinResult.Keys) : builderParameters.JoinScoresNeeded)
+            return null;
+
+        if (metadata.HasMoreLikeThis || metadata.HasVectorSearch || metadata.HasHighlightings || metadata.HasFacet || metadata.HasExplanations)
+            return null;
+
+        var (fieldName, fieldMetadata) = OuterJoinField(builderParameters, join);
+
+        // an entry under several keys would be counted and returned once for each of them
+        if (IndexDefinitionBaseServerSide.IndexVersion.IsPerEntryMultipleTermsMarkerSupported(builderParameters.Index.Definition.Version) == false
+            || builderParameters.IndexSearcher.HasMultipleTermsInField(fieldMetadata))
+            return null;
+
+        var keysAreTerms = ResolveJoinKeyCase(builderParameters, join, joinResult, fieldName, fieldMetadata) == false && joinResult.KeysAreTerms;
+        var keysReachTerms = keysAreTerms || JoinEncodedKeys.KeysReachTreeUnchanged(joinResult.InnerIndex, builderParameters.Index, fieldName);
+        var countTotal = builderParameters.Query.IsCountQuery || builderParameters.Query.SkipStatistics == false;
+        var timings = joinResult.Timings;
+        var allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+        var stopwatch = Stopwatch.StartNew();
+        if (builderParameters.IndexSearcher.TryJoinFirstEntries(fieldMetadata, joinResult.Keys, keysAreTerms, UseEncodedKeys(builderParameters, joinResult, fieldName), keysReachTerms, outer,
+                builderParameters.Take, countTotal, out var match) == false)
+            return null;
+
+        timings?.AddCounter("JoinFirstEntries", 1);
+        timings?.AddCounter("JoinFirstEntriesMicroseconds", stopwatch.ElapsedTicks * 1_000_000 / Stopwatch.Frequency);
+        timings?.AddCounter("JoinFirstEntriesScanned", match.ScannedEntries);
+        timings?.AddCounter("JoinFirstEntriesKeysProbed", match.ProbedKeys ? 1 : 0);
+        timings?.AddCounter("JoinFirstEntriesFromLists", match.CollectedFromLists ? 1 : 0);
+        timings?.AddCounter("OuterMatchKeys", joinResult.Keys.Count);
+        timings?.AddCounter("OuterMatchAllocatedManagedBytes", GC.GetAllocatedBytesForCurrentThread() - allocatedBefore);
+        builderParameters.BuildSteps?.Add($"Join first entries: {join.On} ({joinResult.Keys.Count} keys, {(match.TotalIsKnown ? match.TotalResults.ToString() : "unknown number of")} entries)");
+        return match;
+    }
+
+    private static bool KeysScoreDiffer(JoinTermScores keys)
+    {
+        for (var i = 1; i < keys.Count; i++)
+        {
+            if (keys.Score(i) != keys.Score(0))
+                return true;
+        }
+
+        return false;
+    }
+
+    private static (string FieldName, FieldMetadata Field) OuterJoinField(Parameters builderParameters, JoinClause join)
+    {
+        var metadata = builderParameters.Metadata;
+        var fieldName = QueryBuilderHelper.ExtractIndexFieldName(metadata.Query, builderParameters.QueryParameters, join.On.Left, metadata);
+        var exact = QueryBuilderHelper.IsExact(builderParameters.Index, false, fieldName);
+        var fieldMetadata = QueryBuilderHelper.GetFieldMetadata(builderParameters.Allocator, fieldName, builderParameters.Index, builderParameters.IndexFieldsMapping,
+            builderParameters.FieldsToFetch, builderParameters.HasDynamics, builderParameters.DynamicFields, exact: exact);
+        return (fieldName, fieldMetadata);
+    }
+
+    private static IQueryMatch BuildJoinMatch(Parameters builderParameters, int joinIndex, bool leftJoin = false, bool inWhere = false)
+    {
+        builderParameters.Query.JoinResults[joinIndex].EnsureRanked();
+        if (builderParameters.Query.JoinResults[joinIndex].RankedByInnerOrder)
+            builderParameters.Query.JoinResults[joinIndex].Timings?.AddCounter("JoinOrderedWalk", 0);
+
+        var allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+        var joinMatch = JoinMatch(builderParameters, joinIndex, builderParameters.JoinScoresNeeded, leftJoin, inWhere);
+
+        // reported next to the scan statistics of the same join
+        var joinTimings = builderParameters.Query.JoinResults[joinIndex].Timings;
+        joinTimings?.AddCounter("OuterMatchKeys", builderParameters.Query.JoinResults[joinIndex].Keys?.Count ?? 0);
+        joinTimings?.AddCounter("OuterMatchAllocatedManagedBytes", GC.GetAllocatedBytesForCurrentThread() - allocatedBefore);
+        return joinMatch;
+    }
+
+    private static IQueryMatch MatchesJoin(Parameters builderParameters, MethodExpression matches)
+    {
+        var alias = ((FieldExpression)matches.Arguments[0]).Compound[0];
+        var joins = builderParameters.Metadata.Query.Joins;
+        for (var i = 0; i < joins.Count; i++)
+        {
+            if (joins[i].Alias == alias)
+                return BuildJoinMatch(builderParameters, i, inWhere: true);
+        }
+
+        throw new InvalidQueryException($"matches({alias}) refers to '{alias}', which is not the alias of a JOIN of this query.", builderParameters.Metadata.QueryText, builderParameters.QueryParameters);
+    }
+
+    // Restricts the query to the entries whose join field equals one of the keys returned by the JOIN sub-query
+    private static IQueryMatch JoinMatch(Parameters builderParameters, int joinIndex, bool scoreNeeded, bool leftJoin = false, bool inWhere = false)
+    {
+        var metadata = builderParameters.Metadata;
+        var join = metadata.Query.Joins[joinIndex];
+        var keys = builderParameters.Query.JoinResults?[joinIndex].Keys
+                   ?? throw new InvalidQueryException("JOIN is not supported in this kind of query (it works in queries, index entries queries, streaming and facets, " +
+                                                      "not in suggestions or more-like-this queries).", metadata.QueryText, builderParameters.QueryParameters);
+
+        var (fieldName, fieldMetadata) = OuterJoinField(builderParameters, join);
+
+        var joinResult = builderParameters.Query.JoinResults[joinIndex];
+        if (join.IsComposite)
+            return CompositeJoinMatch(builderParameters, join, joinResult, scoreNeeded, leftJoin);
+
+        // a field that lowercases is searched case-insensitively
+        var fold = ResolveJoinKeyCase(builderParameters, join, joinResult, fieldName, fieldMetadata);
+        var keysAreTerms = fold == false && joinResult.KeysAreTerms;
+
+        if (join.Compare != null)
+        {
+            // the rows that have a joined document, kept when the fields of the row and of its joined document compare as asked
+            var filter = JoinCompareFilter.Create(builderParameters.IndexSearcher, metadata, builderParameters.QueryParameters, builderParameters.Index, joinResult, join.Compare);
+            builderParameters.BuildSteps?.Add($"Join compare: {join.Alias} ({keys.Count} keys)");
+            return new JoinCompareMatch(ScoreMapOfJoinKeys(builderParameters, joinResult, fieldName, fieldMetadata, fold, keysAreTerms), filter);
+        }
+
+        // a join with BOOST 0 adds nothing to the score (the ranks of a join that orders are still needed)
+        scoreNeeded &= joinResult.Boost != 0f || joinResult.RankedByInnerOrder;
+
+        builderParameters.BuildSteps?.Add($"{(leftJoin ? "Left join" : "Join")}: {join.On} ({keys.Count} keys, scores {(scoreNeeded ? "used" : "not needed")}, boost {joinResult.Boost})");
+
+        // a LEFT JOIN that is not scored adds nothing, every entry stays
+        if (leftJoin && scoreNeeded == false)
+            return null;
+
+        if (scoreNeeded == false)
+        {
+            // nothing looks at the scores, so a plain IN is all that is needed
+            if (keys.Count == 0)
+                return builderParameters.IndexSearcher.EmptyMatch();
+
+            // the keys of a join on a field are terms of the joined index: they are matched as they are
+            return builderParameters.IndexSearcher.InQuery(fieldMetadata, keys, keysAreTerms, builderParameters.Token, UseEncodedKeys(builderParameters, joinResult, fieldName));
+        }
+
+        return ScoreMapOfJoinKeys(builderParameters, joinResult, fieldName, fieldMetadata, fold, keysAreTerms);
+    }
+
+    // The keys that fold to the same term are one key: the score of a row counts the best of their scores once
+    private static ScoreMapMatch ScoreMapOfJoinKeys(Parameters builderParameters, JoinResult joinResult, string fieldName, in FieldMetadata fieldMetadata, bool fold, bool keysAreTerms)
+    {
+        if (fold == false)
+            return builderParameters.IndexSearcher.ScoreMap(fieldMetadata, joinResult.Keys, keysAreTerms, joinResult.Boost, UseEncodedKeys(builderParameters, joinResult, fieldName));
+
+        joinResult.FoldedDistinctKeys ??= CompositeJoinKeys.FoldDistinct(joinResult.InnerAllocator, joinResult.Keys);
+        return builderParameters.IndexSearcher.ScoreMap(fieldMetadata, joinResult.FoldedDistinctKeys, termsAreIndexedTerms: true, scoreFactor: joinResult.Boost);
+    }
+
+    // The keys are ids kept as the joined index encoded them, and the outer field holds them unchanged
+    private static bool UseEncodedKeys(Parameters builderParameters, JoinResult joinResult, string outerField)
+        => joinResult.Keys.IsEncoded && JoinEncodedKeys.KeysReachTreeUnchanged(joinResult.InnerIndex, builderParameters.Index, outerField);
+
+    // A join on several fields: the entries that hold the value of the first field of one of the keys are the candidates
+    private static IQueryMatch CompositeJoinMatch(Parameters builderParameters, JoinClause join, JoinResult joinResult, bool scoreNeeded, bool leftJoin)
+    {
+        var metadata = builderParameters.Metadata;
+        var pairs = join.Pairs.ToList();
+        var outerFields = new string[pairs.Count];
+        var fold = new bool[pairs.Count];
+        FieldMetadata first = default;
+        for (var i = 0; i < pairs.Count; i++)
+        {
+            var fieldName = QueryBuilderHelper.ExtractIndexFieldName(metadata.Query, builderParameters.QueryParameters, pairs[i].On.Left, metadata);
+            outerFields[i] = fieldName.Value;
+            var exact = QueryBuilderHelper.IsExact(builderParameters.Index, false, fieldName);
+            var fieldMetadata = QueryBuilderHelper.GetFieldMetadata(builderParameters.Allocator, fieldName, builderParameters.Index, builderParameters.IndexFieldsMapping,
+                builderParameters.FieldsToFetch, builderParameters.HasDynamics, builderParameters.DynamicFields, exact: exact);
+            if (i == 0)
+                first = fieldMetadata;
+
+            fold[i] = ResolveJoinKeyCase(builderParameters, join, joinResult, fieldName, fieldMetadata, joinResult.PairKeyProbes[i], pairs[i].InnerField, joinResult.PairInnerModes[i]);
+        }
+
+        if (fold.Contains(true))
+            joinResult.CompositeProbe ??= CompositeJoinKeys.Fold(joinResult.InnerAllocator, joinResult.Keys, fold);
+
+        scoreNeeded &= joinResult.Boost != 0f;
+        builderParameters.BuildSteps?.Add($"{(leftJoin ? "Left join" : "Join")} on {pairs.Count} fields: {join.On} ({joinResult.Keys.Count} keys, scores {(scoreNeeded ? "used" : "not needed")}, boost {joinResult.Boost})");
+
+        if (leftJoin && scoreNeeded == false)
+            return null;
+
+        if (joinResult.Keys.Count == 0)
+            return builderParameters.IndexSearcher.EmptyMatch();
+
+        var searcher = builderParameters.IndexSearcher;
+        var candidates = searcher.ScoreMap(first, joinResult.CompositeFirstTerms, termsAreIndexedTerms: fold[0] == false);
+        try
+        {
+            return searcher.ScoreMapOfCompositeKeys(candidates, outerFields, joinResult.CompositeProbe ?? joinResult.Keys, scoreNeeded ? joinResult.Boost : 0f);
+        }
+        catch (CompositeKeyLimitException e)
+        {
+            throw new InvalidQueryException($"An entry of the query has fields ({string.Join(", ", outerFields)}) that hold more combinations of values than the {CompositeKeyBuilder.MaxCombinations} that are supported by {join.On}.",
+                metadata.QueryText, builderParameters.QueryParameters, e);
+        }
+    }
+
+    // A value with upper case letters and no separator, so that every analyzer maps it to a single token
+    internal const string JoinKeyProbe = "\u00c4bCZ1";
+
+    internal static string AnalyzeJoinKeyProbe(IndexSearcher searcher, in FieldMetadata field)
+        => Encoding.UTF8.GetString(searcher.EncodeAndApplyAnalyzer(field, JoinKeyProbe).AsReadOnlySpan());
+
+    // A value with separators and upper case letters
+    internal const string JoinKeySeparatorProbe = "Ab-C/D e";
+
+    // A join compares the terms of the index
+    private static bool ResolveJoinKeyCase(Parameters builderParameters, JoinClause join, JoinResult result, string fieldName, in FieldMetadata lookup)
+    {
+        var fold = ResolveJoinKeyCase(builderParameters, join, result, fieldName, lookup, result.KeyProbe, join.InnerField, result.InnerIndexingMode);
+        if (fold)
+            result.FoldCase = true;
+
+        return fold;
+    }
+
+    private static bool ResolveJoinKeyCase(Parameters builderParameters, JoinClause join, JoinResult result, string fieldName, in FieldMetadata lookup, string keyProbe, string innerField, FieldIndexingMode innerMode)
+    {
+        if (keyProbe == null)
+            return false;
+
+        // the ids of the entries are lowercased: the keys of a joined field that keeps the case are lowercased to match them
+        if (fieldName == RavenConstants.Documents.Indexing.Fields.DocumentIdFieldName)
+            return result.KeysAreTerms && keyProbe == JoinKeyProbe;
+
+        // a Key field is lowercased like an id, and like another Key field
+        var outerIsKey = IsKeyField(builderParameters.Index, fieldName);
+        if (outerIsKey && (result.KeysAreTerms == false || IsKeyField(result.InnerIndex, innerField)))
+            return false;
+
+        if (builderParameters.IndexFieldsMapping.TryGetByFieldName(builderParameters.Allocator, fieldName, out var binding) == false)
+            return false;
+
+        var searcher = builderParameters.IndexSearcher;
+        var stored = AnalyzeJoinKeyProbe(searcher, binding.Metadata);
+        // the keys of a field join are terms that are matched as they are
+        var looked = result.KeysAreTerms ? keyProbe : Encoding.UTF8.GetString(searcher.EncodeAndApplyAnalyzer(lookup, keyProbe).AsReadOnlySpan());
+
+        if (stored == looked)
+            return false;
+
+        if (result.KeysAreTerms && keyProbe == JoinKeyProbe && binding.FieldIndexingMode == FieldIndexingMode.Normal && stored == JoinKeyProbe.ToLowerInvariant() &&
+            Encoding.UTF8.GetString(searcher.EncodeAndApplyAnalyzer(binding.Metadata, JoinKeySeparatorProbe).AsReadOnlySpan()) == JoinKeySeparatorProbe.ToLowerInvariant())
+        {
+            return true;
+        }
+
+        var outerIndexing = DescribeIndexing(binding.FieldIndexingMode);
+        string message;
+        if (result.KeysAreTerms)
+        {
+            message = $"The JOIN with '{join.Alias}' would never match: the field '{fieldName}' of the index '{builderParameters.Index.Name}' is {outerIndexing} (the value '{JoinKeyProbe}' is indexed as '{stored}'), " +
+                      $"but the field '{innerField}' of the joined index '{result.InnerIndexName}' is {DescribeIndexing(innerMode)} ('{JoinKeyProbe}' is indexed as '{keyProbe}'), " +
+                      "and a join compares the terms of both fields as they are. Index both fields the same way (both with the default indexing, or both Exact), or index them with FieldIndexing.Key.";
+        }
+        else
+        {
+            message = $"The JOIN with '{join.Alias}' would never match: the field '{fieldName}' of the index '{builderParameters.Index.Name}' is {outerIndexing} (the value '{JoinKeyProbe}' is indexed as '{stored}'), " +
+                      $"but a join on id({join.Alias}) compares the lowercased ids of the documents of '{join.Alias}' ('{JoinKeyProbe}' becomes '{looked}'). " +
+                      $"Index '{fieldName}' with the default indexing (remove the Exact option or the custom analyzer) so that its terms are lowercased too, or index it with FieldIndexing.Key. " +
+                      $"A field with the default indexing is searched case-insensitively, like a document id (where {fieldName} = 'COMPANIES-8213-A' finds 'companies-8213-a'), and this is what a join on id({join.Alias}) compares.";
+        }
+
+        throw new InvalidQueryException(message, builderParameters.Metadata.QueryText, builderParameters.QueryParameters);
+    }
+
+    private static bool IsKeyField(Index index, string field)
+        => field != null && index.Definition.IndexFields.TryGetValue(field, out var indexField) && indexField.Indexing == FieldIndexing.Key;
+
+    private static string DescribeIndexing(FieldIndexingMode mode) => mode switch
+    {
+        FieldIndexingMode.Exact => "indexed Exact",
+        FieldIndexingMode.Search => "indexed Search",
+        _ => "indexed with the default indexing"
+    };
 
     private static IQueryMatch DeduplicationMatch(Parameters parameters, IQueryMatch match)
     {
@@ -364,6 +796,12 @@ public static partial class CoraxQueryBuilder
                                 if (right is CoraxWhenQuery)
                                     return left;
                                 
+                                // the comparison of fields reads every entry it looks at
+                                if (right is JoinCompareMatch { IsDriven: false } rightCompare && left is not JoinCompareMatch)
+                                    return rightCompare.DrivenBy(MaterializeWhenNeeded(builderParameters, left, ref builderParameters.StreamingDisabled));
+                                if (left is JoinCompareMatch { IsDriven: false } leftCompare && right is not JoinCompareMatch)
+                                    return leftCompare.DrivenBy(MaterializeWhenNeeded(builderParameters, right, ref builderParameters.StreamingDisabled));
+
                                 // in case of AND we can materialize only TermMatches, we push streamingOptimization there only for changing order for MultiTermMatch;
                             if (left is CoraxBooleanItem cbi && leftOnlyOptimization.TrySetAsStreamingField(builderParameters, cbi, right))
                                     left = cbi.Materialize(ref leftOnlyOptimization);
@@ -530,6 +968,8 @@ public static partial class CoraxQueryBuilder
             {
                 case MethodType.Search:
                     return HandleSearch(builderParameters, me);
+                case MethodType.Matches:
+                    return MatchesJoin(builderParameters, me);
                 case MethodType.Proximity:
                     throw new NotSupportedInCoraxException($"{nameof(Corax)} doesn't support proximity over search() method");
                 case MethodType.Fuzzy:
@@ -558,7 +998,7 @@ public static partial class CoraxQueryBuilder
                 case MethodType.Regex:
                     return HandleRegex(builderParameters, me, ref leftOnlyOptimization);
                 case MethodType.MoreLikeThis:
-                    return builderParameters.IndexSearcher.AllEntries();
+                    return builderParameters.MoreLikeThisMatch != null ? builderParameters.MoreLikeThisMatch() : builderParameters.IndexSearcher.AllEntries();
                 default:
                     QueryMethod.ThrowMethodNotSupported(methodType, metadata.QueryText, queryParameters);
                     return null; // never hit
@@ -657,12 +1097,16 @@ public static partial class CoraxQueryBuilder
         return builderParameters.IndexSearcher.InQuery(fieldMetadata, matches);
     }
 
-    public static MoreLikeThisQuery.MoreLikeThisQuery BuildMoreLikeThisQuery(Parameters builderParameters, QueryExpression whereExpression)
+    public static MoreLikeThisQuery.MoreLikeThisQuery BuildMoreLikeThisQuery(Parameters builderParameters, QueryExpression whereExpression, bool buildFilter = true)
     {
         using (CultureHelper.EnsureInvariantCulture())
         {
-            var filterQuery = BuildQuery(builderParameters, out _);
-            filterQuery = MaterializeWhenNeeded(builderParameters, filterQuery, ref builderParameters.StreamingDisabled);
+            IQueryMatch filterQuery = null;
+            if (buildFilter)
+            {
+                filterQuery = BuildQuery(builderParameters, out _);
+                filterQuery = MaterializeWhenNeeded(builderParameters, filterQuery, ref builderParameters.StreamingDisabled);
+            }
 
             var moreLikeThisQuery = ToMoreLikeThisQuery(builderParameters, whereExpression, out var baseDocument, out var options);
             moreLikeThisQuery = MaterializeWhenNeeded(builderParameters, moreLikeThisQuery, ref builderParameters.StreamingDisabled);
@@ -1287,8 +1731,10 @@ public static partial class CoraxQueryBuilder
             return null;
         }
 
-        if (query.Metadata.HasMoreLikeThis) // MoreLikeThis orders its matches by score itself
+        if (query.Metadata.HasMoreLikeThis && query.Metadata.Query.Joins == null) // MoreLikeThis orders its matches by score itself (with a JOIN the query orders them like any other)
             return null;
+        if (query.IsJoinSource && query.Metadata.OrderBy == null)
+            return null; // the sub-query of a join is scanned as a whole, the order of its keys is irrelevant (unless the main query orders by it)
 
         var orderByFields = query.Metadata.OrderBy;
 
@@ -1316,8 +1762,25 @@ public static partial class CoraxQueryBuilder
         if (orderByFields.Length > sortArray.Length)
             throw new InvalidOperationException($"Corax does not support ordering by more than {sortArray.Length} properties.");
 
+        var fieldIndex = -1;
         foreach (var field in orderByFields)
         {
+            fieldIndex++;
+            if (field.JoinAlias != null)
+            {
+                // the keys of the join carry their position in the order of the joined index as a rank
+                if (query.JoinResults == null)
+                    throw new InvalidQueryException($"ORDER BY {field.JoinAlias}.{field.Name} is only supported in a query that has the JOIN.", query.Query, query.QueryParameters);
+
+                if (builderParameters.IndexSearcher.DocumentsAreBoosted)
+                    throw new InvalidQueryException($"ORDER BY {field.JoinAlias}.{field.Name} is not supported when the documents of the main index are boosted.", query.Query, query.QueryParameters);
+
+                if (fieldIndex == 0 || orderByFields[fieldIndex - 1].JoinAlias != field.JoinAlias)
+                    sortArray[sortIndex++] = new OrderMetadata(true, MatchCompareFieldType.Rank); // the lowest position first
+
+                continue;
+            }
+
             var nullsSortMode = (field.NullsOrdering, field.Ascending) switch
             {
                 (NullsOrderingType.First, Ascending: true) => NullsSortMode.NullsSmallest,

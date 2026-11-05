@@ -6,6 +6,7 @@ using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using Corax.Querying;
+using Corax.Utils;
 using Jint;
 using Jint.Native;
 using Jint.Native.Object;
@@ -14,6 +15,7 @@ using Lucene.Net.Documents;
 using Lucene.Net.Store;
 using Raven.Client.Documents.Indexes;
 using Raven.Client.Documents.Linq;
+using Raven.Client.Documents.Queries;
 using Raven.Client.Exceptions;
 using Raven.Server.Documents.Includes;
 using Raven.Server.Documents.Indexes.Persistence.Lucene.Documents;
@@ -51,6 +53,7 @@ namespace Raven.Server.Documents.Queries.Results
 
         private LruDictionary<string, Document> _loadedDocuments;
         private Dictionary<string, Document> _loadedDocumentsByAliasName;
+        private string _aliasNameDocumentId;
         private HashSet<string> _loadedDocumentIds;
 
         protected readonly DocumentFields DocumentFields;
@@ -630,7 +633,7 @@ namespace Raven.Server.Documents.Queries.Results
             public bool IsNumeric;
         }
 
-        private static unsafe bool TryGetValueFromCoraxIndex(JsonOperationContext context, string fieldName, ref RetrieverInput retrieverInput, out object value)
+        internal static unsafe bool TryGetValueFromCoraxIndex(JsonOperationContext context, string fieldName, ref RetrieverInput retrieverInput, out object value)
         {
             long fieldRootPage = retrieverInput.CoraxIndexSearcher.FieldCache.GetLookupRootPage(fieldName);
             ref var reader = ref retrieverInput.CoraxTermsReader;
@@ -823,6 +826,13 @@ namespace Raven.Server.Documents.Queries.Results
             }
             _loadedDocumentIds.Clear();
 
+            // the documents loaded by alias belong to one row
+            if (string.Equals(_aliasNameDocumentId, document.Id, StringComparison.Ordinal) == false)
+            {
+                _loadedDocumentsByAliasName.Clear();
+                _aliasNameDocumentId = document.Id;
+            }
+
             //_loadedDocuments.Clear(); - explicitly not clearing this, we want to cache this for the duration of the query
 
             _loadedDocuments[document.Id ?? string.Empty] = document;
@@ -847,10 +857,24 @@ namespace Raven.Server.Documents.Queries.Results
                 }
                 else if (fieldToFetch.QueryField.LoadFromAlias != null)
                 {
-                    if (_loadedDocumentsByAliasName.TryGetValue(fieldToFetch.QueryField.LoadFromAlias, out var loadedDoc))
+                    // the document the alias is loaded through may not have been selected itself
+                    if (_loadedDocumentsByAliasName.TryGetValue(fieldToFetch.QueryField.LoadFromAlias, out var loadedDoc) == false)
+                        loadedDoc = LoadDocumentOfAlias(fieldToFetch.QueryField.LoadFromAlias, document);
+
+                    if (loadedDoc != null)
                     {
                         IncludeUtil.GetDocIdFromInclude(loadedDoc.Data, fieldToFetch.QueryField.SourceAlias, _loadedDocumentIds, _identitySeparator);
+
+                        if (ChainJoinsAreOptional() && AnyMatched(fieldToFetch.QueryField.LoadFromAlias, loadedDoc.Id) == false)
+                            _loadedDocumentIds.Clear();
                     }
+                }
+                else if (QueryMetadata.TryGetMainIdJoinAlias(fieldToFetch.QueryField.SourceAlias, out var mainIdJoinAlias))
+                {
+                    AddDocumentIdsOfMainIdJoin(mainIdJoinAlias, retrieverInput.DocumentId ?? document.Id, token);
+                }
+                else if (TryGetDocumentIdsOfFieldJoin(fieldToFetch, ref retrieverInput))
+                {
                 }
                 else if (fieldToFetch.CanExtractFromIndex)
                 {
@@ -905,6 +929,8 @@ namespace Raven.Server.Documents.Queries.Results
                 _loadedDocumentsByAliasName.Clear();
             }
 
+            RemoveDocumentsOfUnmatchedJoins(fieldToFetch);
+
             if (_loadedDocumentIds.Count == 0)
             {
                 if (fieldToFetch.QueryField.SourceIsArray)
@@ -925,6 +951,23 @@ namespace Raven.Server.Documents.Queries.Results
 
                 if (_loadedDocuments.TryGetValue(docId, out var doc) == false)
                 {
+                    if (TryGetStoredValueOfJoinedDocument(fieldToFetch, docId, out var storedValue))
+                    {
+                        if (storedValue is DynamicJsonArray storedItems)
+                        {
+                            foreach (var item in storedItems)
+                                buffer.Add(item);
+
+                            fieldToFetch.QueryField.SourceIsArray = true;
+                        }
+                        else
+                        {
+                            buffer.Add(storedValue);
+                        }
+
+                        continue;
+                    }
+
                     using (_loadScope = _loadScope?.Start() ?? _projectionScope?.For(nameof(QueryTimingsScope.Names.Load)))
                     {
                         _loadedDocuments[docId] = doc = LoadDocument(docId);
@@ -980,6 +1023,280 @@ namespace Raven.Server.Documents.Queries.Results
             }
             value = null;
             return false;
+        }
+
+        private Document LoadDocumentOfAlias(string alias, Document root)
+        {
+            if (_query.Metadata.RootAliasPaths.TryGetValue(alias, out var path) == false)
+                return null;
+
+            Document from = root;
+            if (path.LoadFromAlias != null)
+            {
+                if (_loadedDocumentsByAliasName.TryGetValue(path.LoadFromAlias, out from) == false)
+                    from = LoadDocumentOfAlias(path.LoadFromAlias, root);
+
+                if (from == null)
+                    return null;
+            }
+
+            var ids = new HashSet<string>();
+            IncludeUtil.GetDocIdFromInclude(from.Data, path.PropertyPath, ids, _identitySeparator);
+
+            foreach (var id in ids)
+            {
+                if (_loadedDocuments.TryGetValue(id, out var loaded) == false)
+                {
+                    _loadedDocuments[id] = loaded = LoadDocument(id);
+                    if (loaded != null)
+                        loaded.IgnoreDispose = true; // so we can do multiple projections of the same value
+                }
+
+                if (loaded == null)
+                    continue;
+
+                _loadedDocumentsByAliasName[alias] = loaded;
+                return loaded;
+            }
+
+            return null;
+        }
+
+        // When the where clause combines the joins with or (matches(u) or matches(d)), a row that matched d still has an owner
+        private void RemoveDocumentsOfUnmatchedJoins(FieldsToFetch.FieldToFetch fieldToFetch)
+        {
+            if (_query?.JoinResults == null || fieldToFetch.QueryField.SourceAlias == null || _loadedDocumentIds.Count == 0)
+                return;
+
+            // two joins can match on the same outer field: the projected alias (u in u.Name) picks the join
+            var projectedAlias = fieldToFetch.QueryField.ExpressionField?.Compound[0].Value;
+
+            // a joined document of a chain is a key of the sub-query of its own join
+            if (fieldToFetch.QueryField.LoadFromAlias != null)
+            {
+                if (projectedAlias != null && ChainJoinsAreOptional())
+                    _loadedDocumentIds.RemoveWhere(id => AnyMatched(projectedAlias, id) == false);
+
+                return;
+            }
+
+            foreach (var join in _query.JoinResults)
+            {
+                // a join that every row has to match loads only matched documents, unless the outer field is a list
+                if (join.KeysAreTerms || (join.IsOptional == false && _loadedDocumentIds.Count < 2) || string.Equals(join.OuterPath, fieldToFetch.QueryField.SourceAlias, StringComparison.OrdinalIgnoreCase) == false)
+                    continue;
+
+                if (projectedAlias != null && string.Equals(join.RootAlias, projectedAlias, StringComparison.OrdinalIgnoreCase) == false)
+                    continue;
+
+                // matches(f) of a chain reads the sub-query of the join once per referenced alias
+                _loadedDocumentIds.RemoveWhere(id => AnyMatched(join.RootAlias, id) == false);
+                return;
+            }
+        }
+
+        // matches() of a chained alias or of a join of the main document
+        private bool ChainJoinsAreOptional()
+        {
+            return _query.Metadata.Query.HasJoinChain && AnyOptional(_query.JoinResults);
+
+            static bool AnyOptional(List<JoinResult> joins)
+            {
+                foreach (var join in joins ?? [])
+                {
+                    if (join.IsOptional || AnyOptional(join.Nested))
+                        return true;
+                }
+
+                return false;
+            }
+        }
+
+        // Whether the document is a key of a join of the alias
+        private bool AnyMatched(string alias, string id)
+        {
+            var any = false;
+            foreach (var join in _query.JoinResults)
+            {
+                if (string.Equals(join.RootAlias, alias, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (MatchesAny(join, id, ref any))
+                        return true;
+                }
+
+                if (MatchesNestedAny(join.Nested, alias, id, ref any))
+                    return true;
+            }
+
+            return any == false;
+        }
+
+        private static bool MatchesNestedAny(List<JoinResult> nested, string alias, string id, ref bool any)
+        {
+            if (nested == null)
+                return false;
+
+            foreach (var join in nested)
+            {
+                if (string.Equals(join.Alias, alias, StringComparison.OrdinalIgnoreCase) && MatchesAny(join, id, ref any))
+                    return true;
+
+                if (MatchesNestedAny(join.Nested, alias, id, ref any))
+                    return true;
+            }
+
+            return false;
+        }
+
+        // A join on a field has no document keys
+        private static bool MatchesAny(JoinResult join, string id, ref bool any)
+        {
+            if (join.KeysAreTerms || join.Reader == null)
+                return true;
+
+            any = true;
+            return join.MatchedDocument(id);
+        }
+
+        private List<string> _joinedDocumentIds;
+
+        // ON id(main) = alias.field: the documents whose field holds the id of the row are looked up for the row, in the order of their ids
+        private void AddDocumentIdsOfMainIdJoin(string alias, string mainId, CancellationToken token)
+        {
+            JoinResult found = null;
+            foreach (var join in _query.JoinResults ?? [])
+            {
+                if (join.IsOnIdOfMain && string.Equals(join.Alias, alias, StringComparison.OrdinalIgnoreCase))
+                {
+                    found = join;
+                    break;
+                }
+            }
+
+            if (found == null || mainId == null)
+                return;
+
+            if (found.FoldCase)
+                throw new InvalidQueryException($"The alias '{alias}' cannot be selected: its JOIN matches the lowercased id of the main document against the field '{found.InnerField}' of '{found.InnerIndexName}', " +
+                                                $"which keeps the case of its values, so the documents that hold the id in another case cannot be looked up. Index '{found.InnerField}' with the default indexing or FieldIndexing.Key.",
+                    _query.Query, _query.QueryParameters);
+
+            var ids = _joinedDocumentIds ??= [];
+            ids.Clear();
+            found.AddDocumentIdsOfMainId(mainId, ids, token);
+            foreach (var id in ids)
+                _loadedDocumentIds.Add(id);
+        }
+
+        // A join on a field matches every joined document that has the value
+        private bool TryGetDocumentIdsOfFieldJoin(FieldsToFetch.FieldToFetch fieldToFetch, ref RetrieverInput retrieverInput)
+        {
+            if (_query.JoinResults == null || fieldToFetch.QueryField.SourceAlias == null || SearchEngineType != SearchEngineType.Corax)
+                return false;
+
+            // two joins can match on the same outer field: the projected alias (u in u.Name) picks the join
+            var found = JoinOfProjectedField(fieldToFetch, static join => join.Keys?.HasWinners == true);
+            if (found == null)
+                return false;
+
+            ref var reader = ref retrieverInput.CoraxTermsReader;
+            var best = -1;
+            if (found.PairOuterPaths != null)
+            {
+                OfferCompositeKeys(found, retrieverInput.CoraxIndexSearcher, ref reader, retrieverInput.DocumentId, ref best);
+                if (best != -1)
+                    _loadedDocumentIds.Add(found.JoinedDocumentIdOf(best));
+
+                return true;
+            }
+
+            var rootPage = retrieverInput.CoraxIndexSearcher.FieldCache.GetLookupRootPage(found.OuterPath);
+            reader.Reset();
+            while (reader.FindNext(rootPage))
+            {
+                if (reader.IsNull || reader.IsNonExisting)
+                    continue;
+
+                found.OfferJoinedKey(reader.Current.Decoded(), ref best);
+            }
+
+            if (best != -1)
+                _loadedDocumentIds.Add(found.JoinedDocumentIdOf(best));
+
+            return true;
+        }
+
+        // A join on several fields: the best joined document of the tuples of values of the fields of the entry
+        private void OfferCompositeKeys(JoinResult found, IndexSearcher searcher, ref EntryTermsReader reader, string documentId, ref int best)
+        {
+            var paths = found.PairOuterPaths;
+            using var builder = new CompositeKeyBuilder(paths.Length);
+            for (var f = 0; f < paths.Length; f++)
+            {
+                var rootPage = searcher.FieldCache.GetLookupRootPage(paths[f]);
+                reader.Reset();
+                while (reader.FindNext(rootPage))
+                {
+                    if (reader.IsNull || reader.IsNonExisting)
+                        continue;
+
+                    builder.Add(f, reader.Current.Decoded());
+                }
+            }
+
+            int combinations;
+            try
+            {
+                combinations = builder.Combinations;
+            }
+            catch (CompositeKeyLimitException e)
+            {
+                throw new InvalidQueryException($"The fields ({string.Join(", ", paths)}) of document '{documentId}' hold more combinations of values than the {CompositeKeyBuilder.MaxCombinations} that a JOIN on several fields supports.",
+                    _query.Query, _query.QueryParameters, e);
+            }
+
+            for (var c = 0; c < combinations; c++)
+                found.OfferCompositeKey(builder.Combination(c), ref best);
+        }
+
+        private JoinResult JoinOfProjectedField(FieldsToFetch.FieldToFetch fieldToFetch, Func<JoinResult, bool> usable)
+        {
+            var projectedAlias = fieldToFetch.QueryField.ExpressionField?.Compound[0].Value;
+            JoinResult found = null;
+            foreach (var join in _query.JoinResults)
+            {
+                if (usable(join) == false || string.Equals(join.OuterPath, fieldToFetch.QueryField.SourceAlias, StringComparison.OrdinalIgnoreCase) == false)
+                    continue;
+
+                if (projectedAlias != null && string.Equals(join.Alias, projectedAlias, StringComparison.OrdinalIgnoreCase) == false)
+                    continue;
+
+                if (found != null)
+                    return null;
+
+                found = join;
+            }
+
+            return found;
+        }
+
+        // A field of a joined document that is stored in the index entry of the joined index is read from there
+        private bool TryGetStoredValueOfJoinedDocument(FieldsToFetch.FieldToFetch fieldToFetch, string documentId, out object value)
+        {
+            value = null;
+
+            if (_query.JoinResults == null || fieldToFetch.QueryField.SourceAlias == null || string.IsNullOrEmpty(fieldToFetch.Name.Value) ||
+                _query.ProjectionBehavior.FromDocumentOnly())
+                return false;
+
+            // in a chain of joins the next alias is loaded by a field of this document
+            if (_query.Metadata.Query.HasJoinChain)
+                return false;
+
+            // the field belongs to the document the implicit LOAD of the join alias loaded
+            var found = JoinOfProjectedField(fieldToFetch, static join => join.Reader != null);
+
+            return found != null && found.Reader.TryGetStoredValue(_context, documentId, fieldToFetch.Name.Value, out value);
         }
 
         protected object GetFunctionValue(FieldsToFetch.FieldToFetch fieldToFetch, string documentId, object[] args, CancellationToken token)

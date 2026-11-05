@@ -195,6 +195,12 @@ namespace Voron.Data.CompactTrees
                 new Encoder3Gram<AdaptiveMemoryEncoderState>(managedState));
         }
 
+        // Two dictionaries with the same table encode a key to the same bits, whatever their ids (page numbers of their environments) are
+        public static ulong GetTableHash(LowLevelTransaction llt, long dictionaryId)
+        {
+            return ((PersistentDictionaryHeader*)llt.GetPage(dictionaryId).DataPointer)->TableHash;
+        }
+
         public void Decode(int keyLengthInBits, ReadOnlySpan<byte> key, ref Span<byte> decodedKey)
         {
             int len = _encoder.Decode(keyLengthInBits, key, decodedKey);

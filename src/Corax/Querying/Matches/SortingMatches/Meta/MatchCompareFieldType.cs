@@ -8,5 +8,6 @@ public enum MatchCompareFieldType : ushort
     Score,
     Alphanumeric,
     Spatial,
-    Random
+    Random,
+    Rank
 }

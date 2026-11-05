@@ -515,6 +515,11 @@ public sealed partial class CompactTree : IPrepareForCommit
         return result;
     }
 
+    public CompactTree OpenReaderWithOwnCursor()
+    {
+        return new CompactTree(Lookup<CompactKeyLookup>.Open(_inner.Llt, _inner.State));
+    }
+
     public void InitializeStateForTryGetNextValue()
     {
         _inner.InitializeCursorState();

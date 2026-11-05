@@ -191,6 +191,8 @@ namespace TypingsGenerator
                 .WithTypeMapping(new TsInterface(new TsName("Array")), typeof(ISet<>))
                 .WithTypeMapping(new TsInterface(new TsName("dictionary<Raven.Client.Documents.Queries.Timings.QueryTimings>")),
                     typeof(IDictionary<string, QueryTimings>))
+                .WithTypeMapping(new TsInterface(new TsName("dictionary<number>")),
+                    typeof(IDictionary<string, long>))
                 .WithTypeMapping(new TsInterface(new TsName("dictionary<Raven.Server.NotificationCenter.Notifications.Details.HugeDocumentInfo>")),
                     typeof(ConcurrentDictionary<string, HugeDocumentInfo>))
                 .WithTypeMapping(TsPrimitive.Any, typeof(TreePage))

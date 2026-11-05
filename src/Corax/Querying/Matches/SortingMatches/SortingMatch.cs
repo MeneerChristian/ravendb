@@ -30,6 +30,7 @@ public unsafe partial struct SortingMatch<TInner> : IQueryMatch
 {
     private readonly IndexSearcher _searcher;
     private TInner _inner;
+    private readonly IRankedMatch _ranked;
     private readonly OrderMetadata _orderMetadata;
     private readonly CancellationToken _cancellationToken;
     private readonly NullsSortMode _defaultNullsSortMode;
@@ -58,6 +59,15 @@ public unsafe partial struct SortingMatch<TInner> : IQueryMatch
     {
         _searcher = searcher;
         _inner = inner;
+        if (orderMetadata.FieldType == MatchCompareFieldType.Rank)
+        {
+            // the rank is sorted like a score that comes the other way round (the lowest first)
+            orderMetadata = new OrderMetadata(true, MatchCompareFieldType.Score, ascending: !orderMetadata.Ascending);
+            _ranked = typeof(TInner).IsValueType == false || typeof(IRankedMatch).IsAssignableFrom(typeof(TInner)) ? inner as IRankedMatch : null; // a struct is boxed once, here, and only when it is ranked, not in every batch
+            if (_ranked == null)
+                throw new NotSupportedException("ORDER BY a rank needs a match that has ranks.");
+        }
+
         _orderMetadata = orderMetadata;
         _cancellationToken = cancellationToken;
         _defaultNullsSortMode = defaultNullsSortMode;
@@ -187,6 +197,9 @@ public unsafe partial struct SortingMatch<TInner> : IQueryMatch
         // This method should also be re-entrant for the case where we have already pre-sorted everything and 
         // we will just need to acquire via pages the totality of the results. 
         if (match.TotalResults == NotStarted)
+            TakeFirstOfConstantScore<TEntryComparer>(ref match);
+
+        if (match.TotalResults == NotStarted)
         {
             if (match._inner is not MemoizationMatch memoizer)
             {
@@ -203,6 +216,13 @@ public unsafe partial struct SortingMatch<TInner> : IQueryMatch
             
             if (match.TotalResults == 0)
                 return 0;
+
+            // nothing is asked for, only the number of matches: there is nothing to sort
+            if (match._take == 0)
+            {
+                memoizer.Dispose();
+                return 0;
+            }
 
             const int IndexSortingThreshold = 4096;
             var forceUsingOnlyIndex = match._searcher._testingConfiguration is { ForceSortingUsingIndex: true };
@@ -243,6 +263,38 @@ public unsafe partial struct SortingMatch<TInner> : IQueryMatch
         match._distancesResults.Dispose();
 
         return 0;
+    }
+
+    // Every entry of a constant score has the same score and a score sort keeps equal scores in entry order, so the best entries are the first ones of the match
+    // and the sort over all of them is not needed. Scores differ when the documents are boosted.
+    private static void TakeFirstOfConstantScore<TEntryComparer>(ref SortingMatch<TInner> match)
+    {
+        if (match._inner is not IConstantScoreMatch
+            || typeof(TEntryComparer) != typeof(EntryComparerByScore) && typeof(TEntryComparer) != typeof(Descending<EntryComparerByScore>)
+            || match._ranked != null || match._take < 0 || match._sortingDataTransfer.IncludeDistances
+            || match._inner.Confidence != QueryCountConfidence.High || match._searcher.DocumentsAreBoosted)
+            return;
+
+        var total = match._inner.Count;
+        var take = (int)Math.Min(match._take, total);
+        using var _ = match._searcher.Allocator.Allocate<long>(Math.Max(take, 1), out Span<long> ids);
+        var read = 0;
+        int filled;
+        while (read < take && (filled = match._inner.Fill(ids.Slice(read, take - read))) > 0)
+            read += filled;
+
+        match.TotalResults = total;
+        match._results.EnsureCapacityFor(read);
+        match._results.AddRangeUnsafe(ids.Slice(0, read));
+        if (match._scoresResults.HasContext)
+        {
+            using var __ = match._searcher.Allocator.Allocate<float>(Math.Max(read, 1), out Span<float> scores);
+            scores = scores.Slice(0, read);
+            scores.Fill(Bm25Relevance.InitialScoreValue);
+            match._inner.Score(ids.Slice(0, read), scores, 1f);
+            match._scoresResults.EnsureCapacityFor(read);
+            match._scoresResults.AddRangeUnsafe(scores);
+        }
     }
 
     private static void SortByRandom(ref SortingMatch<TInner> match, Span<long> results)
@@ -623,15 +675,35 @@ public unsafe partial struct SortingMatch<TInner> : IQueryMatch
         var llt = match._searcher.Transaction.LowLevelTransaction;
         var allocator = match._searcher.Allocator;
 
-        var sizeToAllocate = batchResults.Length * (sizeof(long) + sizeof(UnmanagedSpan));
+        var termIdsLength = batchResults.Length;
+        var needsTerms = true;
+
+        // The spatial sort only keeps the nearest 'take' entries in a heap
+        var isSpatial = typeof(TEntryComparer) == typeof(EntryComparerBySpatial);
+        if (isSpatial)
+        {
+            var heapSize = Math.Min(match._take, batchResults.Length);
+            if (heapSize < 0)
+                heapSize = batchResults.Length;
+
+            termIdsLength = heapSize / 2 + 1; // two int indexes in a long
+            needsTerms = false;
+        }
+
+        // The score sort keeps one float per match for the score and two ints per slot of the heap, it needs neither a term nor an id per match
+        var isScore = typeof(TEntryComparer) == typeof(EntryComparerByScore) || typeof(TEntryComparer) == typeof(Descending<EntryComparerByScore>);
+        if (isScore)
+            termIdsLength = SortsAllByScore(ref match, batchResults.Length) ? batchResults.Length : HeapSizeOf(ref match, batchResults.Length) / 2 + 1;
+
+        var sizeToAllocate = termIdsLength * sizeof(long) + (needsTerms ? batchResults.Length * (isScore ? sizeof(float) : sizeof(UnmanagedSpan)) : 0);
 
         //OrderBySpatial relies on this order of data. If you change it, please review the spatial ordering to ensure that everything works fine: [[ids], [terms], [spatial_distances]].
-        if (match._sortingDataTransfer.IncludeDistances)
+        if (match._sortingDataTransfer.IncludeDistances && isSpatial == false)
             sizeToAllocate += batchResults.Length * sizeof(SpatialResult);
         
         var bufScope = allocator.Allocate(sizeToAllocate, out ByteString bs);
-        Span<long> batchTermIds = new(bs.Ptr, batchResults.Length);
-        UnmanagedSpan* termsPtr = (UnmanagedSpan*)(bs.Ptr + batchResults.Length * sizeof(long));
+        Span<long> batchTermIds = new(bs.Ptr, termIdsLength);
+        UnmanagedSpan* termsPtr = needsTerms ? (UnmanagedSpan*)(bs.Ptr + termIdsLength * sizeof(long)) : null;
 
         // Initialize the important infrastructure for the sorting.
         TEntryComparer entryComparer = new();
@@ -641,6 +713,16 @@ public unsafe partial struct SortingMatch<TInner> : IQueryMatch
 
         bufScope.Dispose();
     }
+
+    private static int HeapSizeOf(ref SortingMatch<TInner> match, int batchLength)
+    {
+        var heapSize = Math.Min(match._take, batchLength);
+        return heapSize < 0 ? batchLength : heapSize;
+    }
+
+    // The heap is cheaper only while it keeps a small part of the matches; a ranked match always takes the heap, which sorts by its ranks
+    private static bool SortsAllByScore(ref SortingMatch<TInner> match, int batchLength) =>
+        match._ranked == null && HeapSizeOf(ref match, batchLength) > batchLength / 8;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal void SetSortingDataTransfer(in SortingDataTransfer sortingDataTransfer)

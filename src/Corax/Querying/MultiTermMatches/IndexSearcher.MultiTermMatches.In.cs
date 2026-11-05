@@ -23,6 +23,16 @@ public partial class IndexSearcher
 
     public MultiTermMatch InQuery(in FieldMetadata field, List<(string Term, bool Exact)> inTerms, in CancellationToken token = default) => InQuery<(string Term, bool Exact)>(in field, inTerms, token);
     
+    public MultiTermMatch InQuery(in FieldMetadata field, JoinTermScores keys, bool keysAreIndexedTerms, in CancellationToken token = default, bool useEncodedKeys = false)
+    {
+        var terms = _fieldsTree?.CompactTreeFor(field.FieldName);
+        if (terms == null || keys.Count == 0)
+            return MultiTermMatch.CreateEmpty(_transaction.Allocator);
+
+        return MultiTermMatch.Create(new MultiTermMatch<JoinKeysTermProvider>(this, field, _transaction.Allocator,
+            new JoinKeysTermProvider(this, field, terms, keys, keysAreIndexedTerms, useEncodedKeys), streamingEnabled: false, token: token));
+    }
+
     private MultiTermMatch InQuery<TTermType>(in FieldMetadata field, List<TTermType> inTerms, CancellationToken token)
     {
         if (typeof(TTermType) != typeof((string Term, bool Exact)) && typeof(TTermType) != typeof(Slice) && typeof(TTermType) != typeof(string))

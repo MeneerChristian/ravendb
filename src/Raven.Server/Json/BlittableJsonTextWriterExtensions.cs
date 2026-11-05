@@ -1096,6 +1096,27 @@ namespace Raven.Server.Json
             else
                 writer.WriteNull();
 
+            if (queryTimings.Counters is { Count: > 0 })
+            {
+                writer.WriteComma();
+                writer.WritePropertyName(nameof(QueryTimings.Counters));
+                writer.WriteStartObject();
+                var firstCounter = true;
+
+                foreach (var counter in queryTimings.Counters)
+                {
+                    if (firstCounter == false)
+                        writer.WriteComma();
+
+                    firstCounter = false;
+
+                    writer.WritePropertyName(counter.Key);
+                    writer.WriteInteger(counter.Value);
+                }
+
+                writer.WriteEndObject();
+            }
+
             writer.WriteEndObject();
         }
 

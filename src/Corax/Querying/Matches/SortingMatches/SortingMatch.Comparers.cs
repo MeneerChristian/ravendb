@@ -88,38 +88,48 @@ unsafe partial struct SortingMatch<TInner>
             var readScores = new Span<float>((float*)batchTerms, batchResults.Length);
             match._cancellationToken.ThrowIfCancellationRequested();
 
-            // We have to initialize the score buffer with a positive number to ensure that multiplication (document-boosting) is taken into account when BM25 relevance returns 0 (for example, with AllEntriesMatch).
-            readScores.Fill(Bm25Relevance.InitialScoreValue);
+            // A ranked match sorts by its rank, and what is returned as the score is its relevance
+            var ranked = match._ranked;
+            var computeRelevance = ranked == null || match._sortingDataTransfer.IncludeScores;
+            if (computeRelevance)
+            {
+                // We have to initialize the score buffer with a positive number to ensure that multiplication (document-boosting) is taken into account when BM25 relevance returns 0 (for example, with AllEntriesMatch).
+                readScores.Fill(Bm25Relevance.InitialScoreValue);
 
-            // We perform the scoring process. 
-            match._inner.Score(batchResults, readScores, 1f);
+                // We perform the scoring process.
+                match._inner.Score(batchResults, readScores, 1f);
 
-            match._searcher.BoostDocuments(batchResults, readScores,
-                sortedById: match._inner is not (VectorSearchMatch { ReturnsResultsByDistance: true } or MultiVectorSearchMatch { ReturnsResultsByDistance: true }));
-            
-            // Note! readScores & indexes are aliased and same as batchTermIds
-            var heapSize = Math.Min(match._take, batchResults.Length);
-            heapSize = heapSize < 0 ? batchResults.Length : heapSize;
+                match._searcher.BoostDocuments(batchResults, readScores,
+                    sortedById: match._inner is not (VectorSearchMatch { ReturnsResultsByDistance: true } or MultiVectorSearchMatch { ReturnsResultsByDistance: true }));
+            }
 
-            // The heap is cheaper only while it keeps a small part of the matches.
-            if (heapSize > batchResults.Length / 8)
+            var heapSize = HeapSizeOf(ref match, batchResults.Length);
+            if (SortsAllByScore(ref match, batchResults.Length))
             {
                 SortAll(ref match, batchResults, batchTermIds, readScores, heapSize, descending);
                 return;
             }
 
-            var indexes = MemoryMarshal.Cast<long, int>(batchTermIds)[(batchTermIds.Length)..];
+            // The scores are in the memory of the terms, the indexes of the heap in the memory of the term ids
+            var indexes = MemoryMarshal.Cast<long, int>(batchTermIds);
             using var _ = llt.Allocator.Allocate(heapSize, out Span<float> terms);
             var heapSorter = HeapSorterBuilder.BuildSingleNumericalSorter(indexes.Slice(0, heapSize), terms, descending == false, match.NullIsSmallest);
-            
-            
-            for (int i = 0; i < batchTermIds.Length; i++)
+
+            if (ranked == null)
             {
-                
-                heapSorter.Insert(i, readScores[i]);
+                for (int i = 0; i < batchResults.Length; i++)
+                    heapSorter.Insert(i, readScores[i]);
+
+                heapSorter.Fill(batchResults, ref match._results, ref match._scoresResults, readScores);
+                return;
             }
-            
-            heapSorter.Fill(batchResults, ref match._results, ref match._scoresResults, readScores);
+
+            using var __ = llt.Allocator.Allocate(batchResults.Length, out Span<float> ranks);
+            ranked.Rank(batchResults, ranks);
+            for (int i = 0; i < batchResults.Length; i++)
+                heapSorter.Insert(i, ranks[i]);
+
+            heapSorter.Fill(batchResults, ref match._results, ref match._scoresResults, computeRelevance ? readScores : Span<float>.Empty);
         }
 
         private static void SortAll(ref SortingMatch<TInner> match, Span<long> batchResults, Span<long> keys, Span<float> scores, int take, bool descending)
@@ -569,8 +579,9 @@ unsafe partial struct SortingMatch<TInner>
 
             var heapSize = Math.Min(match._take, batchResults.Length);
             heapSize = heapSize < 0 ? batchResults.Length : heapSize;
-            
-            var indexes = MemoryMarshal.Cast<long, int>(batchTermIds)[..(batchTermIds.Length)];
+
+            // batchTermIds may hold only heapSize / 2 + 1 longs (see SortResults): two int indexes in each
+            var indexes = MemoryMarshal.Cast<long, int>(batchTermIds);
             using var _ = llt.Allocator.Allocate(heapSize, out Span<SpatialResult> terms);
 
 

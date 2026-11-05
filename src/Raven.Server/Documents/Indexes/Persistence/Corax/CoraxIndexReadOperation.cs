@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Linq;
+using System.Text;
 using System.Threading;
 using Corax;
 using Corax.Querying;
@@ -14,9 +15,12 @@ using Corax.Querying.Matches.Meta;
 using Corax.Querying.Matches.SortingMatches;
 using Corax.Querying.Matches.SortingMatches.Meta;
 using Corax.Utils;
+using Voron.Data.CompactTrees;
+using Voron.Util;
 using Raven.Client.Documents.Indexes;
 using Raven.Client.Documents.Queries.Explanation;
 using Raven.Client.Documents.Queries.MoreLikeThis;
+using Raven.Client.Exceptions;
 using Raven.Client.Exceptions.Corax;
 using Raven.Server.Documents.Indexes.Debugging;
 using Raven.Server.Documents.Indexes.Static.Spatial;
@@ -62,6 +66,9 @@ namespace Raven.Server.Documents.Indexes.Persistence.Corax
         [ThreadStatic] 
         private static ArrayPool<CoraxSpatialResult> _queryDistancePool;
 
+        [ThreadStatic]
+        private static ArrayPool<byte> _queryIdBytesPool;
+
 
         public static ArrayPool<long> QueryPool
         {
@@ -81,7 +88,7 @@ namespace Raven.Server.Documents.Indexes.Persistence.Corax
             }
         }
 
-        private static ArrayPool<CoraxSpatialResult> DistancePool 
+        private static ArrayPool<CoraxSpatialResult> DistancePool
         {
             get
             {
@@ -90,7 +97,18 @@ namespace Raven.Server.Documents.Indexes.Persistence.Corax
             }
         }
 
+        private static ArrayPool<byte> IdBytesPool
+        {
+            get
+            {
+                _queryIdBytesPool ??= ArrayPool<byte>.Create();
+                return _queryIdBytesPool;
+            }
+        }
+
         protected readonly IndexSearcher IndexSearcher;
+
+        internal IndexSearcher Searcher => IndexSearcher;
 
         private readonly IndexFieldsMapping _fieldMappings;
 
@@ -115,6 +133,7 @@ namespace Raven.Server.Documents.Indexes.Persistence.Corax
             _vectorChunkHighlightings[fieldName] = new VectorChunkHighlightingCapture(fieldName, taskId, minimumSimilarity, queryVectors);
         }
         private readonly ByteStringContext _allocator;
+        private readonly LowLevelTransaction _lowLevelTransaction;
 
         private readonly int _maxNumberOfOutputsPerDocument;
 
@@ -125,6 +144,7 @@ namespace Raven.Server.Documents.Indexes.Persistence.Corax
         public CoraxIndexReadOperation(Index index, RavenLogger logger, Transaction readTransaction, QueryBuilderFactories queryBuilderFactories, IndexFieldsMapping fieldsMapping, IndexQueryServerSide query) : base(index, logger, queryBuilderFactories, query)
         {
             _allocator = readTransaction.Allocator;
+            _lowLevelTransaction = readTransaction.LowLevelTransaction;
             _fieldMappings = fieldsMapping;
             IndexSearcher = new IndexSearcher(readTransaction, _fieldMappings)
             {
@@ -143,8 +163,8 @@ namespace Raven.Server.Documents.Indexes.Persistence.Corax
 
             if (index is {_forTestingPurposes: {CoraxConfiguration: not null}})
                 IndexSearcher.SetTestingConfiguration(index._forTestingPurposes.CoraxConfiguration);
-            
-            var primaryKey = index.Type.IsMap() 
+
+            var primaryKey = index.Type.IsMap()
                 ? Constants.Documents.Indexing.Fields.DocumentIdFieldName
                 : Constants.Documents.Indexing.Fields.ReduceKeyHashFieldName; // map reduce
             _documentIdReader = IndexSearcher.TermsReaderFor(primaryKey);
@@ -152,7 +172,740 @@ namespace Raven.Server.Documents.Indexes.Persistence.Corax
         }
 
         public override long EntriesCount() => IndexSearcher.NumberOfEntries;
-        
+
+        private string _storedValueDocumentId;
+        private long _storedValueEntryId = -1;
+        private CompactKey _storedValueKey;
+
+        // The key of the entry terms reader of the query results
+        private CompactKey _entryTermsKey;
+
+        internal bool TryGetStoredValue(JsonOperationContext context, string documentId, string fieldName, out object value)
+        {
+            value = null;
+
+            if (_index.Type.IsMap() == false ||
+                _index.Definition.IndexFields.TryGetValue(fieldName, out var field) == false ||
+                field.Storage != FieldStorage.Yes)
+                return false;
+
+            if (string.Equals(_storedValueDocumentId, documentId, StringComparison.Ordinal) == false)
+            {
+                var idField = _fieldMappings.GetByFieldId(0).Metadata.ChangeAnalyzer(FieldIndexingMode.Exact, null);
+                var match = IndexSearcher.TermQuery(idField, documentId);
+                Span<long> ids = stackalloc long[2];
+                var read = match.Fill(ids);
+                _storedValueDocumentId = documentId;
+                _storedValueEntryId = read == 1 ? ids[0] : -1;
+            }
+
+            if (_storedValueEntryId < 0)
+                return false;
+
+            // the reader initializes the key
+            _storedValueKey ??= new CompactKey();
+            Page page = default;
+            var termsReader = IndexSearcher.GetEntryTermsReader(_storedValueEntryId, ref page, _storedValueKey);
+            var input = new RetrieverInput(IndexSearcher, _fieldMappings, in termsReader, documentId, _index.IndexFieldsPersistence.HasTimeValues);
+            try
+            {
+                return QueryResultRetrieverBase.TryGetValueFromCoraxIndex(context, field.Name ?? field.OriginalName, ref input, out value);
+            }
+            finally
+            {
+                _storedValueKey.Reset();
+            }
+        }
+
+        // the keys of a join are held in native memory while the query runs: the server bounds them
+        private JoinTermScores Bounded(JoinTermScores keys)
+        {
+            keys.MaxHeldBytes = _index.DocumentDatabase.Configuration.Queries.JoinMaxKeysMemory.GetValue(SizeUnit.Bytes);
+            return keys;
+        }
+
+        internal JoinTermScores ScanIdsAndScores(IndexQueryServerSide query, DocumentsOperationContext documentsContext, CancellationToken token)
+            => ScanIdsAndScores(query, documentsContext, keepWinners: false, outerKeyTable: null, token);
+
+        // outerKeyTable: the table of the dictionary of the index that is joined with the ids. When it is the table of this index the ids are kept encoded
+        internal JoinTermScores ScanIdsAndScores(IndexQueryServerSide query, DocumentsOperationContext documentsContext, bool keepWinners, ulong? outerKeyTable, CancellationToken token)
+        {
+            var keepEncoded = keepWinners == false && outerKeyTable != null && outerKeyTable == DocumentIdTableHash();
+            var output = keepEncoded
+                ? Bounded(JoinTermScores.CreateEncoded(_allocator, _lowLevelTransaction, _documentIdReader.DictionaryId))
+                : Bounded(new JoinTermScores(_allocator, keepWinners));
+            ContextBoundNativeList<long> ids = default;
+            ContextBoundNativeList<float> scores = default;
+            try
+            {
+                if (TryScoreSubQuery(query, documentsContext, out ids, out scores, token) == false)
+                    return output;
+
+                if (keepEncoded)
+                    EncodedDocumentIdsWithScores(ids.ToSpan(), scores.ToSpan(), output);
+                else
+                    DocumentIdsWithScores(ids.ToSpan(), scores.ToSpan(), output, winners: keepWinners);
+                return output;
+            }
+            catch
+            {
+                output.Dispose();
+                throw;
+            }
+            finally
+            {
+                ids.Dispose();
+                scores.Dispose();
+            }
+        }
+
+        private IQueryMatch BuildSubQuery(IndexQueryServerSide query, DocumentsOperationContext documentsContext, out OrderMetadata[] sortMetadata, CancellationToken token)
+        {
+            var fieldsToFetch = new FieldsToFetch(query, _index.Definition, _index.Type);
+            var builderParameters = new CoraxQueryBuilder.Parameters(IndexSearcher, _allocator, serverContext: null, documentsContext, query, _index, query.QueryParameters,
+                QueryBuilderFactories, _fieldMappings, fieldsToFetch, highlightingTerms: null, take: CoraxConstants.IndexSearcher.TakeAll, deduplicationDisabled: false,
+                indexReadOperation: this, token: token);
+
+            return CoraxQueryBuilder.BuildQuery(builderParameters, out sortMetadata);
+        }
+
+        // The ids of every entry the sub-query matches and their scores, in the native memory of the transaction
+        private bool TryScoreSubQuery(IndexQueryServerSide query, DocumentsOperationContext documentsContext, out ContextBoundNativeList<long> ids,
+            out ContextBoundNativeList<float> scores, CancellationToken token)
+        {
+            ids = default;
+            scores = default;
+            var queryMatch = BuildSubQuery(query, documentsContext, out _, token);
+            if (queryMatch is null)
+                return false;
+
+            ids = ReadAllEntries(queryMatch, token);
+            try
+            {
+                if (ids.Count == 0)
+                    return false;
+
+                Sort.Run(ids.ToSpan());
+
+                scores = new ContextBoundNativeList<float>(_allocator);
+                scores.GrowFitting(ids.Count + 1);
+                scores.Count = ids.Count;
+                scores.ToSpan().Fill(Bm25Relevance.InitialScoreValue);
+                queryMatch.Score(ids.ToSpan(), scores.ToSpan(), 1f);
+
+                return true;
+            }
+            catch
+            {
+                ids.Dispose();
+                scores.Dispose();
+                throw;
+            }
+        }
+
+        // The documents of the entries that the sub-query matches and whose field holds this term (as the index stores it), added to the list in the order of their ids
+        internal void AddDocumentIdsOfTerm(IndexQueryServerSide query, DocumentsOperationContext documentsContext, string field, ReadOnlySpan<byte> term, List<string> documentIds,
+            CancellationToken token)
+        {
+            if (_fieldMappings.TryGetByFieldName(_allocator, field, out var binding) == false)
+                return;
+
+            var queryMatch = BuildSubQuery(query, documentsContext, out _, token);
+            if (queryMatch is null)
+                return;
+
+            // the term is the one the index stores: it is looked up as it is
+            using var termScope = Slice.From(_allocator, term, ByteStringType.Immutable, out var termSlice);
+            var termMatch = IndexSearcher.TermQuery(binding.Metadata.ChangeAnalyzer(FieldIndexingMode.Exact, null), termSlice);
+            var entries = ReadAllEntries(IndexSearcher.And<IQueryMatch, IQueryMatch>(termMatch, queryMatch, token), token);
+            try
+            {
+                var first = documentIds.Count;
+                foreach (var entry in entries.ToSpan())
+                    documentIds.Add(GetDocumentIdOfEntry(entry));
+
+                documentIds.Sort(first, documentIds.Count - first, StringComparer.Ordinal);
+            }
+            finally
+            {
+                entries.Dispose();
+            }
+        }
+
+        // The probe key of a JOIN as this index stores it
+        internal string AnalyzeJoinKeyProbe(string field, out FieldIndexingMode mode)
+        {
+            mode = FieldIndexingMode.Normal;
+            IndexFieldBinding binding;
+            if (field == null)
+                binding = _fieldMappings.GetByFieldId(CoraxConstants.IndexWriter.PrimaryKeyFieldId);
+            else if (_fieldMappings.TryGetByFieldName(_allocator, field, out binding) == false)
+                return null;
+
+            mode = binding.FieldIndexingMode;
+            return CoraxQueryBuilder.AnalyzeJoinKeyProbe(IndexSearcher, binding.Metadata);
+        }
+
+        // The ids of every entry the match returns, in the native memory of the transaction
+        private ContextBoundNativeList<long> ReadAllEntries(IQueryMatch queryMatch, CancellationToken token)
+        {
+            var entries = new ContextBoundNativeList<long>(_allocator);
+            const int bufferSize = 4096;
+            var buffer = QueryPool.Rent(bufferSize);
+            try
+            {
+                while (true)
+                {
+                    token.ThrowIfCancellationRequested();
+
+                    var read = queryMatch.Fill(buffer.AsSpan(0, bufferSize));
+                    if (read == 0)
+                        break;
+
+                    // doubles in blocks that fill what the allocator keeps for them (a power of two takes twice as much)
+                    if (entries.Count + read >= entries.Capacity)
+                        entries.GrowFitting(Math.Max(entries.Count + read + 1, (int)Math.Min(entries.Capacity * 2L, int.MaxValue / 16)));
+
+                    entries.AddRange(new ReadOnlySpan<long>(buffer, 0, read));
+                }
+            }
+            catch
+            {
+                entries.Dispose();
+                throw;
+            }
+            finally
+            {
+                QueryPool.Return(buffer);
+            }
+
+            return entries;
+        }
+
+        // The sub-query of a JOIN that orders by its own index
+        private float[] RankSubQueryEntries(IndexQueryServerSide query, DocumentsOperationContext documentsContext, out ContextBoundNativeList<long> entries, CancellationToken token)
+        {
+            entries = default;
+            try
+            {
+                if (ReadOrderedSubQueryEntries(query, documentsContext, out entries, out var sortMetadata, token) == false)
+                    return null;
+
+                return RankOrderedEntries(query, sortMetadata, entries);
+            }
+            catch
+            {
+                entries.Dispose();
+                throw;
+            }
+        }
+
+        // The ids of the entries the sub-query matches, in the order of the sub-query
+        private bool ReadOrderedSubQueryEntries(IndexQueryServerSide query, DocumentsOperationContext documentsContext, out ContextBoundNativeList<long> entries,
+            out OrderMetadata[] sortMetadata, CancellationToken token)
+        {
+            entries = default;
+            var stopwatch = Stopwatch.StartNew();
+            var queryMatch = BuildSubQuery(query, documentsContext, out sortMetadata, token);
+            if (queryMatch is null)
+                return false;
+
+            entries = ReadAllEntries(queryMatch, token);
+            query.JoinTimings?.AddCounter("RankSortAndFillMicroseconds", stopwatch.ElapsedTicks * 1_000_000 / Stopwatch.Frequency);
+            return true;
+        }
+
+        // The dense rank of every entry (in the order of the sub-query); the entries are then sorted by id, each one keeps its rank
+        private float[] RankOrderedEntries(IndexQueryServerSide query, OrderMetadata[] sortMetadata, ContextBoundNativeList<long> entries)
+        {
+            const int MaxExactRank = 1 << 24; // a float holds every integer up to here
+            ContextBoundNativeList<bool> tiedWithPrevious = default;
+            float[] ranks = null;
+            long[] keys = null;
+            try
+            {
+                var stopwatch = Stopwatch.StartNew();
+
+                // the entries come back in the order of the sub-query
+                var entriesSpan = entries.ToSpan();
+                ranks = ScorePool.Rent(entriesSpan.Length);
+                keys = QueryPool.Rent(entriesSpan.Length);
+                tiedWithPrevious = new ContextBoundNativeList<bool>(_allocator, entriesSpan.Length);
+                tiedWithPrevious.Count = entriesSpan.Length;
+
+                var ranksSpan = ranks.AsSpan(0, entriesSpan.Length);
+                var keysSpan = keys.AsSpan(0, entriesSpan.Length);
+                var tiedSpan = tiedWithPrevious.ToSpan();
+                tiedSpan.Fill(true);
+                foreach (var order in sortMetadata ?? [])
+                {
+                    IndexSearcher.ReadSortKeys(order, entriesSpan, keysSpan);
+                    for (var i = 1; i < keysSpan.Length; i++)
+                        tiedSpan[i] &= keysSpan[i] == keysSpan[i - 1];
+                }
+
+                query.JoinTimings?.AddCounter("RankSortKeysMicroseconds", stopwatch.ElapsedTicks * 1_000_000 / Stopwatch.Frequency);
+
+                var rank = 0;
+                for (var i = 0; i < ranksSpan.Length; i++)
+                {
+                    if (i == 0 || tiedSpan[i] == false)
+                        rank++;
+
+                    ranksSpan[i] = rank;
+                }
+
+                if (rank > MaxExactRank)
+                    throw new InvalidQueryException($"ORDER BY of a joined index is supported for up to {MaxExactRank} distinct values, but the JOIN sub-query has {rank}.", query.Query, query.QueryParameters);
+
+                // the bulk readers need the ids in order: the ids are sorted in place, each one keeps its rank
+                MemoryExtensions.Sort(entriesSpan, ranksSpan);
+                var result = ranks;
+                ranks = null;
+                return result;
+            }
+            finally
+            {
+                if (ranks != null)
+                    ScorePool.Return(ranks);
+                if (keys != null)
+                    QueryPool.Return(keys);
+                tiedWithPrevious.Dispose();
+            }
+        }
+
+        // The sub-query side of a JOIN on the id that orders by its own index, when the outer query may read only the first entries in that order:
+        // the keys are not ranked (ranks are made when the outer query needs them), and the order is kept. Null when the sub-query has too few entries for that.
+        internal JoinTermScores ScanIdsInOrder(IndexQueryServerSide query, DocumentsOperationContext documentsContext, int minimumKeys, out JoinOrderedKeys ordered, CancellationToken token)
+        {
+            ordered = null;
+            var output = Bounded(new JoinTermScores(_allocator));
+            ContextBoundNativeList<long> entries = default;
+            ContextBoundNativeList<long> sorted = default;
+            ContextBoundNativeList<int> positions = default;
+            ContextBoundNativeList<int> keyAt = default;
+            float[] scores = null;
+            float[] ranks = null;
+            try
+            {
+                if (ReadOrderedSubQueryEntries(query, documentsContext, out entries, out var sortMetadata, token) == false)
+                {
+                    output.ScoresAreRanks = true;
+                    return output;
+                }
+
+                var count = entries.Count;
+                if (count < minimumKeys)
+                {
+                    // too small for the walk to pay: the ranks as always
+                    output.ScoresAreRanks = true;
+                    ranks = RankOrderedEntries(query, sortMetadata, entries);
+                    DocumentIdsWithScores(entries.ToSpan(), ranks.AsSpan(0, count), output);
+                    return output;
+                }
+
+                // the bulk readers need the ids in order, the walk needs the order: the position of every key in it
+                sorted = new ContextBoundNativeList<long>(_allocator, count);
+                sorted.AddRange(entries.ToSpan());
+                positions = new ContextBoundNativeList<int>(_allocator, count);
+                for (var i = 0; i < count; i++)
+                    positions.Add(i);
+                MemoryExtensions.Sort(sorted.ToSpan(), positions.ToSpan());
+
+                // nothing looks at the scores of the keys until the ranks replace them
+                scores = ScorePool.Rent(count);
+                scores.AsSpan(0, count).Clear();
+                DocumentIdsWithScores(sorted.ToSpan(), scores.AsSpan(0, count), output);
+                if (output.Count != count)
+                    throw new InvalidOperationException($"The sub-query has {count} entries but {output.Count} document ids.");
+
+                keyAt = new ContextBoundNativeList<int>(_allocator, count);
+                keyAt.Count = count;
+                var positionSpan = positions.ToSpan();
+                for (var key = 0; key < count; key++)
+                    keyAt[positionSpan[key]] = key;
+
+                ordered = new JoinOrderedKeys(IndexSearcher, sortMetadata, entries, keyAt);
+                entries = default;
+                keyAt = default;
+                return output;
+            }
+            catch
+            {
+                output.Dispose();
+                keyAt.Dispose();
+                throw;
+            }
+            finally
+            {
+                entries.Dispose();
+                sorted.Dispose();
+                positions.Dispose();
+                if (scores != null)
+                    ScorePool.Return(scores);
+                if (ranks != null)
+                    ScorePool.Return(ranks);
+            }
+        }
+
+        // The relevance the sub-query gives every one of the entries, in step with them
+        private void RelevanceOfEntries(IndexQueryServerSide scoreQuery, DocumentsOperationContext documentsContext, ReadOnlySpan<long> entries, Span<float> relevance, CancellationToken token)
+        {
+            ContextBoundNativeList<long> scoredIds = default;
+            ContextBoundNativeList<float> sourceScores = default;
+            try
+            {
+                relevance.Fill(Bm25Relevance.InitialScoreValue);
+                if (TryScoreSubQuery(scoreQuery, documentsContext, out scoredIds, out sourceScores, token) == false)
+                    return;
+
+                var ids = scoredIds.ToSpan();
+                var from = 0;
+                for (var i = 0; i < entries.Length && from < ids.Length; i++)
+                {
+                    var found = ids.Slice(from).BinarySearch(entries[i]);
+                    if (found < 0)
+                    {
+                        from += ~found;
+                        continue;
+                    }
+
+                    relevance[i] = sourceScores[from + found];
+                    from += found + 1;
+                }
+            }
+            finally
+            {
+                scoredIds.Dispose();
+                sourceScores.Dispose();
+            }
+        }
+
+        // The sub-query side of a JOIN on the id that orders by its own index
+        internal JoinTermScores ScanIdsAndRanks(IndexQueryServerSide query, DocumentsOperationContext documentsContext, CancellationToken token)
+            => ScanIdsAndRanks(query, documentsContext, scoreQuery: null, token);
+
+        internal JoinTermScores ScanIdsAndRanks(IndexQueryServerSide query, DocumentsOperationContext documentsContext, IndexQueryServerSide scoreQuery, CancellationToken token)
+        {
+            var output = Bounded(new JoinTermScores(_allocator, keepRanks: scoreQuery != null) { ScoresAreRanks = scoreQuery == null });
+            ContextBoundNativeList<long> entries = default;
+            ContextBoundNativeList<float> relevance = default;
+            float[] ranks = null;
+            try
+            {
+                ranks = RankSubQueryEntries(query, documentsContext, out entries, token);
+                if (ranks == null)
+                    return output;
+
+                var stopwatch = Stopwatch.StartNew();
+                var ranksSpan = ranks.AsSpan(0, entries.Count);
+                if (scoreQuery == null)
+                {
+                    DocumentIdsWithScores(entries.ToSpan(), ranksSpan, output);
+                }
+                else
+                {
+                    // both lists hold the same entries in the same order
+                    relevance = new ContextBoundNativeList<float>(_allocator, entries.Count);
+                    relevance.Count = entries.Count;
+                    RelevanceOfEntries(scoreQuery, documentsContext, entries.ToSpan(), relevance.ToSpan(), token);
+                    DocumentIdsWithScores(entries.ToSpan(), relevance.ToSpan(), output, ranksSpan);
+                }
+
+                query.JoinTimings?.AddCounter("RankDocumentIdsMicroseconds", stopwatch.ElapsedTicks * 1_000_000 / Stopwatch.Frequency);
+                return output;
+            }
+            catch
+            {
+                output.Dispose();
+                throw;
+            }
+            finally
+            {
+                if (ranks != null)
+                    ScorePool.Return(ranks);
+                entries.Dispose();
+                relevance.Dispose();
+            }
+        }
+
+        // The sub-query side of a JOIN on a field that orders by its own index
+        internal JoinTermScores ScanTermRanks(IndexQueryServerSide query, DocumentsOperationContext documentsContext, IndexQueryServerSide scoreQuery, string joinField, bool keepWinners,
+            CancellationToken token)
+        {
+            var output = Bounded(new JoinTermScores(_allocator, keepWinners, keepRanks: scoreQuery != null));
+            ContextBoundNativeList<long> entries = default;
+            float[] ranks = null;
+            JoinTermScores relevance = null;
+            try
+            {
+                ranks = RankSubQueryEntries(query, documentsContext, out entries, token);
+                if (ranks == null)
+                {
+                    output.ScoresAreRanks = scoreQuery == null;
+                    return output;
+                }
+
+                // a scan keeps the best score of a term, and the best rank is the lowest: the scan reads the negated ranks
+                var ranksSpan = ranks.AsSpan(0, entries.Count);
+                for (var i = 0; i < ranksSpan.Length; i++)
+                    ranksSpan[i] = -ranksSpan[i];
+
+                ScanFieldTerms(joinField, JoinFieldScan.Auto, entries.ToSpan(), ranksSpan, output);
+                if (scoreQuery != null)
+                    relevance = ScanTermScores(scoreQuery, documentsContext, joinField, JoinFieldScan.Auto, keepWinners: false, token);
+
+                output.TurnScoresIntoRanks(relevance);
+                return output;
+            }
+            catch
+            {
+                output.Dispose();
+                throw;
+            }
+            finally
+            {
+                if (ranks != null)
+                    ScorePool.Return(ranks);
+                entries.Dispose();
+                relevance?.Dispose();
+            }
+        }
+
+        private void DocumentIdsWithScores(ReadOnlySpan<long> ids, ReadOnlySpan<float> scores, JoinTermScores output, ReadOnlySpan<float> ranks = default, bool winners = false)
+        {
+            // the ids are sorted and unique, the bulk reader returns the terms in that same order
+            const int chunkSize = 1024;
+            const int minimumIdBytes = 12;
+            var chunk = QueryPool.Rent(chunkSize);
+            try
+            {
+                var keysSeen = 0;
+                long bytesSeen = 0;
+                for (var start = 0; start < ids.Length;)
+                {
+                    var remaining = ids.Length - start;
+                    var averageBytes = keysSeen == 0 ? minimumIdBytes : (int)Math.Max(minimumIdBytes, (bytesSeen + keysSeen - 1) / keysSeen);
+                    output.EnsureCapacity(remaining, (int)Math.Min((long)remaining * averageBytes, int.MaxValue));
+
+                    var length = Math.Min(chunkSize, remaining);
+                    ids.Slice(start, length).CopyTo(chunk);
+
+                    var read = _documentIdReader.GetAllTermsFromSet(chunk.AsSpan(0, length), out var terms);
+                    for (var i = 0; i < read; i++)
+                    {
+                        var term = _documentIdReader.GetDecodedTerm(terms[i]);
+                        if (winners)
+                            output.Add(term, scores[start + i], ids[start + i]);
+                        else if (ranks.IsEmpty)
+                            output.Add(term, scores[start + i]);
+                        else
+                            output.Add(term, scores[start + i], ranks[start + i]);
+                        bytesSeen += term.Length;
+                    }
+
+                    keysSeen += read;
+                    start += read;
+                }
+            }
+            finally
+            {
+                QueryPool.Return(chunk);
+            }
+        }
+
+        // The table of the dictionary that encodes the ids of the documents, null when the index has none
+        internal ulong? DocumentIdTableHash()
+        {
+            var dictionaryId = _documentIdReader.DictionaryId;
+            return dictionaryId > 0 ? PersistentDictionary.GetTableHash(_lowLevelTransaction, dictionaryId) : null;
+        }
+
+        // The ids stay as the entries hold them: encoded
+        private void EncodedDocumentIdsWithScores(ReadOnlySpan<long> ids, ReadOnlySpan<float> scores, JoinTermScores output)
+        {
+            const int chunkSize = 1024;
+            const int minimumEncodedBytes = 6;
+            var chunk = QueryPool.Rent(chunkSize);
+            try
+            {
+                var keysSeen = 0;
+                long bytesSeen = 0;
+                for (var start = 0; start < ids.Length;)
+                {
+                    var remaining = ids.Length - start;
+                    var averageBytes = keysSeen == 0 ? minimumEncodedBytes : (int)Math.Max(minimumEncodedBytes, (bytesSeen + keysSeen - 1) / keysSeen);
+                    output.EnsureCapacity(remaining, (int)Math.Min((long)remaining * averageBytes, int.MaxValue));
+
+                    var length = Math.Min(chunkSize, remaining);
+                    ids.Slice(start, length).CopyTo(chunk);
+
+                    var read = _documentIdReader.GetAllTermsFromSet(chunk.AsSpan(0, length), out var terms);
+                    for (var i = 0; i < read; i++)
+                    {
+                        var encoded = TermsReader.EncodedTermOf(terms[i], out var bits);
+                        output.AddEncoded(encoded, bits, scores[start + i]);
+                        bytesSeen += encoded.Length;
+                    }
+
+                    keysSeen += read;
+                    start += read;
+                }
+            }
+            finally
+            {
+                QueryPool.Return(chunk);
+            }
+        }
+
+        internal bool IsDocumentIdAmong(JoinTermScores keys, ReadOnlySpan<byte> id)
+        {
+            var isAscii = Ascii.IsValid(id);
+            if (isAscii)
+            {
+                // the analyzer of the id lowers the case of ASCII letters and changes nothing else
+                const int stackIdBytes = 512;
+                var rented = id.Length > stackIdBytes ? IdBytesPool.Rent(id.Length) : null;
+                try
+                {
+                    Span<byte> lowered = rented is null ? stackalloc byte[stackIdBytes] : rented;
+                    lowered = lowered.Slice(0, id.Length);
+                    for (var i = 0; i < id.Length; i++)
+                        lowered[i] = id[i] is >= (byte)'A' and <= (byte)'Z' ? (byte)(id[i] + 32) : id[i];
+
+                    return keys.TryFind(lowered, out _);
+                }
+                finally
+                {
+                    if (rented != null)
+                        IdBytesPool.Return(rented);
+                }
+            }
+
+            if (_fieldMappings.TryGetByFieldName(_allocator, Constants.Documents.Indexing.Fields.DocumentIdFieldName, out var binding) == false)
+                return keys.TryFind(id, out _);
+
+            IndexSearcher.ApplyAnalyzer(binding.Metadata, binding.Analyzer, id, out var analyzed);
+            try
+            {
+                return keys.TryFind(analyzed.AsReadOnlySpan(), out _);
+            }
+            finally
+            {
+                analyzed.Release(_allocator);
+            }
+        }
+
+        internal ByteStringContext Allocator => _allocator;
+
+        internal JoinTermScores ScanCompositeKeys(IndexQueryServerSide query, DocumentsOperationContext documentsContext, string[] fields, CancellationToken token)
+        {
+            var rows = Bounded(new JoinTermScores(_allocator, keepWinners: true));
+            ContextBoundNativeList<long> ids = default;
+            ContextBoundNativeList<float> scores = default;
+            try
+            {
+                if (TryScoreSubQuery(query, documentsContext, out ids, out scores, token))
+                    IndexSearcher.CompositeKeysOfEntries(fields, ids.ToSpan(), scores.ToSpan(), rows);
+
+                return CompositeJoinKeys.MergeBest(_allocator, rows);
+            }
+            catch (CompositeKeyLimitException e)
+            {
+                throw new InvalidQueryException($"The JOIN sub-query has an entry whose fields ({string.Join(", ", fields)}) hold more combinations of values than the {CompositeKeyBuilder.MaxCombinations} that are supported.",
+                    query.Query, query.QueryParameters, e);
+            }
+            finally
+            {
+                rows.Dispose();
+                ids.Dispose();
+                scores.Dispose();
+            }
+        }
+
+        internal enum JoinFieldScan
+        {
+            Auto,
+            // Opens the entry-terms reader of every matched entry, keeps the best per term id
+            EntryTerms,
+            // Walks the terms of the field and intersects each posting list with the matched ids
+            TermWalk,
+            // Bulk reads the entries -> term map
+            BulkMap
+        }
+
+        internal string GetDocumentIdOfEntry(long entryId) => _documentIdReader.GetTermFor(entryId);
+
+        internal JoinTermScores ScanTermScores(IndexQueryServerSide query, DocumentsOperationContext documentsContext, string joinField, JoinFieldScan strategy, bool keepWinners,
+            CancellationToken token)
+        {
+            var output = Bounded(new JoinTermScores(_allocator, keepWinners));
+            ContextBoundNativeList<long> ids = default;
+            ContextBoundNativeList<float> scores = default;
+            try
+            {
+                if (TryScoreSubQuery(query, documentsContext, out ids, out scores, token) == false)
+                    return output;
+
+                ScanFieldTerms(joinField, strategy, ids.ToSpan(), scores.ToSpan(), output);
+                return output;
+            }
+            catch
+            {
+                output.Dispose();
+                throw;
+            }
+            finally
+            {
+                ids.Dispose();
+                scores.Dispose();
+            }
+        }
+
+        // Every term the field has in the entries with the best of their scores, by the given scan
+        private void ScanFieldTerms(string joinField, JoinFieldScan strategy, ReadOnlySpan<long> ids, ReadOnlySpan<float> scores, JoinTermScores output)
+        {
+            if (strategy == JoinFieldScan.Auto)
+                strategy = ChooseJoinFieldScan(joinField, ids.Length);
+            else if (strategy == JoinFieldScan.BulkMap && CanReadEntryTermMap(joinField) == false)
+                strategy = JoinFieldScan.EntryTerms; // the map keeps one term per entry: a multi-valued field would lose keys
+
+            switch (strategy)
+            {
+                case JoinFieldScan.TermWalk:
+                    IndexSearcher.ScoresByWalkingTermsOfField(joinField, ids, scores, ref output);
+                    break;
+                case JoinFieldScan.BulkMap:
+                    IndexSearcher.ScoresByEntryTermMap(joinField, ids, scores, output);
+                    break;
+                default:
+                    IndexSearcher.ScoresByEntryTerms(joinField, ids, scores, output);
+                    break;
+            }
+        }
+
+        // The entries -> term map keeps one term per entry
+        private bool CanReadEntryTermMap(string field) => IndexSearcher.FieldHoldsOneTermPerEntry(field) && IndexSearcher.EntryTermMapCoversPostings(field);
+
+        // A single-valued field is read through the entries -> term map
+        private JoinFieldScan ChooseJoinFieldScan(string field, int matched)
+        {
+            var terms = Math.Max(1, IndexSearcher.GetTermAmountInField(IndexSearcher.FieldMetadataBuilder(field)));
+            if (IndexSearcher.FieldHoldsOneTermPerEntry(field) && terms <= matched * MaxTermsToVerifyPerMatchedEntry && IndexSearcher.EntryTermMapCoversPostings(field))
+                return JoinFieldScan.BulkMap;
+
+            var walkMicroseconds = IndexSearcher.NumberOfEntries * (WalkNanosecondsPerEntry + WalkNanosecondsPerEntryPerDecade * Math.Log10(terms)) / 1000;
+            return matched * EntryWalkMicrosecondsPerMatchedEntry >= walkMicroseconds ? JoinFieldScan.TermWalk : JoinFieldScan.EntryTerms;
+        }
+
+        // relative costs of the two scans (term walk per entry, growing with the log of the terms; entries -> term scan per matched entry): only their ratio matters
+        private const double WalkNanosecondsPerEntry = 3;
+        private const double WalkNanosecondsPerEntryPerDecade = 4.5;
+        private const double EntryWalkMicrosecondsPerMatchedEntry = 0.25;
+
+        // Checking the map reads the posting list state of every term of the field
+        private const double MaxTermsToVerifyPerMatchedEntry = 4;
+
         protected interface ISupportsHighlighting
         {
             QueryTimingsScope TimingsScope { get; }
@@ -493,9 +1246,10 @@ namespace Raven.Server.Documents.Indexes.Persistence.Corax
 
                     var retriever = _retriever;
                     Page page = default;
+                    var entryTermsKey = new CompactKey(); // shared by the readers of all the entries
                     foreach (var id in distinctIds)
                     {
-                        var reader = _searcher.GetEntryTermsReader(id, ref page);
+                        var reader = _searcher.GetEntryTermsReader(id, ref page, entryTermsKey);
 
                         var key = _documentIdReader.GetTermFor(id);
                         var retrieverInput = new RetrieverInput(_searcher, _fieldsMapping, reader, key, _index.IndexFieldsPersistence.HasTimeValues);
@@ -676,7 +1430,11 @@ namespace Raven.Server.Documents.Indexes.Persistence.Corax
                         }
 
                         builderParameters = new CoraxQueryBuilder.Parameters(IndexSearcher, _allocator, serverContext, documentsContext, query, _index,
-                            query.QueryParameters, QueryBuilderFactories, _fieldMappings, fieldsToFetch, highlightings.Terms, (int)take, deduplicationDisabled: false, indexReadOperation: this, token: token, queryTime: queryTime, queryTimings: coraxTimings);
+                            query.QueryParameters, QueryBuilderFactories, _fieldMappings, fieldsToFetch, highlightings.Terms, (int)take, deduplicationDisabled: false, indexReadOperation: this, token: token, queryTime: queryTime, queryTimings: coraxTimings)
+                        {
+                            AllowJoinOrderedWalk = true,
+                            AllowJoinFirstEntries = true
+                        };
 
                         using (closeServerTransaction)
                         {
@@ -723,6 +1481,9 @@ namespace Raven.Server.Documents.Indexes.Persistence.Corax
                         case SortingMultiMatch smm:
                             smm.SetSortingDataTransfer(sortingData);
                             queryMatch = smm;
+                            break;
+                        case IPresortedMatch presorted:
+                            presorted.SetScoreAndDistanceBuffer(sortingData);
                             break;
                     }
                 }
@@ -775,7 +1536,7 @@ namespace Raven.Server.Documents.Indexes.Persistence.Corax
                         CoraxSpatialResult? documentDistance = hasOrderByDistance ? sortingData.DistancesBuffer[i] : null;
 
                         var key = _documentIdReader.GetTermFor(indexEntryId);
-                        EntryTermsReader entryTermsReader = IndexSearcher.GetEntryTermsReader(indexEntryId, ref page);
+                        EntryTermsReader entryTermsReader = IndexSearcher.GetEntryTermsReader(indexEntryId, ref page, _entryTermsKey ??= new CompactKey());
                         var retrieverInput = new RetrieverInput(IndexSearcher, _fieldMappings, in entryTermsReader, key, _index.IndexFieldsPersistence.HasTimeValues, documentScore, documentDistance);
 
                         var filterResult = queryFilter.Apply(ref retrieverInput, key);
@@ -855,12 +1616,18 @@ namespace Raven.Server.Documents.Indexes.Persistence.Corax
                 if (sortingData.IncludeDistances)
                     DistancePool.Return(sortingData.DistancesBuffer);
                 
-                if (queryMatch is not SortingMatch && queryMatch is not SortingMultiMatch)
+                if (queryMatch is not SortingMatch && queryMatch is not SortingMultiMatch && queryMatch is not JoinOrderedWalkMatch && queryMatch is not JoinFirstEntriesMatch && queryMatch is not IPresortedMatch)
                     break; // this is only relevant if we are sorting, since we may have filtered items and need to read more, see: RavenDB-20294
 
                 var sortingMatchTotalResults = 0L;
                 if (queryMatch is SortingMatch) 
                     sortingMatchTotalResults = ((SortingMatch)queryMatch).TotalResults;
+                else if (queryMatch is JoinOrderedWalkMatch walk)
+                    sortingMatchTotalResults = walk.TotalResults;
+                else if (queryMatch is JoinFirstEntriesMatch first)
+                    sortingMatchTotalResults = first.TotalResults;
+                else if (queryMatch is IPresortedMatch presortedMatch)
+                    sortingMatchTotalResults = presortedMatch.TotalResults;
                 else 
                     sortingMatchTotalResults = ((SortingMultiMatch)queryMatch).TotalResults;
 
@@ -1145,123 +1912,14 @@ namespace Raven.Server.Documents.Indexes.Persistence.Corax
         public override IEnumerable<QueryResult> MoreLikeThis(IndexQueryServerSide query, IQueryResultRetriever retriever, DocumentsOperationContext context,
             CancellationToken token)
         {
-            IDisposable releaseServerContext = null;
-            IDisposable closeServerTransaction = null;
-            TransactionOperationContext serverContext = null;
-            MoreLikeThisQuery moreLikeThisQuery;
-            CoraxQueryBuilder.Parameters builderParameters;
+            var sortedQuery = PrepareMoreLikeThis(query, context, out var mlt, out var baseDocId, token);
 
-            try
-            {
-                if (query.Metadata.HasCmpXchg)
-                {
-                    releaseServerContext = context.DocumentDatabase.ServerStore.ContextPool.AllocateOperationContext(out serverContext);
-                    closeServerTransaction = serverContext.OpenReadTransaction();
-                }
-
-                using (closeServerTransaction)
-                {
-                    builderParameters = new(IndexSearcher, _allocator, serverContext, context, query, _index, query.QueryParameters, QueryBuilderFactories,
-                        _fieldMappings, null, null /* allow highlighting? */, CoraxQueryBuilder.TakeAll, deduplicationDisabled: true, indexReadOperation: this, token: token);
-                    moreLikeThisQuery = CoraxQueryBuilder.BuildMoreLikeThisQuery(builderParameters, query.Metadata.Query.Where);
-                }
-            }
-            finally
-            {
-                releaseServerContext?.Dispose();
-            }
-
-            var options = moreLikeThisQuery.Options != null ? JsonDeserializationServer.MoreLikeThisOptions(moreLikeThisQuery.Options) : MoreLikeThisOptions.Default;
-
-            HashSet<string> stopWords = null;
-            if (string.IsNullOrWhiteSpace(options.StopWordsDocumentId) == false)
-            {
-                var stopWordsDoc = context.DocumentDatabase.DocumentsStorage.Get(context, options.StopWordsDocumentId);
-                if (stopWordsDoc == null)
-                    throw new InvalidOperationException($"Stop words document {options.StopWordsDocumentId} could not be found");
-
-                if (stopWordsDoc.Data.TryGet(nameof(MoreLikeThisStopWords.StopWords), out BlittableJsonReaderArray value) && value != null)
-                {
-                    stopWords = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                    for (var i = 0; i < value.Length; i++)
-                        stopWords.Add(value.GetStringByIndex(i));
-                }
-            }
-
-            builderParameters = new(IndexSearcher, _allocator, null, context, query, _index, query.QueryParameters, QueryBuilderFactories,
-                _fieldMappings, null, null /* allow highlighting? */, CoraxQueryBuilder.TakeAll, deduplicationDisabled:true, indexReadOperation: this, token: token);
-            using var mlt = new RavenRavenMoreLikeThis(builderParameters, options);
-            long? baseDocId = null;
-
-            if (moreLikeThisQuery.BaseDocument == null)
-            {
-                Span<long> docsIds = stackalloc long[16];
-                
-                // get the current Lucene docid for the given RavenDB doc ID
-                if (moreLikeThisQuery.BaseDocumentQuery.Fill(docsIds) == 0)
-                    throw new InvalidOperationException("Given filtering expression did not yield any documents that could be used as a base of comparison");
-
-                //What if we've got multiple items?
-                baseDocId = docsIds[0];
-            }
-
-            if (stopWords != null)
-                mlt.SetStopWords(stopWords);
-
-            string[] fieldNames;
-            if (options.Fields != null && options.Fields.Length > 0)
-                fieldNames = options.Fields;
-            else
-            {
-                fieldNames = new string[_fieldMappings.Count];
-                var index = 0;
-                foreach (var binding in _fieldMappings)
-                {
-                    if (binding.FieldNameAsString is Client.Constants.Documents.Indexing.Fields.DocumentIdFieldName or Client.Constants.Documents.Indexing.Fields.SourceDocumentIdFieldName or Client.Constants.Documents.Indexing.Fields.ReduceKeyHashFieldName)
-                        continue;
-                    fieldNames[index++] = binding.FieldNameAsString;
-
-                }
-
-                if (index < fieldNames.Length)
-                    Array.Resize(ref fieldNames, index);
-            }
-
-            mlt.SetFieldNames(fieldNames);
-
-            var pageSize = CoraxBufferSize(IndexSearcher, query.PageSize, query);
-
-            IQueryMatch mltQuery;
-            if (baseDocId.HasValue)
-            {
-                mltQuery = mlt.Like(baseDocId.Value);
-            }
-            else
-            {
-                using (var blittableJson = ParseJsonStringIntoBlittable(moreLikeThisQuery.BaseDocument, context))
-                    mltQuery = mlt.Like(blittableJson);
-            }
-
-            if (moreLikeThisQuery.FilterQuery != null && moreLikeThisQuery.FilterQuery is AllEntriesMatch == false)
-            {
-                mltQuery = IndexSearcher.And(mltQuery, moreLikeThisQuery.FilterQuery, token: token);
-            }
+            using var _ = mlt;
 
             if (query.PageSize == 0)
                 yield break;
 
-            // take counts entries, the loop counts documents: +1 for the base document, times fanout
-            var maxOutputsPerDocument = Math.Max(1, _maxNumberOfOutputsPerDocument); // zero until the index has run
-            long take = query.Start + query.PageSize + 1;
-
-            take = take < 0 || take > int.MaxValue / maxOutputsPerDocument // query.Start is unbounded, and take is cast to int below
-                ? CoraxConstants.IndexSearcher.TakeAll
-                : take * maxOutputsPerDocument;
-
-            if (take > IndexSearcher.NumberOfEntries)
-                take = CoraxConstants.IndexSearcher.TakeAll;
-
-            var sortedQuery = IndexSearcher.OrderBy(mltQuery, new OrderMetadata(hasBoost: true, MatchCompareFieldType.Score), _index.Configuration.NullsSortMode, (int)take, token);
+            var pageSize = CoraxBufferSize(IndexSearcher, query.PageSize, query);
 
             var ravenIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             if (baseDocId.HasValue)
@@ -1282,7 +1940,19 @@ namespace Raven.Server.Documents.Indexes.Persistence.Corax
                 {
                     // sized to the span Fill gets, so ids[i] and ScoresBuffer[i] line up
                     sortingData = new SortingDataTransfer { ScoresBuffer = ScorePool.Rent(ids.Length) };
-                    sortedQuery.SetScoreAndDistanceBuffer(sortingData);
+                    switch (sortedQuery)
+                    {
+                        case SortingMatch sm:
+                            sm.SetScoreAndDistanceBuffer(sortingData);
+                            sortedQuery = sm;
+                            break;
+                        case SortingMultiMatch smm:
+                            smm.SetSortingDataTransfer(sortingData);
+                            sortedQuery = smm;
+                            break;
+                        default:
+                            throw new InvalidOperationException($"A morelikethis() query has to be sorted to return the scores, but its match is a {sortedQuery.GetType().Name}.");
+                    }
                 }
 
                 var read = 0;
@@ -1312,7 +1982,7 @@ namespace Raven.Server.Documents.Indexes.Persistence.Corax
                             continue;
                         }
 
-                        var termsReader = IndexSearcher.GetEntryTermsReader(hit, ref page);
+                        var termsReader = IndexSearcher.GetEntryTermsReader(hit, ref page, _entryTermsKey ??= new CompactKey());
                         var documentScore = sortingData.IncludeScores ? sortingData.ScoresBuffer[i] : (float?)null;
                         var retrieverInput = new RetrieverInput(IndexSearcher, _fieldMappings, termsReader, id, _index.IndexFieldsPersistence.HasTimeValues, documentScore);
                         var result = retriever.Get(ref retrieverInput, token);
@@ -1338,6 +2008,168 @@ namespace Raven.Server.Documents.Indexes.Persistence.Corax
                 QueryPool.Return(ids);
                 if (sortingData.ScoresBuffer != null)
                     ScorePool.Return(sortingData.ScoresBuffer);
+            }
+        }
+
+        private IQueryMatch PrepareMoreLikeThis(IndexQueryServerSide query, DocumentsOperationContext context, out RavenRavenMoreLikeThis mlt, out long? baseDocId, CancellationToken token)
+        {
+            IDisposable releaseServerContext = null;
+            IDisposable closeServerTransaction = null;
+            TransactionOperationContext serverContext = null;
+            MoreLikeThisQuery moreLikeThisQuery;
+            CoraxQueryBuilder.Parameters builderParameters;
+            var hasJoins = query.Metadata.Query.Joins != null;
+            IQueryMatch joinedQuery = null;
+            mlt = null;
+            baseDocId = null;
+
+            // take counts entries, the loop counts documents: +1 for the base document, times fanout
+            var maxOutputsPerDocument = Math.Max(1, _maxNumberOfOutputsPerDocument); // zero until the index has run
+            long take = query.Start + query.PageSize + 1;
+
+            take = take < 0 || take > int.MaxValue / maxOutputsPerDocument // query.Start is unbounded, and take is cast to int below
+                ? CoraxConstants.IndexSearcher.TakeAll
+                : take * maxOutputsPerDocument;
+
+            if (take > IndexSearcher.NumberOfEntries)
+                take = CoraxConstants.IndexSearcher.TakeAll;
+
+            try
+            {
+                if (query.Metadata.HasCmpXchg)
+                {
+                    releaseServerContext = context.DocumentDatabase.ServerStore.ContextPool.AllocateOperationContext(out serverContext);
+                    closeServerTransaction = serverContext.OpenReadTransaction();
+                }
+
+                using (closeServerTransaction)
+                {
+                    builderParameters = new(IndexSearcher, _allocator, serverContext, context, query, _index, query.QueryParameters, QueryBuilderFactories,
+                        _fieldMappings, null, null /* allow highlighting? */, hasJoins ? (int)take : CoraxQueryBuilder.TakeAll, deduplicationDisabled: true, indexReadOperation: this, token: token);
+                    moreLikeThisQuery = CoraxQueryBuilder.BuildMoreLikeThisQuery(builderParameters, query.Metadata.Query.Where, buildFilter: hasJoins == false);
+
+                    // the where clause of a query with a JOIN is built with the server transaction open
+                    if (hasJoins)
+                        joinedQuery = BuildMoreLikeThisMatch(query, context, moreLikeThisQuery, builderParameters, take, out mlt, out baseDocId, token);
+                }
+            }
+            finally
+            {
+                releaseServerContext?.Dispose();
+            }
+
+            return hasJoins
+                ? joinedQuery
+                : BuildMoreLikeThisMatch(query, context, moreLikeThisQuery, null, take, out mlt, out baseDocId, token);
+        }
+
+        private IQueryMatch BuildMoreLikeThisMatch(IndexQueryServerSide query, DocumentsOperationContext context, MoreLikeThisQuery moreLikeThisQuery,
+            CoraxQueryBuilder.Parameters builderParameters, long take, out RavenRavenMoreLikeThis mlt, out long? baseDocId, CancellationToken token)
+        {
+            var joinBuilderParameters = builderParameters;
+            var options = moreLikeThisQuery.Options != null ? JsonDeserializationServer.MoreLikeThisOptions(moreLikeThisQuery.Options) : MoreLikeThisOptions.Default;
+
+            HashSet<string> stopWords = null;
+            if (string.IsNullOrWhiteSpace(options.StopWordsDocumentId) == false)
+            {
+                var stopWordsDoc = context.DocumentDatabase.DocumentsStorage.Get(context, options.StopWordsDocumentId);
+                if (stopWordsDoc == null)
+                    throw new InvalidOperationException($"Stop words document {options.StopWordsDocumentId} could not be found");
+
+                if (stopWordsDoc.Data.TryGet(nameof(MoreLikeThisStopWords.StopWords), out BlittableJsonReaderArray value) && value != null)
+                {
+                    stopWords = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    for (var i = 0; i < value.Length; i++)
+                        stopWords.Add(value.GetStringByIndex(i));
+                }
+            }
+
+            builderParameters = new(IndexSearcher, _allocator, null, context, query, _index, query.QueryParameters, QueryBuilderFactories,
+                _fieldMappings, null, null /* allow highlighting? */, CoraxQueryBuilder.TakeAll, deduplicationDisabled:true, indexReadOperation: this, token: token);
+            mlt = new RavenRavenMoreLikeThis(builderParameters, options);
+            baseDocId = null;
+
+            try
+            {
+                if (moreLikeThisQuery.BaseDocument == null)
+                {
+                    Span<long> docsIds = stackalloc long[16];
+
+                    // the entry id of the given RavenDB doc ID
+                    if (moreLikeThisQuery.BaseDocumentQuery.Fill(docsIds) == 0)
+                        throw new InvalidOperationException("Given filtering expression did not yield any documents that could be used as a base of comparison");
+
+                    baseDocId = docsIds[0];
+                }
+
+                if (stopWords != null)
+                    mlt.SetStopWords(stopWords);
+
+                string[] fieldNames;
+                if (options.Fields != null && options.Fields.Length > 0)
+                    fieldNames = options.Fields;
+                else
+                {
+                    fieldNames = new string[_fieldMappings.Count];
+                    var index = 0;
+                    foreach (var binding in _fieldMappings)
+                    {
+                        if (binding.FieldNameAsString is Client.Constants.Documents.Indexing.Fields.DocumentIdFieldName or Client.Constants.Documents.Indexing.Fields.SourceDocumentIdFieldName or Client.Constants.Documents.Indexing.Fields.ReduceKeyHashFieldName)
+                            continue;
+                        fieldNames[index++] = binding.FieldNameAsString;
+
+                    }
+
+                    if (index < fieldNames.Length)
+                        Array.Resize(ref fieldNames, index);
+                }
+
+                mlt.SetFieldNames(fieldNames);
+
+                IQueryMatch mltQuery;
+                if (baseDocId.HasValue)
+                {
+                    mltQuery = mlt.Like(baseDocId.Value);
+                }
+                else
+                {
+                    using (var blittableJson = ParseJsonStringIntoBlittable(moreLikeThisQuery.BaseDocument, context))
+                        mltQuery = mlt.Like(blittableJson);
+                }
+
+                if (joinBuilderParameters != null)
+                {
+                    var taken = false;
+                    joinBuilderParameters.MoreLikeThisMatch = () =>
+                    {
+                        if (taken)
+                            throw new InvalidQueryException("A query that has a JOIN can contain only one morelikethis().", query.Query, query.QueryParameters);
+
+                        taken = true;
+                        return mltQuery;
+                    };
+
+                    var joined = CoraxQueryBuilder.BuildQuery(joinBuilderParameters, out var sortMetadata);
+                    if (taken == false)
+                        throw new InvalidQueryException("The morelikethis() of the query did not become part of the query that was built (a query with a JOIN builds it from the where clause), so it would have been silently ignored.", query.Query, query.QueryParameters);
+
+                    // the query orders by something else than the score
+                    return sortMetadata != null
+                        ? joined
+                        : IndexSearcher.OrderBy(joined, new OrderMetadata(hasBoost: true, MatchCompareFieldType.Score), _index.Configuration.NullsSortMode, (int)take, token);
+                }
+
+                if (moreLikeThisQuery.FilterQuery != null && moreLikeThisQuery.FilterQuery is AllEntriesMatch == false)
+                {
+                    mltQuery = IndexSearcher.And(mltQuery, moreLikeThisQuery.FilterQuery, token: token);
+                }
+
+                return IndexSearcher.OrderBy(mltQuery, new OrderMetadata(hasBoost: true, MatchCompareFieldType.Score), _index.Configuration.NullsSortMode, (int)take, token);
+            }
+            catch
+            {
+                mlt.Dispose();
+                throw;
             }
         }
 
@@ -1385,7 +2217,7 @@ namespace Raven.Server.Documents.Indexes.Persistence.Corax
                         continue;
                     
                     token.ThrowIfCancellationRequested();
-                    var reader = IndexSearcher.GetEntryTermsReader(coraxInternalEntryId, ref page);
+                    var reader = IndexSearcher.GetEntryTermsReader(coraxInternalEntryId, ref page, _entryTermsKey ??= new CompactKey());
                     var id = _documentIdReader.GetTermFor(coraxInternalEntryId);
                     yield return documentsContext.ReadObject(coraxEntryReader.GetDocument(ref reader), id);
                 }

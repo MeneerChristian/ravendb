@@ -37,6 +37,8 @@ namespace Raven.Server.Documents.Queries.Timings
             public static string Reduce;
             public static string Paging;
             public static string Embeddings;
+            public static string Join;
+            public static string Scan;
         }
 
         private QueryInspectionNode _queryPlan;
@@ -58,11 +60,22 @@ namespace Raven.Server.Documents.Queries.Timings
             return new QueryTimingsScope(start);
         }
 
+        private SortedDictionary<string, long> _counters;
+
+        public void AddCounter(string name, long value)
+        {
+            _counters ??= new SortedDictionary<string, long>();
+            _counters[name] = value;
+        }
+
         public QueryTimings ToTimings()
         {
             QueryTimings timings = _base ?? new QueryTimings();
 
             timings.DurationInMs = (long)Duration.TotalMilliseconds;
+
+            if (_counters != null)
+                timings.Counters = new SortedDictionary<string, long>(_counters);
 
             if (Scopes != null)
             {

@@ -80,12 +80,12 @@ public sealed class CoraxIndexFacetedReadOperation : IndexFacetReadOperationBase
         var ids = CoraxIndexReadOperation.QueryPool.Rent(coraxPageSize);
         CreateMappingForRanges(results, facetsByRange, facetQuery);
 
-        // When a WHERE clause is present, materialize all matching doc IDs into a HashSet.
+        // When a WHERE clause or a JOIN is present, materialize all matching doc IDs into a HashSet.
         // Both term and range facets intersect their posting lists against this set.
         // deduplicationDisabled: true is safe here because the HashSet absorbs duplicates
         // and skipping the query-level dedup saves work during materialization.
         HashSet<long> baseQueryMatchingIds = null;
-        if (query.Metadata.Query.Where is not null)
+        if (query.Metadata.Query.Where is not null || query.Metadata.Query.Joins != null)
         {
             var parameters = new CoraxQueryBuilder.Parameters(_indexSearcher, _allocator, null, null, query, _index,
                 query.QueryParameters, _queryBuilderFactories, _fieldMappings, null, null, -1,

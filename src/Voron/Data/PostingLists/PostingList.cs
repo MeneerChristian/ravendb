@@ -49,6 +49,17 @@ namespace Voron.Data.PostingLists
             }
         }
 
+        // Points a read-only list at another posting list, so that one object serves many lists that are read one after the other
+        public void Reopen(in PostingListState state)
+        {
+            Debug.Assert(_llt.Flags != TransactionFlags.ReadWrite || (_additions.Count == 0 && _removals.Count == 0), "a list with pending changes cannot be pointed at another one");
+            if (state.RootObjectType != RootObjectType.Set)
+                throw new InvalidOperationException("Tried to open a posting list that is actually a " + state.RootObjectType);
+            _state = state;
+            _pos = -1;
+            _len = 0;
+        }
+
         public static void Create(LowLevelTransaction tx, ref PostingListState state)
         {
             var newPage = tx.AllocatePage(1);

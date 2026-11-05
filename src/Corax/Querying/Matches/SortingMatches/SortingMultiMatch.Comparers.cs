@@ -108,17 +108,16 @@ public unsafe partial struct SortingMultiMatch<TInner> : IQueryMatch
                 return;
 
             _comparerId = comparerId;
-            
+
             match._scoreBufferHandler = match._searcher.Allocator.Allocate(batchResults.Length * sizeof(float), out var scoreBuffer);
-            _scores = new UnmanagedSpan<float>(scoreBuffer.Ptr, scoreBuffer.Length);
+            var bytes = batchResults.Length * sizeof(float);
+            _scores = new UnmanagedSpan<float>(scoreBuffer.Ptr, bytes);
             match._secondaryScoreBuffer = _scores;
-            
-            var readScores = scoreBuffer.ToSpan<float>();
-            
-            readScores.Fill(Bm25Relevance.InitialScoreValue);
-            match._inner.Score(batchResults, readScores, 1f);
-            
-            match._searcher.BoostDocuments(batchResults, readScores, sortedById: true);
+            var relevance = _scores.ToSpan();
+            relevance.Fill(Bm25Relevance.InitialScoreValue);
+            match._inner.Score(batchResults, relevance, 1f);
+
+            match._searcher.BoostDocuments(batchResults, relevance, sortedById: true);
         }
 
         public void SortBatch<TComparer2, TComparer3>(ref SortingMultiMatch<TInner> match,
@@ -128,7 +127,7 @@ public unsafe partial struct SortingMultiMatch<TInner> : IQueryMatch
             where TComparer3 : struct, IComparer<UnmanagedSpan>, IComparer<int>, IEntryComparer
         {
             Debug.Assert(_comparerId == 0, "_comparerId == 0");
-            
+
             var readScores = MemoryMarshal.Cast<long, float>(batchTermIds)[..batchResults.Length];
 
             // We have to initialize the score buffer with a positive number to ensure that multiplication (document-boosting) is taken into account when BM25 relevance returns 0 (for example, with AllEntriesMatch).
@@ -149,7 +148,16 @@ public unsafe partial struct SortingMultiMatch<TInner> : IQueryMatch
             }
 
             match._token.ThrowIfCancellationRequested();
-            EntryComparerHelper.IndirectSort<EntryComparerByScore, TComparer2, TComparer3>(ref match, indexes, batchTerms, new(), comparer2, comparer3);
+            var take = match._take < 0 ? indexes.Length : Math.Min(match._take, indexes.Length);
+            if (take <= indexes.Length / EntryComparerHelper.TopSortMinimumRatio)
+            {
+                EntryComparerHelper.IndirectTopSort<EntryComparerByScore, TComparer2, TComparer3>(ref match, indexes, batchTerms, take, new(), comparer2, comparer3);
+                indexes = indexes[..take];
+            }
+            else
+            {
+                EntryComparerHelper.IndirectSort<EntryComparerByScore, TComparer2, TComparer3>(ref match, indexes, batchTerms, new(), comparer2, comparer3);
+            }
 
             for (int i = 0; i < indexes.Length; i++)
             {
@@ -169,6 +177,77 @@ public unsafe partial struct SortingMultiMatch<TInner> : IQueryMatch
         {
             Debug.Assert(_comparerId != 0, "_comparerId != 0");
             return _scores[y].CompareTo(_scores[x]);
+        }
+    }
+
+    private struct EntryComparerByRank : IEntryComparer, IComparer<UnmanagedSpan>, IComparer<int>
+    {
+        private UnmanagedSpan<float> _ranks;
+        private int _comparerId;
+
+        public Slice GetSortFieldName(ref SortingMultiMatch<TInner> match) => Slices.Empty; // a rank is not read from a field
+
+        public void Init(ref SortingMultiMatch<TInner> match, UnmanagedSpan<long> batchResults, int comparerId)
+        {
+            if (comparerId == 0)
+                return;
+
+            _comparerId = comparerId;
+            var bytes = batchResults.Length * sizeof(float);
+            match._rankBufferHandler = match._searcher.Allocator.Allocate(bytes, out var buffer);
+            _ranks = new UnmanagedSpan<float>(buffer.Ptr, bytes);
+            RankedOf(ref match).Rank(batchResults, _ranks.ToSpan());
+        }
+
+        private static IRankedMatch RankedOf(ref SortingMultiMatch<TInner> match) =>
+            match._ranked ?? throw new NotSupportedException("ORDER BY a rank needs a match that has ranks.");
+
+        public void SortBatch<TComparer2, TComparer3>(ref SortingMultiMatch<TInner> match,
+            LowLevelTransaction llt, PageLocator pageLocator, UnmanagedSpan<long> batchResults, Span<long> batchTermIds, UnmanagedSpan* batchTerms,
+            OrderMetadata[] orderMetadata, TComparer2 comparer2, TComparer3 comparer3)
+            where TComparer2 : struct, IComparer<UnmanagedSpan>, IComparer<int>, IEntryComparer
+            where TComparer3 : struct, IComparer<UnmanagedSpan>, IComparer<int>, IEntryComparer
+        {
+            Debug.Assert(_comparerId == 0, "_comparerId == 0");
+
+            var count = batchResults.Length;
+            // a score() among the following keys has computed the relevance already (and the sort hands it over)
+            var ownRelevance = match._sortingDataTransfer.IncludeScores && match._scoreBufferHandler == null;
+            using var _ = llt.Allocator.Allocate((ownRelevance ? 2 : 1) * count * sizeof(float), out var buffer);
+            var ranks = new Span<float>(buffer.Ptr, count);
+            var relevance = ownRelevance ? new Span<float>(buffer.Ptr + count * sizeof(float), count) : default;
+
+            RankedOf(ref match).Rank(batchResults, ranks);
+            if (ownRelevance)
+            {
+                relevance.Fill(Bm25Relevance.InitialScoreValue);
+                match._inner.Score(batchResults, relevance, 1f);
+            }
+
+            var indexes = MemoryMarshal.Cast<long, int>(batchTermIds)[..(batchTermIds.Length)];
+            for (int i = 0; i < batchTermIds.Length; i++)
+            {
+                batchTerms[i] = new UnmanagedSpan(ranks[i]);
+                indexes[i] = i;
+            }
+
+            match._token.ThrowIfCancellationRequested();
+            EntryComparerHelper.IndirectSort<EntryComparerByRank, TComparer2, TComparer3>(ref match, indexes, batchTerms, new(), comparer2, comparer3);
+
+            for (int i = 0; i < indexes.Length; i++)
+            {
+                match._results.Add(batchResults[indexes[i]]);
+                if (ownRelevance)
+                    match._scoresResults.Add(relevance[indexes[i]]);
+            }
+        }
+
+        public int Compare(UnmanagedSpan x, UnmanagedSpan y) => x.Double.CompareTo(y.Double);
+
+        public int Compare(int x, int y)
+        {
+            Debug.Assert(_comparerId != 0, "_comparerId != 0");
+            return _ranks[x].CompareTo(_ranks[y]);
         }
     }
 

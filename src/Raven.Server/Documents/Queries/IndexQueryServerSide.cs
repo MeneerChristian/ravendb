@@ -57,6 +57,15 @@ namespace Raven.Server.Documents.Queries
 
         public long PageSize = int.MaxValue;
 
+        [JsonDeserializationIgnore]
+        internal List<JoinResult> JoinResults;
+
+        [JsonDeserializationIgnore]
+        internal bool IsJoinSource;
+
+        [JsonDeserializationIgnore]
+        internal QueryTimingsScope JoinTimings;
+
         /// <summary>
         /// puts the given string in TrafficWatch property of HttpContext.Items
         /// puts the given type in TrafficWatchChangeType property of HttpContext.Items

@@ -21,6 +21,7 @@ public unsafe partial struct SortingMultiMatch<TInner>
     private const int NextComparerOffset = 3;
     private readonly IndexSearcher _searcher;
     private TInner _inner;
+    private readonly IRankedMatch _ranked;
     private readonly OrderMetadata[] _orderMetadata;
     private readonly NullsSortMode _defaultNullsSortMode;
     private readonly delegate*<ref SortingMultiMatch<TInner>, Span<long>, int> _fillFunc;
@@ -40,6 +41,7 @@ public unsafe partial struct SortingMultiMatch<TInner>
     // This is data persisted for holding score from secondary comparer.
     private UnmanagedSpan<float> _secondaryScoreBuffer;
     private IDisposable _scoreBufferHandler;
+    private IDisposable _rankBufferHandler;
     
     private int _alreadyReadIdx;
 
@@ -51,6 +53,7 @@ public unsafe partial struct SortingMultiMatch<TInner>
     {
         _searcher = searcher;
         _inner = inner;
+        _ranked = SortsByRank(orderMetadata) && (typeof(TInner).IsValueType == false || typeof(IRankedMatch).IsAssignableFrom(typeof(TInner))) ? inner as IRankedMatch : null; // a struct is boxed once, and only when a key is a rank
         _orderMetadata = orderMetadata;
         _defaultNullsSortMode = defaultNullsSortMode;
         _take = take;
@@ -89,6 +92,9 @@ public unsafe partial struct SortingMultiMatch<TInner>
                     
                     (true, MatchCompareFieldType.Score) => new EntryComparerByScore(),
                     (false, MatchCompareFieldType.Score) => new Descending<EntryComparerByScore>(),
+
+                    (true, MatchCompareFieldType.Rank) => new EntryComparerByRank(),
+                    (false, MatchCompareFieldType.Rank) => new Descending<EntryComparerByRank>(),
                     
                     _ => throw new NotSupportedException($"Ascending: {orderMetadata[metadataId].Ascending} | FieldType: {orderMetadata[metadataId].FieldType}.")
                 };
@@ -204,6 +210,8 @@ public unsafe partial struct SortingMultiMatch<TInner>
         }
 
         bufScope.Dispose();
+        match._rankBufferHandler?.Dispose();
+        match._rankBufferHandler = null;
     }
 
 
@@ -211,7 +219,18 @@ public unsafe partial struct SortingMultiMatch<TInner>
 
     public QueryCountConfidence Confidence => throw new NotSupportedException();
 
-    public bool IsBoosting => _inner.IsBoosting || _orderMetadata[0].FieldType == MatchCompareFieldType.Score;
+    private static bool SortsByRank(OrderMetadata[] orderMetadata)
+    {
+        foreach (var order in orderMetadata)
+        {
+            if (order.FieldType == MatchCompareFieldType.Rank)
+                return true;
+        }
+
+        return false;
+    }
+
+    public bool IsBoosting => _inner.IsBoosting || _orderMetadata[0].FieldType is MatchCompareFieldType.Score or MatchCompareFieldType.Rank;
 
     public int AndWith(Span<long> buffer, int matches)
     {

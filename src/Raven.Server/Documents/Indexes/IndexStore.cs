@@ -41,6 +41,7 @@ using Raven.Server.ServerWide;
 using Raven.Server.ServerWide.Context;
 using Raven.Server.Utils;
 using Sparrow.Collections;
+using AsyncManualResetEvent = Sparrow.Server.AsyncManualResetEvent;
 using Sparrow.Logging;
 using Sparrow.Server.Logging;
 using Sparrow.Threading;
@@ -858,6 +859,8 @@ namespace Raven.Server.Documents.Indexes
                     OpenIndexesFromRecord(record, raftIndex, addToInitLog);
             });
         }
+
+        public AsyncManualResetEvent.FrozenAwaiter GetIndexRegistrationAwaiter() => _indexes.GetRegistrationAwaiter();
 
         public Index GetIndex(string name)
         {
@@ -2271,6 +2274,7 @@ namespace Raven.Server.Documents.Indexes
             internal Action<Index> BeforeRollingIndexStart;
 
             internal Action<Index> BeforeIndexThreadExit;
+            internal Action<Index> BeforeJoinSourceIsHeld;
             internal Action<Index> BeforeIndexStart;
 
             internal Action BeforeHandleDatabaseRecordChange;

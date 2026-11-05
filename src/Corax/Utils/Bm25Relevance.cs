@@ -33,9 +33,8 @@ public sealed unsafe class Bm25Relevance : IDisposable
     /// </summary>
     public const float ConstantScoreValue = 1f;
 
-    private const int MaximumDocumentCapacity = MaxSizeOfStorage / (sizeof(long) + sizeof(short));
-    private const int DynamicScoreBatchSize = 16 * 1024;
-    private const int MaxSizeOfStorage = 1024 * 1024; //1MB;
+    // A bigger buffer is a segment that the allocator keeps in its caches after the query: the terms above it are scored from their posting list
+    internal const int DefaultMaxSizeOfStorage = 128 * 1024;
     private const float BFactor = 0.25f;
     private const float K1 = 2f;
     private const int GallopRatio = 32;
@@ -69,15 +68,16 @@ public sealed unsafe class Bm25Relevance : IDisposable
     {
         _termRatioToWholeCollection = (float)termRatioToWholeCollection;
         _numberOfDocuments = numberOfDocuments;
-        IsStored = MaximumDocumentCapacity > numberOfDocuments;
+        int maximumDocumentCapacity = (indexSearcher?._testingConfiguration?.Bm25MaxSizeOfStorage ?? DefaultMaxSizeOfStorage) / (sizeof(long) + sizeof(short));
+        IsStored = maximumDocumentCapacity > numberOfDocuments;
 
 
         if (IsStored == false && dynamicalScoreFunc != null)
         {
             _scoreFunc = dynamicalScoreFunc;
             _processFunc = &DecodeAndDiscard;
-            _bufferCapacity = DynamicScoreBatchSize;
-            _currentId = DynamicScoreBatchSize;
+            _bufferCapacity = maximumDocumentCapacity;
+            _currentId = maximumDocumentCapacity;
         }
         else
         {
@@ -143,7 +143,6 @@ public sealed unsafe class Bm25Relevance : IDisposable
     /// boostFactor - Boost_c
     /// frequencies - occurs
     /// </summary>
-    /// <param name="matches">Ids of docs matched by query. Requirements: sorted</param>
     /// <param name="scores"></param>
     /// <param name="boostFactor">Scalar</param>
     private static void CalculateScoreFromMemory(Bm25Relevance bm25, Span<long> matches, Span<float> scores, float boostFactor)
@@ -155,8 +154,8 @@ public sealed unsafe class Bm25Relevance : IDisposable
         var frequencies = bm25.Scores;
         var denominator = Denominator(bm25._termRatioToWholeCollection);
 
-        // Both sides are sorted, so every lookup continues from the previous position.
-        if (innerItems.Length < matches.Length)
+        // the matches may repeat an id and need not be ascending
+        if (innerItems.Length < matches.Length && IsAscending(matches))
         {
             var gallop = matches.Length <= GallopRatio * innerItems.Length;
             var idOfMatch = 0;
@@ -166,10 +165,9 @@ public sealed unsafe class Bm25Relevance : IDisposable
                 if (idOfMatch == matches.Length)
                     return;
 
-                if (matches[idOfMatch] != innerItems[idX])
-                    continue;
-
-                scores[idOfMatch] += Contribution(frequencies[idX], boostFactor, denominator, bm25._idf);
+                var score = Contribution(frequencies[idX], boostFactor, denominator, bm25._idf);
+                for (var at = idOfMatch; at < matches.Length && matches[at] == innerItems[idX]; at++)
+                    scores[at] += score;
             }
 
             return;
@@ -177,17 +175,30 @@ public sealed unsafe class Bm25Relevance : IDisposable
 
         var gallopInInner = innerItems.Length <= GallopRatio * matches.Length;
         var idOfInner = 0;
+        var previous = long.MinValue;
         for (int idX = 0; idX < matches.Length; ++idX)
         {
-            idOfInner = FindLowerBound(innerItems, idOfInner, matches[idX], gallopInInner);
-            if (idOfInner == innerItems.Length)
-                return;
+            if (matches[idX] < previous)
+                idOfInner = 0;
 
-            if (innerItems[idOfInner] != matches[idX])
+            previous = matches[idX];
+            idOfInner = FindLowerBound(innerItems, idOfInner, matches[idX], gallopInInner);
+            if (idOfInner == innerItems.Length || innerItems[idOfInner] != matches[idX])
                 continue;
 
             scores[idX] += Contribution(frequencies[idOfInner], boostFactor, denominator, bm25._idf);
         }
+    }
+
+    private static bool IsAscending(Span<long> items)
+    {
+        for (var i = 1; i < items.Length; i++)
+        {
+            if (items[i] < items[i - 1])
+                return false;
+        }
+
+        return true;
     }
 
     /// <summary>
@@ -300,9 +311,24 @@ public sealed unsafe class Bm25Relevance : IDisposable
         {
             if (matches.Length == 0)
                 return;
+
+            // the matches may be in any order, then the posting list is read from the smallest of them to the largest and every part is scored against all the matches
+            var ascending = IsAscending(matches);
+            var firstMatch = matches[0];
             var lastMatch = matches[^1];
+            if (ascending == false)
+            {
+                firstMatch = long.MaxValue;
+                lastMatch = long.MinValue;
+                foreach (var match in matches)
+                {
+                    firstMatch = Math.Min(firstMatch, match);
+                    lastMatch = Math.Max(lastMatch, match);
+                }
+            }
+
             var pruneBound = EntryIdEncodings.PrepareIdForSeekInPostingList(lastMatch + 1);
-            bm25._setIterator.Seek(EntryIdEncodings.PrepareIdForSeekInPostingList(matches[0]));
+            bm25._setIterator.Seek(EntryIdEncodings.PrepareIdForSeekInPostingList(firstMatch));
 
             var matchesStart = 0;
             bm25._currentId = bm25._bufferCapacity;
@@ -315,11 +341,19 @@ public sealed unsafe class Bm25Relevance : IDisposable
                 EntryIdEncodings.Decode(bm25.Matches, bm25.Scores);
 
                 var postings = bm25.Matches;
-                matchesStart = FindLowerBound(matches, matchesStart, postings[0], gallop: true);
-                if (matchesStart == matches.Length)
-                    return;
+                if (ascending)
+                {
+                    matchesStart = FindLowerBound(matches, matchesStart, postings[0], gallop: true);
+                    if (matchesStart == matches.Length)
+                        return;
 
-                CalculateScoreFromMemory(bm25, matches[matchesStart..], scores[matchesStart..], boostFactor);
+                    CalculateScoreFromMemory(bm25, matches[matchesStart..], scores[matchesStart..], boostFactor);
+                }
+                else
+                {
+                    CalculateScoreFromMemory(bm25, matches, scores, boostFactor);
+                }
+
                 if (postings[^1] >= lastMatch)
                     return;
 

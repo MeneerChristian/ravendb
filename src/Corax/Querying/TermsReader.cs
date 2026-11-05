@@ -45,6 +45,8 @@ public unsafe struct TermsReader : IDisposable
         _rawTermsContainer = new ContextBoundNativeList<UnmanagedSpan>(_llt.Allocator);
     }
 
+    internal bool HasMap => _lookup != null;
+
     public string GetTermFor(long id)
     {
         TryGetTermFor(id, out string s);
@@ -107,6 +109,23 @@ public unsafe struct TermsReader : IDisposable
         return maxToProcess;
     }
     
+    // returns how many of the ids were read: at most one batch per call
+    internal int GetAllTermIdsFromSet(ReadOnlySpan<long> ids, out ReadOnlySpan<long> termIds)
+    {
+        var maxToProcess = Math.Min(ids.Length, 1024);
+        if (maxToProcess == 0 || _lookup == null)
+        {
+            termIds = default;
+            return 0;
+        }
+
+        _termsLocation.ResetAndEnsureCapacity(maxToProcess);
+        _termsLocation.Count = maxToProcess;
+        _lookup.GetFor(ids[..maxToProcess], _termsLocation.ToSpan(), -1L);
+        termIds = _termsLocation.ToSpan();
+        return maxToProcess;
+    }
+
     public bool TryGetRawTermFor(long id, out UnmanagedSpan term)
     {
         if (_lookup.TryGetValue(id, out var termEntryId) == false)
@@ -133,6 +152,16 @@ public unsafe struct TermsReader : IDisposable
         Set(_xKeyScope.Key, item, _dictionaryId);
         term = _xKeyScope.Key.ToString();
         return true;
+    }
+
+    public long DictionaryId => _dictionaryId;
+
+    // The encoded bits of a term as it is stored in the container, and how many of them are used
+    public static ReadOnlySpan<byte> EncodedTermOf(UnmanagedSpan raw, out int encodedKeyLengthInBits)
+    {
+        int remainderBits = raw.Address[0] >> 4;
+        encodedKeyLengthInBits = (raw.Length - 1) * 8 - remainderBits;
+        return new ReadOnlySpan<byte>(raw.Address + 1, raw.Length - 1);
     }
 
     public static void Set(CompactKey key, in Container.Item item, long dictionaryId)

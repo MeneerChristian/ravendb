@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using Sparrow.Collections;
+using AsyncManualResetEvent = Sparrow.Server.AsyncManualResetEvent;
 
 namespace Raven.Server.Documents.Indexes
 {
@@ -37,9 +38,18 @@ namespace Raven.Server.Documents.Indexes
             }
         }
 
+        private readonly AsyncManualResetEvent _registered = new();
+
+        /// <summary>Completes when an index is added or takes the place of another by its name. Taken before the indexes are read, so a registration in between is not missed.</summary>
+        public AsyncManualResetEvent.FrozenAwaiter GetRegistrationAwaiter() => _registered.GetFrozenAwaiter();
+
+        private void Registered() => _registered.SetAndResetAtomically();
+
         public void Add(Index index)
         {
             _indexesByName[index.Name] = index;
+
+            Registered();
 
             foreach (var collection in index.Definition.Collections)
             {
@@ -55,6 +65,8 @@ namespace Raven.Server.Documents.Indexes
             _indexesByName.AddOrUpdate(name, newIndex, (key, oldValue) => newIndex);
             if (newIndex.Name != name)
                 _indexesByName.TryRemove(newIndex.Name, out Index _);
+
+            Registered();
 
             if (oldIndex == null)
                 return;

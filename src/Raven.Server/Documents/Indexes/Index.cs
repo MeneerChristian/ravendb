@@ -22,6 +22,7 @@ using Raven.Client.Documents.Indexes.Vector;
 using Raven.Client.Documents.Operations;
 using Raven.Client.Documents.Queries;
 using Raven.Client.Exceptions.Corax;
+using Raven.Client.Exceptions;
 using Raven.Client.Exceptions.Documents.Indexes;
 using Raven.Client.Extensions;
 using Raven.Client.ServerWide.Operations;
@@ -1376,6 +1377,27 @@ namespace Raven.Server.Documents.Indexes
                 using (indexContext.OpenReadTransaction())
                 {
                     return IsStale(queryContext, indexContext, cutoff: cutoff, referenceCutoff: cutoff, stalenessReasons: stalenessReasons);
+                }
+            }
+        }
+
+        internal bool IsStaleForJoin(QueryOperationContext queryContext, (long DocumentCutoff, long? ReferenceCutoff, long? CompareExchangeReferenceCutoff)? cutoff)
+        {
+            using (CurrentlyInUse(out var valid))
+            {
+                if (valid == false)
+                    return true;
+
+                // a joined index that cannot answer must fail the query now
+                if (Type == IndexType.Faulty)
+                    throw new IndexInvalidException($"The index '{Name}' is faulty, a query cannot join with it.");
+
+                AssertIndexState();
+
+                using (_contextPool.AllocateOperationContext(out TransactionOperationContext indexContext))
+                using (indexContext.OpenReadTransaction())
+                {
+                    return IsStale(queryContext, indexContext, cutoff?.DocumentCutoff, cutoff?.ReferenceCutoff, cutoff?.CompareExchangeReferenceCutoff);
                 }
             }
         }
@@ -3451,6 +3473,7 @@ namespace Raven.Server.Documents.Indexes
                 (long? DocEtag, long? ReferenceEtag, long? CompareExchangeReferenceEtag)? cutoffEtag = null;
 
                 var stalenessScope = query.Timings?.For(nameof(QueryTimingsScope.Names.Staleness), start: false);
+                var joinedIndexes = JoinedIndexes.Create(DocumentDatabase, query.Metadata.Query);
 
                 while (true)
                 {
@@ -3462,6 +3485,7 @@ namespace Raven.Server.Documents.Indexes
                     // query the index again. This is important because of:
                     // https://issues.hibernatingrhinos.com/issue/RavenDB-5576
                     var frozenAwaiter = GetIndexingBatchAwaiter();
+                    var joinedAwaiters = joinedIndexes?.GetAwaiters();
                     using (_contextPool.AllocateOperationContext(out TransactionOperationContext indexContext))
                     using (var indexTx = indexContext.OpenReadTransaction())
                     {
@@ -3477,6 +3501,12 @@ namespace Raven.Server.Documents.Indexes
                                 cutoffEtag = GetCutoffEtag(queryContext);
 
                             isStale = IsStale(queryContext, indexContext, cutoffEtag?.DocEtag, cutoffEtag?.ReferenceEtag, cutoffEtag?.CompareExchangeReferenceEtag);
+
+                            // the result is only fresh when the indexes it joins with are fresh too
+                            var mainIndexIsStale = isStale;
+                            var staleJoinedIndex = joinedIndexes?.FindStale(queryContext, query.WaitForNonStaleResults);
+                            isStale |= staleJoinedIndex != null;
+
                             if (WillResultBeAcceptable(isStale, query, wait) == false)
                             {
                                 resultToFill.ReadTransactionDispose?.Dispose();
@@ -3490,15 +3520,19 @@ namespace Raven.Server.Documents.Indexes
 
                                 marker.ReleaseLock();
 
-                                await wait.WaitForIndexingAsync(frozenAwaiter).ConfigureAwait(false);
+                                await wait.WaitForIndexingAsync(mainIndexIsStale || staleJoinedIndex == null ? frozenAwaiter : joinedAwaiters[staleJoinedIndex]).ConfigureAwait(false);
                                 continue;
                             }
                         }
 
                         FillQueryResult(resultToFill, isStale, query.Metadata, queryContext, indexContext, queryTime);
 
+                        using (var joinSource = OpenJoinSource(query, queryContext, indexTx, token))
                         using (var reader = IndexPersistence.OpenIndexReader(indexTx.InnerTransaction, query))
                         {
+                            query.JoinResults = joinSource?.Results;
+                            resultToFill.ResultEtag ^= GetJoinedIndexesEtag(queryContext, query.Metadata.Query, joinSource);
+
                             using (var queryScope = query.Timings?.For(nameof(QueryTimingsScope.Names.Query)))
                             {
                                 QueryTimingsScope gatherScope = null;
@@ -3609,9 +3643,28 @@ namespace Raven.Server.Documents.Indexes
                                         enumerator = pulsedEnumerator;
                                     }
 
+                                    var measureMemory = queryScope != null;
+                                    var measureJoin = query.JoinTimings != null;
+                                    long outerQueryAllocatedBytes = 0;
+                                    long nativeHeldBytes = 0, nativeHeldPeakBytes = 0;
+                                    bool MoveNextMeasured()
+                                    {
+                                        if (measureMemory == false)
+                                            return enumerator.MoveNext();
+
+                                        var allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+                                        var nativeBefore = NativeMemory.CurrentThreadStats.TotalAllocated;
+                                        var hasNext = enumerator.MoveNext();
+                                        outerQueryAllocatedBytes += GC.GetAllocatedBytesForCurrentThread() - allocatedBefore;
+
+                                        nativeHeldBytes += NativeMemory.CurrentThreadStats.TotalAllocated - nativeBefore;
+                                        nativeHeldPeakBytes = Math.Max(nativeHeldPeakBytes, nativeHeldBytes);
+                                        return hasNext;
+                                    }
+
                                     using (enumerator)
                                     {
-                                        while (enumerator.MoveNext())
+                                        while (MoveNextMeasured())
                                         {
                                             var document = enumerator.Current;
                                             //Streaming:
@@ -3638,6 +3691,22 @@ namespace Raven.Server.Documents.Indexes
                                             includeRevisionsCommand?.Fill(document.Result);
                                         }
                                         
+                                        if (measureMemory)
+                                        {
+                                            queryScope.AddCounter("AllocatedManagedBytes", outerQueryAllocatedBytes);
+                                            queryScope.AddCounter("HeldUnmanagedBytesPeak", nativeHeldPeakBytes);
+                                        }
+
+                                        if (measureJoin)
+                                        {
+                                            query.JoinTimings.AddCounter("OuterQueryAllocatedManagedBytes", outerQueryAllocatedBytes);
+                                            var scanBytes = 0L;
+                                            foreach (var joinResult in query.JoinResults)
+                                                scanBytes += joinResult.ScanAllocatedManagedBytes;
+
+                                            query.JoinTimings.AddCounter("TotalAllocatedManagedBytes", scanBytes + outerQueryAllocatedBytes);
+                                        }
+
                                         // Corax: we have to update the statistics again (after all) due to take parameter in OrderBy clauses.
                                         UpdateQueryStatistics();
                                         void UpdateQueryStatistics()
@@ -3700,6 +3769,18 @@ namespace Raven.Server.Documents.Indexes
             }
         }
 
+        private JoinSources OpenJoinSource(IndexQueryServerSide query, QueryOperationContext queryContext, RavenTransaction indexTransaction, OperationCancelToken token)
+        {
+            if (query.Metadata.Query.Joins == null)
+                return null;
+
+            using (var joinScope = query.Timings?.For(nameof(QueryTimingsScope.Names.Join)))
+            {
+                query.JoinTimings = joinScope;
+                return JoinSources.Open(DocumentDatabase, query, this, indexTransaction, queryContext.Documents, joinScope, Configuration.CoraxIncludeDocumentScore, keepWinners: false, token.Token);
+            }
+        }
+
         private async Task IndexEntriesQueryInternal<TQueryResult>(
             TQueryResult resultToFill,
             IndexQueryServerSide query,
@@ -3719,12 +3800,14 @@ namespace Raven.Server.Documents.Indexes
                 (long? DocEtag, long? ReferenceEtag, long? CompareExchangeReferenceEtag)? cutoffEtag = null;
 
                 var stalenessScope = query.Timings?.For(nameof(QueryTimingsScope.Names.Staleness), start: false);
+                var joinedIndexes = JoinedIndexes.Create(DocumentDatabase, query.Metadata.Query);
 
                 while (true)
                 {
                     AssertIndexState();
                     await marker.HoldLockAsync();
                     var frozenAwaiter = GetIndexingBatchAwaiter();
+                    var joinedAwaiters = joinedIndexes?.GetAwaiters();
                     using (_contextPool.AllocateOperationContext(out TransactionOperationContext indexContext))
                     using (var indexTx = indexContext.OpenReadTransaction())
                     {
@@ -3738,6 +3821,12 @@ namespace Raven.Server.Documents.Indexes
                                 cutoffEtag = GetCutoffEtag(queryContext);
 
                             isStale = IsStale(queryContext, indexContext, cutoffEtag?.DocEtag, cutoffEtag?.ReferenceEtag, cutoffEtag?.CompareExchangeReferenceEtag);
+
+                            // the result is only fresh when the indexes it joins with are fresh too
+                            var mainIndexIsStale = isStale;
+                            var staleJoinedIndex = joinedIndexes?.FindStale(queryContext, query.WaitForNonStaleResults);
+                            isStale |= staleJoinedIndex != null;
+
                             if (WillResultBeAcceptable(isStale, query, wait) == false)
                             {
                                 queryContext.CloseTransaction();
@@ -3749,15 +3838,18 @@ namespace Raven.Server.Documents.Indexes
 
                                 marker.ReleaseLock();
 
-                                await wait.WaitForIndexingAsync(frozenAwaiter).ConfigureAwait(false);
+                                await wait.WaitForIndexingAsync(mainIndexIsStale || staleJoinedIndex == null ? frozenAwaiter : joinedAwaiters[staleJoinedIndex]).ConfigureAwait(false);
                                 continue;
                             }
                         }
 
                         FillQueryResult(resultToFill, isStale, query.Metadata, queryContext, indexContext);
 
+                        using (var joinSource = OpenJoinSource(query, queryContext, indexTx, token))
                         using (var reader = IndexPersistence.OpenIndexReader(indexTx.InnerTransaction))
                         {
+                            query.JoinResults = joinSource?.Results;
+                            resultToFill.ResultEtag ^= GetJoinedIndexesEtag(queryContext, query.Metadata.Query, joinSource);
                             var totalResults = new Reference<long>();
 
                             foreach (var indexEntry in reader.IndexEntries(query, totalResults, queryContext.Documents, GetOrAddSpatialField, ignoreLimit, token.Token))
@@ -3772,10 +3864,29 @@ namespace Raven.Server.Documents.Indexes
             }
         }
 
+        private void AssertJoinsAreSupported(IndexQueryServerSide query, string unsupportedQueryKind = null)
+        {
+            if (query.Metadata.Query.Joins == null)
+                return;
+
+            if (unsupportedQueryKind != null)
+                throw new InvalidQueryException($"JOIN is not supported in {unsupportedQueryKind} queries (it works in queries, index entries queries, streaming and facets).", query.Query, query.QueryParameters);
+
+            if (SearchEngineType != SearchEngineType.Corax)
+                throw new InvalidQueryException($"JOIN is supported only for Corax indexes, but the index '{Name}' uses {SearchEngineType}.", query.Query, query.QueryParameters);
+        }
+
         private void QueryInternalPreparation(IndexQueryServerSide query)
         {
             AssertIndexState();
+            AssertJoinsAreSupported(query);
 
+            PromoteFromIdleAndMarkQueried();
+            AssertQueryDoesNotContainFieldsThatAreNotIndexed(query.Metadata);
+        }
+
+        private void PromoteFromIdleAndMarkQueried()
+        {
             if (State == IndexState.Idle)
             {
                 try
@@ -3791,8 +3902,45 @@ namespace Raven.Server.Documents.Indexes
             }
 
             MarkQueried(DocumentDatabase.Time.GetUtcNow());
-            AssertQueryDoesNotContainFieldsThatAreNotIndexed(query.Metadata);
         }
+
+        internal enum JoinSourceHold
+        {
+            Held,
+            Disposed, // a replacement of the index disposed it: the index of its name is the one to read
+            Busy // a replacement holds the index (it is not disposed), and it was not released in time
+        }
+
+        // keeps the index from going idle while a query of another index reads it. Waits up to the given time for a replacement that holds the index: the replacement
+        // that drains the queries of the index is a matter of moments, and the join is not failed while it completes
+        internal JoinSourceHold TryBeginQueryAsJoinSource(TimeSpan wait, out IDisposable inUse)
+        {
+            inUse = null;
+            if (_disposeOnce.Disposed)
+                return JoinSourceHold.Disposed;
+
+            AssertIndexState();
+
+            var held = new IndexQueryDoneRunning(this);
+            if (held.TryHoldLock(wait) == false)
+            {
+                held.Dispose();
+                return _disposeOnce.Disposed ? JoinSourceHold.Disposed : JoinSourceHold.Busy;
+            }
+
+            // the lock is granted after the drain that disposed the index released it
+            if (_disposeOnce.Disposed)
+            {
+                held.Dispose();
+                return JoinSourceHold.Disposed;
+            }
+
+            PromoteFromIdleAndMarkQueried();
+            inUse = held;
+            return JoinSourceHold.Held;
+        }
+
+        internal bool TryBeginQueryAsJoinSource(out IDisposable inUse) => TryBeginQueryAsJoinSource(TimeSpan.Zero, out inUse) == JoinSourceHold.Held;
 
         public virtual async Task<FacetedQueryResult> FacetedQuery(
             FacetQuery facetQuery,
@@ -3807,6 +3955,7 @@ namespace Raven.Server.Documents.Indexes
 
             var query = facetQuery.Query;
             queryTime ??= query.Metadata.HasTimeBasedFunction ? new QueryTimeScope() : null;
+            AssertJoinsAreSupported(query);
 
             MarkQueried(DocumentDatabase.Time.GetUtcNow());
             AssertQueryDoesNotContainFieldsThatAreNotIndexed(query.Metadata);
@@ -3820,6 +3969,7 @@ namespace Raven.Server.Documents.Indexes
                 (long? DocEtag, long? ReferenceEtag, long? CompareExchangeReferenceEtag)? cutoffEtag = null;
 
                 var stalenessScope = query.Timings?.For(nameof(QueryTimingsScope.Names.Staleness), start: false);
+                var joinedIndexes = JoinedIndexes.Create(DocumentDatabase, query.Metadata.Query);
 
                 while (true)
                 {
@@ -3835,6 +3985,7 @@ namespace Raven.Server.Documents.Indexes
                         // query the index again. This is important because of:
                         // https://issues.hibernatingrhinos.com/issue/RavenDB-5576
                         var frozenAwaiter = GetIndexingBatchAwaiter();
+                        var joinedAwaiters = joinedIndexes?.GetAwaiters();
                         using (var indexTx = indexContext.OpenReadTransaction())
                         {
                             if (queryContext.AreTransactionsOpened() == false)
@@ -3849,6 +4000,11 @@ namespace Raven.Server.Documents.Indexes
 
                                 isStale = IsStale(queryContext, indexContext, cutoffEtag?.DocEtag, cutoffEtag?.ReferenceEtag, cutoffEtag?.CompareExchangeReferenceEtag);
 
+                                // the result is only fresh when the indexes it joins with are fresh too
+                                var mainIndexIsStale = isStale;
+                                var staleJoinedIndex = joinedIndexes?.FindStale(queryContext, query.WaitForNonStaleResults);
+                                isStale |= staleJoinedIndex != null;
+
                                 if (WillResultBeAcceptable(isStale, query, wait) == false)
                                 {
                                     queryContext.CloseTransaction();
@@ -3860,7 +4016,7 @@ namespace Raven.Server.Documents.Indexes
 
                                     marker.ReleaseLock();
 
-                                    await wait.WaitForIndexingAsync(frozenAwaiter).ConfigureAwait(false);
+                                    await wait.WaitForIndexingAsync(mainIndexIsStale || staleJoinedIndex == null ? frozenAwaiter : joinedAwaiters[staleJoinedIndex]).ConfigureAwait(false);
                                     continue;
                                 }
                             }
@@ -3868,6 +4024,11 @@ namespace Raven.Server.Documents.Indexes
                             FillFacetedQueryResult(result, isStale,
                                 facetQuery.FacetsEtag, facetQuery.Query.Metadata,
                                 queryContext, indexContext, queryTime);
+
+                            // the joins are read before the documents transaction may be closed, and stay open for as long as the facets are computed
+                            using var joinSource = OpenJoinSource(query, queryContext, indexTx, token);
+                            query.JoinResults = joinSource?.Results;
+                            result.ResultEtag ^= GetJoinedIndexesEtag(queryContext, facetQuery.Query.Metadata.Query, joinSource);
 
                             if (facetQuery.Query.Metadata.HasIncludeOrLoad == false)
                                 queryContext.CloseTransaction();
@@ -3938,6 +4099,8 @@ namespace Raven.Server.Documents.Indexes
 
             if (State == IndexState.Idle)
                 SetState(IndexState.Normal);
+
+            AssertJoinsAreSupported(query, "suggestion");
 
             MarkQueried(DocumentDatabase.Time.GetUtcNow());
             AssertQueryDoesNotContainFieldsThatAreNotIndexed(query.Metadata);
@@ -4055,7 +4218,7 @@ namespace Raven.Server.Documents.Indexes
             }
         }
 
-        private (long DocumentCutoff, long? ReferenceCutoff, long? CompareExchangeReferenceCutoff) GetCutoffEtag(QueryOperationContext queryContext)
+        internal (long DocumentCutoff, long? ReferenceCutoff, long? CompareExchangeReferenceCutoff) GetCutoffEtag(QueryOperationContext queryContext)
         {
             long cutoffEtag = 0;
 
@@ -4145,6 +4308,9 @@ namespace Raven.Server.Documents.Indexes
 
                     if (sortedField.OrderingType == OrderByFieldType.Score)
                         continue;
+
+                    if (sortedField.JoinAlias != null)
+                        continue; // a field of the joined index, it is checked against that index when the join is read
 
                     var f = sortedField.Name;
 
@@ -4462,7 +4628,7 @@ namespace Raven.Server.Documents.Indexes
                     using (indexContext.OpenReadTransaction())
                     using (OpenReadTransaction(context))
                     {
-                        return CalculateIndexEtag(context, indexContext, q, IsStale(context, indexContext), queryTime);
+                        return CalculateIndexEtag(context, indexContext, q, IsStale(context, indexContext), queryTime) ^ GetJoinedIndexesEtag(context, q?.Query, null);
                     }
                 }
 
@@ -4473,6 +4639,44 @@ namespace Raven.Server.Documents.Indexes
 
                     return context.OpenReadTransaction();
                 }
+            }
+        }
+
+        internal long GetIndexEtagOfTransaction(QueryOperationContext context, TransactionOperationContext indexContext)
+        {
+            return CalculateIndexEtag(context, indexContext, null, IsStale(context, indexContext));
+        }
+
+        // the joined indexes are read from the transactions that the joins read with, so that the etag covers exactly the state of the answer
+        private long GetJoinedIndexesEtag(QueryOperationContext context, Query query, JoinSources joinSource)
+        {
+            if (query?.Joins == null)
+                return 0;
+
+            return GetJoinedIndexesEtagOfJoins(context, query, joinSource);
+        }
+
+        private long GetJoinedIndexesEtagOfJoins(QueryOperationContext context, Query query, JoinSources joinSource)
+        {
+            if (query?.Joins == null)
+                return 0;
+
+            unchecked
+            {
+                long combined = 17;
+                foreach (var join in query.Joins)
+                {
+                    var joined = DocumentDatabase.IndexStore.GetIndex(join.Query.From.From.FieldValue);
+                    if (joined == null || joined.Type == IndexType.Faulty)
+                        return DateTime.UtcNow.Ticks; // the query fails when it runs, it must never be answered as 'not modified'
+
+                    combined = combined * 397 ^ (joinSource != null && joinSource.Snapshots.TryGetValue(join, out TransactionOperationContext snapshot)
+                        ? joined.GetIndexEtagOfTransaction(context, snapshot)
+                        : joined.GetIndexEtag(context, null));
+                    combined = combined * 397 ^ GetJoinedIndexesEtagOfJoins(context, join.Query, joinSource);
+                }
+
+                return combined;
             }
         }
 
@@ -5578,6 +5782,24 @@ namespace Raven.Server.Documents.Indexes
                 {
                     ThrowLockTimeoutException();
                 }
+            }
+
+            public bool TryHoldLock(TimeSpan wait)
+            {
+                if (_lock != null)
+                    ThrowLockAlreadyTaken();
+
+                try
+                {
+                    using (var cts = new CancellationTokenSource(wait < TimeSpan.Zero ? TimeSpan.Zero : wait))
+                        _lock = _parent._currentlyRunningQueriesLock.ReaderLock(cts.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    return false;
+                }
+
+                return true;
             }
 
             public bool TryHoldLock()

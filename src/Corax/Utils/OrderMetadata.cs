@@ -28,6 +28,7 @@ public readonly struct OrderMetadata
             MatchCompareFieldType.Integer => Field.FieldName + " as long",
             MatchCompareFieldType.Floating => Field.FieldName + " as double",
             MatchCompareFieldType.Score => "score()",
+            MatchCompareFieldType.Rank => "rank",
             MatchCompareFieldType.Alphanumeric => " alphanumeric(" + Field.FieldName + ")",
             MatchCompareFieldType.Spatial => $"spatial(point: {Point}, round: {Round}, units: {Units})",
             _ => FieldType.ToString()

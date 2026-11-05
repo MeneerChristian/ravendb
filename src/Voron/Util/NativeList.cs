@@ -193,6 +193,31 @@ public unsafe struct NativeList<T>
         Capacity = _storage.Length / sizeof(T);
     }
 
+    // grows to what fits minCapacity in the allocation sizes, a power of two would waste up to half
+    public void GrowFitting(ByteStringContext ctx, int minCapacity)
+    {
+        if (minCapacity <= Capacity)
+            return;
+
+        if (minCapacity > MaxCapacity)
+            ThrowMaxCapacityExceeded(minCapacity);
+
+        var header = sizeof(ByteStringStorage);
+        var needed = (long)minCapacity * sizeof(T);
+        var rounded = Bits.NextAllocationSize((int)Math.Min(int.MaxValue, needed + header));
+        var newSize = (int)Math.Min(Math.Max((long)rounded - header, needed), MaxCapacityInBytes);
+        ctx.Allocate(newSize, out var mem);
+
+        if (_storage.HasValue)
+        {
+            Memory.Copy(mem.Ptr, _storage.Ptr, Count * sizeof(T));
+            ctx.Release(ref _storage);
+        }
+
+        _storage = mem;
+        Capacity = _storage.Length / sizeof(T);
+    }
+
     public readonly void Sort()
     {
         if (typeof(T) == typeof(int) || typeof(T) == typeof(long))

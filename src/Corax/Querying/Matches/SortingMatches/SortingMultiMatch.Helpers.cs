@@ -21,6 +21,8 @@ public unsafe partial struct SortingMultiMatch<TInner>
             (MatchCompareFieldType.Sequence, false) => SortBy<Descending<EntryComparerByTerm>>(orderMetadata),
             (MatchCompareFieldType.Score, true) => SortBy<EntryComparerByScore>(orderMetadata),
             (MatchCompareFieldType.Score, false) => SortBy<Descending<EntryComparerByScore>>(orderMetadata),
+            (MatchCompareFieldType.Rank, true) => SortBy<EntryComparerByRank>(orderMetadata),
+            (MatchCompareFieldType.Rank, false) => SortBy<Descending<EntryComparerByRank>>(orderMetadata),
             (MatchCompareFieldType.Spatial, true) => SortBy<EntryComparerBySpatial>(orderMetadata),
             (MatchCompareFieldType.Spatial, false) => SortBy<Descending<EntryComparerBySpatial>>(orderMetadata),
             (MatchCompareFieldType.Alphanumeric, true) => SortBy<EntryComparerByTermAlphaNumeric>(orderMetadata),
@@ -50,6 +52,8 @@ public unsafe partial struct SortingMultiMatch<TInner>
             
             (MatchCompareFieldType.Score, true) => SortBy<TComparer1, EntryComparerByScore>(orderMetadata),
             (MatchCompareFieldType.Score, false) => SortBy<TComparer1, Descending<EntryComparerByScore>>(orderMetadata),
+            (MatchCompareFieldType.Rank, true) => SortBy<TComparer1, EntryComparerByRank>(orderMetadata),
+            (MatchCompareFieldType.Rank, false) => SortBy<TComparer1, Descending<EntryComparerByRank>>(orderMetadata),
             
             _ => &Fill<TComparer1, NullComparer, NullComparer>
         };
@@ -76,6 +80,8 @@ public unsafe partial struct SortingMultiMatch<TInner>
             (MatchCompareFieldType.Alphanumeric, false) => &Fill<TComparer1, TComparer2, Descending<EntryComparerByTermAlphaNumeric>>,
             (MatchCompareFieldType.Score, true) => &Fill<TComparer1, TComparer2, EntryComparerByScore>,
             (MatchCompareFieldType.Score, false) => &Fill<TComparer1, TComparer2, Descending<EntryComparerByScore>>,
+            (MatchCompareFieldType.Rank, true) => &Fill<TComparer1, TComparer2, EntryComparerByRank>,
+            (MatchCompareFieldType.Rank, false) => &Fill<TComparer1, TComparer2, Descending<EntryComparerByRank>>,
             
             _ => &Fill<TComparer1, TComparer2, NullComparer>
         };
@@ -98,6 +104,94 @@ public unsafe partial struct SortingMultiMatch<TInner>
             IndirectSort(ref match, indexes, batchTerms, comparer1, comparer2, comparer3);
             
             return indexes;
+        }
+
+        // The top-N of a sort that starts with a key that ties heavily
+        internal const int TopSortMinimumRatio = 4;
+
+        public static void IndirectTopSort<TComparer1, TComparer2, TComparer3>(ref SortingMultiMatch<TInner> match, Span<int> indexes,
+            UnmanagedSpan* batchTerms, int take, TComparer1 comparer1, TComparer2 comparer2, TComparer3 comparer3)
+            where TComparer1 : struct, IComparer<UnmanagedSpan>, IEntryComparer
+            where TComparer2 : struct, IComparer<UnmanagedSpan>, IComparer<int>, IEntryComparer
+            where TComparer3 : struct, IComparer<UnmanagedSpan>, IComparer<int>, IEntryComparer
+        {
+            if (match._orderMetadata[0].Ascending)
+                TopSort(indexes, take, new IndirectComparer<TComparer1, TComparer2, TComparer3>(ref match, batchTerms, comparer1, comparer2, comparer3));
+            else
+                TopSort(indexes, take, new IndirectComparer<Descending<TComparer1>, TComparer2, TComparer3>(ref match, batchTerms, new(comparer1), comparer2, comparer3));
+        }
+
+        // Leaves the best 'take' entries, best first, in indexes[..take]. The heap keeps the worst of them at its root.
+        private static void TopSort<TComparer>(Span<int> indexes, int take, TComparer comparer)
+            where TComparer : struct, IComparer<int>
+        {
+            if (take == 0)
+                return;
+
+            var n = indexes.Length;
+            var heap = indexes[..take];
+            var size = 0;
+            for (var i = 0; i < n; i++)
+            {
+                if (size < take)
+                {
+                    heap[size] = i;
+                    SiftUp(heap, size, comparer);
+                    size++;
+                }
+                else if (comparer.Compare(i, heap[0]) < 0) // i sorts before the worst kept entry: a tie is not better
+                {
+                    heap[0] = i;
+                    SiftDown(heap, 0, size, comparer);
+                }
+            }
+
+            for (var end = size - 1; end > 0; end--)
+            {
+                (heap[0], heap[end]) = (heap[end], heap[0]);
+                SiftDown(heap, 0, end, comparer);
+            }
+        }
+
+        // true when x is worse than y, equal entries by their position
+        private static bool Worse<TComparer>(int x, int y, TComparer comparer) where TComparer : struct, IComparer<int>
+        {
+            var cmp = comparer.Compare(x, y);
+            return cmp > 0 || (cmp == 0 && x > y);
+        }
+
+        private static void SiftUp<TComparer>(Span<int> heap, int position, TComparer comparer) where TComparer : struct, IComparer<int>
+        {
+            var item = heap[position];
+            while (position > 0)
+            {
+                var parent = (position - 1) / 2;
+                if (Worse(item, heap[parent], comparer) == false)
+                    break;
+                heap[position] = heap[parent];
+                position = parent;
+            }
+
+            heap[position] = item;
+        }
+
+        private static void SiftDown<TComparer>(Span<int> heap, int position, int size, TComparer comparer) where TComparer : struct, IComparer<int>
+        {
+            var item = heap[position];
+            while (true)
+            {
+                var child = 2 * position + 1;
+                if (child >= size)
+                    break;
+                if (child + 1 < size && Worse(heap[child + 1], heap[child], comparer))
+                    child++;
+                if (Worse(heap[child], item, comparer) == false)
+                    break;
+                heap[position] = heap[child];
+                position = child;
+            }
+
+            heap[position] = item;
         }
 
         public static void IndirectSort<TComparer1, TComparer2, TComparer3>(ref SortingMultiMatch<TInner> match, Span<int> indexes,
