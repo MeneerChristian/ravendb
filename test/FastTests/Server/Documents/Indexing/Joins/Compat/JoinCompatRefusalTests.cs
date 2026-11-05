@@ -52,6 +52,7 @@ public class JoinCompatRefusalTests(ITestOutputHelper output) : RavenTestBase(ou
     [RavenTheory(RavenTestCategory.Querying | RavenTestCategory.Indexes)]
     [InlineData(CompatMode.None)]
     [InlineData(CompatMode.Expanded)]
+    [InlineData(CompatMode.Indirect)]
     public async Task VectorSearchOnTheOuterIndexGivesTheRowsOfTheQueryWithoutTheJoin(CompatMode mode)
     {
         using CompatDb db = await CompatDb.CreateAsync(this, mode);
@@ -69,7 +70,7 @@ public class JoinCompatRefusalTests(ITestOutputHelper output) : RavenTestBase(ou
         await new GamesWithVectors().ExecuteAsync(db.Store);
         if (mode != CompatMode.None)
         {
-            IndexDefinition joinIndex = CompatDb.JoinDefinition("GamesWithVectors/WithVipOwner");
+            IndexDefinition joinIndex = CompatDb.JoinDefinition("GamesWithVectors/WithVipOwner", mode == CompatMode.Indirect);
             joinIndex.Join.OuterIndex = "GamesWithVectors";
             await db.Store.Maintenance.SendAsync(new PutIndexesOperation(joinIndex));
         }

@@ -78,7 +78,7 @@ public class JoinCompatRollingTests(ITestOutputHelper output) : ClusterTestBase(
             }
         });
 
-        await store.Maintenance.SendAsync(new PutIndexesOperation(new UsersIndex().CreateIndexDefinition(), new GamesIndex().CreateIndexDefinition(), JoinDefinition(ManualJoin)));
+        await store.Maintenance.SendAsync(new PutIndexesOperation(new UsersIndex().CreateIndexDefinition(), new GamesIndex().CreateIndexDefinition(), JoinDefinition(ManualJoin, indirect: false)));
         using (IDocumentSession session = store.OpenSession())
         {
             session.Store(new CompatUser { Id = "users/strong", Name = "chris bob", Kind = "vip" });

@@ -56,6 +56,7 @@ public class JoinCompatLifecycleTests(ITestOutputHelper output) : RavenTestBase(
 
     [RavenTheory(RavenTestCategory.Indexes | RavenTestCategory.Querying | RavenTestCategory.Counters | RavenTestCategory.TimeSeries | RavenTestCategory.Attachments)]
     [InlineData(CompatMode.Expanded)]
+    [InlineData(CompatMode.Indirect)]
     public async Task CountersAttachmentsAndTimeSeriesLeaveTheServedJoinExact(CompatMode mode)
     {
         using CompatDb db = await CompatDb.CreateAsync(this, mode);
@@ -102,6 +103,7 @@ public class JoinCompatLifecycleTests(ITestOutputHelper output) : RavenTestBase(
     // the license of the server limits the frequency of the expiration of a database, so a server without one cannot run it
     [RavenTheory(RavenTestCategory.Indexes | RavenTestCategory.Querying | RavenTestCategory.ExpirationRefresh, LicenseRequired = true)]
     [InlineData(CompatMode.Expanded)]
+    [InlineData(CompatMode.Indirect)]
     public async Task AnInnerDocumentThatExpiresLeavesTheServedJoinExact(CompatMode mode)
     {
         using CompatDb db = await CompatDb.CreateAsync(this, mode);
@@ -127,6 +129,7 @@ public class JoinCompatLifecycleTests(ITestOutputHelper output) : RavenTestBase(
 
     [RavenTheory(RavenTestCategory.Indexes | RavenTestCategory.Querying)]
     [InlineData(CompatMode.Expanded)]
+    [InlineData(CompatMode.Indirect)]
     public async Task APausedJoinIsNotWaitedForAndTheJoinIsReadByTheServerUntilItIsStarted(CompatMode mode)
     {
         using CompatDb db = await CompatDb.CreateAsync(this, mode);
@@ -158,7 +161,10 @@ public class JoinCompatLifecycleTests(ITestOutputHelper output) : RavenTestBase(
         Assert.DoesNotContain("games/001", ids);
         Assert.Equal(expected, ids);
         Assert.Equal(expectedTotal, total);
-        Assert.True(outcome.Served == 0 && outcome.Reasons.GetValueOrDefault(JoinFallbacks.BehindTimeout) == 1, $"the join of a paused join index that is behind should be a BehindTimeout: {outcome.Describe()}");
+        if (mode == CompatMode.Expanded)
+            Assert.True(outcome.Served == 0 && outcome.Reasons.GetValueOrDefault(JoinFallbacks.BehindTimeout) == 1, $"the join of a paused join index that is behind should be a BehindTimeout: {outcome.Describe()}");
+        else
+            Assert.True(outcome.Served == 1, $"an Indirect join index holds the keys of the inner index, which did not change: it serves the join of the new outer rows: {outcome.Describe()}");
         Assert.True(elapsed < TimeSpan.FromMilliseconds(1500), $"the query waited for a paused join index: {elapsed}");
 
         await db.Store.Maintenance.SendAsync(new StartIndexOperation(db.JoinName));

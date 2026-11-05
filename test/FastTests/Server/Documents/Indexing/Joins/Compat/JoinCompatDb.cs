@@ -24,6 +24,9 @@ public enum CompatMode
     /// <summary>A join index that is put, storage mode Expanded.</summary>
     Expanded,
 
+    /// <summary>A join index that is put, storage mode Indirect.</summary>
+    Indirect,
+
     /// <summary>No join index is put: the first query of the join makes the auto join index.</summary>
     Auto,
 
@@ -103,6 +106,9 @@ public sealed class CompatDb : IDisposable
         {
             record.Settings[RavenConfiguration.GetKey(x => x.Indexing.CoraxIncludeDocumentScore)] = true.ToString();
             record.Settings[RavenConfiguration.GetKey(x => x.Join.AutoEnabled)] = (mode == CompatMode.Auto).ToString();
+            if (mode == CompatMode.Indirect)
+                record.Settings[RavenConfiguration.GetKey(x => x.Join.IndirectEnabled)] = true.ToString();
+
             modify?.Invoke(record);
         };
 
@@ -127,8 +133,8 @@ public sealed class CompatDb : IDisposable
     {
         await new UsersIndex().ExecuteAsync(Store);
         await new GamesIndex().ExecuteAsync(Store);
-        if (Mode == CompatMode.Expanded)
-            await Store.Maintenance.SendAsync(new PutIndexesOperation(JoinDefinition(ManualJoin)));
+        if (Mode is CompatMode.Expanded or CompatMode.Indirect)
+            await Store.Maintenance.SendAsync(new PutIndexesOperation(JoinDefinition(ManualJoin, Mode == CompatMode.Indirect)));
 
         using (IDocumentSession session = Store.OpenSession())
         {
@@ -160,11 +166,11 @@ public sealed class CompatDb : IDisposable
         }
 
         _test.Indexes.WaitForIndexing(Store);
-        if (Mode == CompatMode.Expanded)
+        if (Mode is CompatMode.Expanded or CompatMode.Indirect)
             await WaitForTheJoinAsync();
     }
 
-    public static IndexDefinition JoinDefinition(string name)
+    public static IndexDefinition JoinDefinition(string name, bool indirect)
     {
         var definition = new IndexDefinition
         {
@@ -173,6 +179,9 @@ public sealed class CompatDb : IDisposable
                 .AddField("Kind")
                 .AddField("Number", JoinFieldKind.Long)
         };
+
+        if (indirect)
+            definition.Join.StorageMode = JoinStorageMode.Indirect;
 
         return definition;
     }

@@ -57,7 +57,7 @@ public class JoinShardedPutTests(ITestOutputHelper output) : RavenTestBase(outpu
         Assert.Equal(new[] { "Games", "Users" }, before);
 
         // the operation of the client
-        IndexInvalidException put = await Assert.ThrowsAnyAsync<IndexInvalidException>(() => store.Maintenance.SendAsync(new PutIndexesOperation(CompatDb.JoinDefinition(CompatDb.ManualJoin))));
+        IndexInvalidException put = await Assert.ThrowsAnyAsync<IndexInvalidException>(() => store.Maintenance.SendAsync(new PutIndexesOperation(CompatDb.JoinDefinition(CompatDb.ManualJoin, indirect: false))));
         Assert.Contains(Message, put.Message);
         Assert.Equal(before, IndexNames(store));
         Assert.DoesNotContain(CompatDb.ManualJoin, store.Maintenance.Server.Send(new GetDatabaseRecordOperation(store.Database)).Indexes.Keys);
@@ -70,7 +70,7 @@ public class JoinShardedPutTests(ITestOutputHelper output) : RavenTestBase(outpu
         // together with an index: the put of several indexes is not atomic (as for any index that is refused), the index before the join index is put and the join index is not
         IndexDefinition games = new CompatDb.GamesIndex().CreateIndexDefinition();
         games.Name = "Games2";
-        IndexDefinition joinIndex = CompatDb.JoinDefinition("Games2/WithVipOwner");
+        IndexDefinition joinIndex = CompatDb.JoinDefinition("Games2/WithVipOwner", indirect: false);
         joinIndex.Join.OuterIndex = "Games2";
         IndexInvalidException together = await Assert.ThrowsAnyAsync<IndexInvalidException>(() => store.Maintenance.SendAsync(new PutIndexesOperation(games, joinIndex)));
         Assert.Contains(Message, together.Message);

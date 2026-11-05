@@ -112,6 +112,7 @@ public class JoinCompatDatabaseTests(ITestOutputHelper output) : RavenTestBase(o
 
     [RavenTheory(RavenTestCategory.Indexes | RavenTestCategory.Querying)]
     [InlineData(CompatMode.Expanded)]
+    [InlineData(CompatMode.Indirect)]
     public async Task ACompactedDatabaseGivesTheSameJoinAndTheJoinBecomesCurrent(CompatMode mode)
     {
         using CompatDb db = await CompatDb.CreateAsync(this, mode, runInMemory: false);

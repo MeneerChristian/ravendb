@@ -16,7 +16,7 @@ namespace FastTests.Server.Documents.Indexing.Joins.Compat;
 
 /// <summary>
 /// The RQL feature matrix of the join (<see cref="JoinRqlFeatureMatrix"/>) with a join index that is asked to serve the join: every feature gives the rows of the query without the join, and the join index
-/// either served the join or counted the reason why it did not. The join index is one that is put (storage mode Expanded) or the auto join index that the first query of the join makes.
+/// either served the join or counted the reason why it did not. The join index is one that is put (Expanded or Indirect) or the auto join index that the first query of the join makes.
 /// </summary>
 public class JoinIndexServedRqlMatrixTests(ITestOutputHelper output) : RavenTestBase(output)
 {
@@ -30,6 +30,11 @@ public class JoinIndexServedRqlMatrixTests(ITestOutputHelper output) : RavenTest
     [InlineData(CompatMode.Expanded, "projection")]
     [InlineData(CompatMode.Expanded, "paging")]
     [InlineData(CompatMode.Expanded, "include")]
+    [InlineData(CompatMode.Indirect, "where")]
+    [InlineData(CompatMode.Indirect, "order")]
+    [InlineData(CompatMode.Indirect, "projection")]
+    [InlineData(CompatMode.Indirect, "paging")]
+    [InlineData(CompatMode.Indirect, "include")]
     [InlineData(CompatMode.Auto, "where")]
     [InlineData(CompatMode.Auto, "order")]
     [InlineData(CompatMode.Auto, "projection")]
@@ -73,6 +78,7 @@ public class JoinIndexServedRqlMatrixTests(ITestOutputHelper output) : RavenTest
 
     [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying | RavenTestCategory.Indexes)]
     [InlineData(CompatMode.Expanded)]
+    [InlineData(CompatMode.Indirect)]
     [InlineData(CompatMode.Auto)]
     public async Task TheCoreShapesOfTheMatrixAreServedByTheJoin(CompatMode mode)
     {
@@ -106,6 +112,7 @@ public class JoinIndexServedRqlMatrixTests(ITestOutputHelper output) : RavenTest
 
     [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying | RavenTestCategory.Indexes)]
     [InlineData(CompatMode.Expanded)]
+    [InlineData(CompatMode.Indirect)]
     [InlineData(CompatMode.Auto)]
     public async Task StreamPatchAndDeleteByQueryOnlyTouchTheDocumentsOfTheJoinWhenAJoinServesIt(CompatMode mode)
     {
@@ -152,6 +159,7 @@ public class JoinIndexServedRqlMatrixTests(ITestOutputHelper output) : RavenTest
 
     [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying | RavenTestCategory.Indexes)]
     [InlineData(CompatMode.Expanded)]
+    [InlineData(CompatMode.Indirect)]
     [InlineData(CompatMode.Auto)]
     public async Task IncludedDocumentsAreLoadedWithTheRowsOfAServedJoin(CompatMode mode)
     {
