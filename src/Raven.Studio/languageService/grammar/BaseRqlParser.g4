@@ -3,7 +3,7 @@ parser grammar BaseRqlParser;
 
 options { tokenVocab = BaseRqlLexer; }
 prog
-   : parameterBeforeQuery* functionStatment* fromStatement groupByStatement? whereStatement? orderByStatement? loadStatement? updateStatement? filterStatement? selectStatement? includeStatement? limitStatement? json? EOF
+   : parameterBeforeQuery* functionStatment* fromStatement joinStatement* groupByStatement? whereStatement? orderByStatement? loadStatement? updateStatement? filterStatement? selectStatement? includeStatement? limitStatement? json? EOF
    ;
    //          FROM STATEMENT          //
    
@@ -24,6 +24,16 @@ fromStatement
    : fromMode INDEX collection = indexName aliasWithOptionalAs? # CollectionByIndex
    | FROM ALL_DOCS # AllCollections
    | fromMode collection = collectionName aliasWithOptionalAs? # CollectionByName
+   ;
+
+//   join (from index 'Users' where search(Name, 'a')) as u on g.OwnerId = id(u)
+//   The sub-query only has the parts that matter for a join: where it reads from, what it is joined with itself (a chain), and its filter.
+joinStatement
+   : JOIN OP_PAR joinSubQuery CL_PAR AS name = aliasName ON expr
+   ;
+
+joinSubQuery
+   : fromStatement joinStatement* whereStatement?
    ;
 
 indexName
@@ -353,6 +363,8 @@ identifiersWithoutRootKeywords
 
 rootKeywords
    : FROM
+   | JOIN
+   | ON
    | GROUP_BY
    | WHERE
    | LOAD

@@ -1,4 +1,4 @@
-// Generated from languageService/grammar/BaseRqlParser.g4 by ANTLR 4.9.0-SNAPSHOT
+// Generated from BaseRqlParser.g4 by ANTLR 4.9.0-SNAPSHOT
 
 
 import { ParseTreeVisitor } from "antlr4ts/tree/ParseTreeVisitor";
@@ -38,6 +38,8 @@ import { FunctionStatmentContext } from "./BaseRqlParser";
 import { UpdateStatementContext } from "./BaseRqlParser";
 import { FromModeContext } from "./BaseRqlParser";
 import { FromStatementContext } from "./BaseRqlParser";
+import { JoinStatementContext } from "./BaseRqlParser";
+import { JoinSubQueryContext } from "./BaseRqlParser";
 import { IndexNameContext } from "./BaseRqlParser";
 import { CollectionNameContext } from "./BaseRqlParser";
 import { AliasWithOptionalAsContext } from "./BaseRqlParser";
@@ -415,6 +417,20 @@ export interface BaseRqlParserVisitor<Result> extends ParseTreeVisitor<Result> {
 	 * @return the visitor result
 	 */
 	visitFromStatement?: (ctx: FromStatementContext) => Result;
+
+	/**
+	 * Visit a parse tree produced by `BaseRqlParser.joinStatement`.
+	 * @param ctx the parse tree
+	 * @return the visitor result
+	 */
+	visitJoinStatement?: (ctx: JoinStatementContext) => Result;
+
+	/**
+	 * Visit a parse tree produced by `BaseRqlParser.joinSubQuery`.
+	 * @param ctx the parse tree
+	 * @return the visitor result
+	 */
+	visitJoinSubQuery?: (ctx: JoinSubQueryContext) => Result;
 
 	/**
 	 * Visit a parse tree produced by `BaseRqlParser.indexName`.

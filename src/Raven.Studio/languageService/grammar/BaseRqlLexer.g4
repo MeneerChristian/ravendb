@@ -188,6 +188,10 @@ INTERSECT
    : I N T E R S E C T
    ;
 
+JOIN
+   : J O I N
+   ;
+
 LOAD
    : L O A D
    ;
@@ -214,6 +218,10 @@ NOT
 
 NULL
    : N U L L
+   ;
+
+ON
+   : O N
    ;
 
 OR

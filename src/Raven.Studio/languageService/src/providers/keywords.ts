@@ -5,6 +5,8 @@ import { AUTOCOMPLETE_META, AUTOCOMPLETE_SCORING, AutocompleteContext, Autocompl
 
 const rootKeywords: number[] = [
     RqlParser.FROM,
+    RqlParser.JOIN,
+    RqlParser.ON,
     RqlParser.GROUP_BY,
     RqlParser.WHERE,
     RqlParser.LOAD,

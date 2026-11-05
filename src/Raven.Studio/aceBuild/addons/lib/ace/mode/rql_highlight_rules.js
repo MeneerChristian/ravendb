@@ -18,7 +18,7 @@ define(function(require, exports, module) {
             ".)";
 
         var clausesKeywords = (
-            "declare|from|group|where|order|load|select|include|update|match|with|limit|filter|filter_limit|offset"
+            "declare|from|join|group|where|order|load|select|include|update|match|with|limit|filter|filter_limit|offset"
         );
         this.clausesKeywords = clausesKeywords.split("|");
 
@@ -75,6 +75,7 @@ define(function(require, exports, module) {
             "keyword.clause": clausesKeywords,
             "keyword.clause.clauseAppend": clauseAppendKeywords,
             "keyword.asKeyword": "as",
+            "keyword.onKeyword": "on",
             "keyword.notKeyword": "not",
             "keyword.orderByOptions": orderByOptions,
             "keyword.orderByAsOptions": orderByAsOptions,
