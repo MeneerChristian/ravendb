@@ -265,7 +265,45 @@ public class JoinAutoModeTests(ITestOutputHelper output) : RavenTestBase(output)
             Assert.Equal(JoinStorageMode.Expanded, joinIndex.StorageMode);
             Assert.Equal(JoinStorageMode.Expanded, joinIndex.ResolvedStorageMode);
             Assert.Null(joinIndex.RowsPerKey);
+            Assert.Null(joinIndex.AutoModeReason);
         }
+    }
+
+    [RavenTheory(RavenTestCategory.Indexes)]
+    [InlineData(1L << 40, 1L << 30, false, "Indirect: 40.0 rows per key >= 30, cache fits, memory ok")]
+    [InlineData(1L << 40, 1L << 30, true, "Expanded: low memory")]
+    [InlineData(1L << 40, 0L, false, "Expanded: the resident cache would not fit its budget (needs 747 bytes, 0 bytes left)")]
+    [InlineData(1L << 40, 100L, false, "Expanded: the resident cache would not fit its budget (needs 747 bytes, 100 bytes left)")]
+    [InlineData(1L << 20, 1L << 30, false, "Expanded: the server has 1 MB available, the auto floor is 100 MB")]
+    public async Task TheStatsSayWhyAutoChoseTheModeWithTheFiguresOfTheRule(long available, long cacheFree, bool lowMemory, string expected)
+    {
+        await BuildAsync(this, keys: 3, rowsPerKey: 40, server: new ServerInputs(available, cacheFree, lowMemory));
+        using (_harness)
+            Assert.Equal(expected, _harness.Stats().Join.AutoModeReason);
+    }
+
+    [RavenFact(RavenTestCategory.Indexes)]
+    public async Task TheStatsSayHowMuchMemoryTheServerHasAndHowMuchTheAutoFloorNeeds()
+    {
+        await BuildAsync(this, keys: 3, rowsPerKey: 40, server: new ServerInputs(AvailableBytes: 2113929216L), floorMb: "2560");
+        using (_harness)
+            Assert.Equal("Expanded: the server has 1.97 GB available, the auto floor is 2.5 GB", _harness.Stats().Join.AutoModeReason);
+    }
+
+    [RavenFact(RavenTestCategory.Indexes)]
+    public async Task TheStatsSayWhyAutoChoseExpandedForFewRowsPerKey()
+    {
+        await BuildAsync(this, keys: 3, rowsPerKey: 12);
+        using (_harness)
+            Assert.Equal("Expanded: 12.0 rows per key < 30", _harness.Stats().Join.AutoModeReason);
+    }
+
+    [RavenFact(RavenTestCategory.Indexes)]
+    public async Task TheStatsSayThatAutoIsExpandedBecauseIndirectIsNotEnabled()
+    {
+        await BuildAsync(this, keys: 3, rowsPerKey: 40, indirectEnabled: false);
+        using (_harness)
+            Assert.Equal("Expanded: Join.IndirectEnabled is false", _harness.Stats().Join.AutoModeReason);
     }
 
     [RavenFact(RavenTestCategory.Indexes)]

@@ -114,14 +114,14 @@ public sealed class JoinOptions
 
         if (facts.DistinctKeys <= 0 || facts.OuterEntries <= 0)
         {
-            reason = "the outer index has no keys to count rows per key";
+            reason = "Expanded: the outer index has no keys to count rows per key";
             return JoinStorageMode.Expanded;
         }
 
         double rowsPerKey = facts.OuterEntries / (double)facts.DistinctKeys;
         if (rowsPerKey < AutoIndirectMinRowsPerKey)
         {
-            reason = string.Create(CultureInfo.InvariantCulture, $"{rowsPerKey:F1} rows per key is less than {AutoIndirectMinRowsPerKey}");
+            reason = string.Create(CultureInfo.InvariantCulture, $"Expanded: {rowsPerKey:F1} rows per key < {AutoIndirectMinRowsPerKey}");
             return JoinStorageMode.Expanded;
         }
 
@@ -129,24 +129,48 @@ public sealed class JoinOptions
         long cacheLeft = Math.Max(0, Math.Min(ResidentCacheMaxBytes, facts.CacheFreeBytes));
         if (ResidentCacheMaxBytes <= 0 || estimate > cacheLeft)
         {
-            reason = $"the resident cache needs {estimate} bytes and the budget has {cacheLeft} left";
+            reason = $"Expanded: the resident cache would not fit its budget (needs {FormatBytes(estimate)}, {FormatBytes(cacheLeft)} left)";
             return JoinStorageMode.Expanded;
         }
 
         if (facts.LowMemory)
         {
-            reason = "the server is in low memory";
+            reason = "Expanded: low memory";
             return JoinStorageMode.Expanded;
         }
 
         if (facts.AvailableBytes - estimate < AutoModeMinimumAvailableBytes)
         {
-            reason = $"{facts.AvailableBytes} bytes are available, the cache needs {estimate} and {AutoModeMinimumAvailableBytes} must stay";
+            reason = $"Expanded: the server has {FormatBytes(facts.AvailableBytes)} available, the auto floor is {FormatBytes(AutoModeMinimumAvailableBytes + estimate)}";
             return JoinStorageMode.Expanded;
         }
 
-        reason = string.Create(CultureInfo.InvariantCulture, $"{rowsPerKey:F1} rows per key (at least {AutoIndirectMinRowsPerKey}), the resident cache needs {estimate} bytes");
+        reason = string.Create(CultureInfo.InvariantCulture, $"Indirect: {rowsPerKey:F1} rows per key >= {AutoIndirectMinRowsPerKey}, cache fits, memory ok");
         return JoinStorageMode.Indirect;
+    }
+
+    /// <summary>Why a join index whose mode is left to Auto is Expanded without the build looking at its entries; null when the build decides.</summary>
+    public string ReasonOfAutoWithoutChoice(JoinDefinition definition)
+    {
+        if (definition.StorageMode != JoinStorageMode.Auto || StorageModeDefault != JoinStorageMode.Auto)
+            return null;
+
+        if (IndirectPossible(definition) == false)
+            return "Expanded: a join index on the id of the outer entries has no Indirect mode";
+
+        return IndirectEnabled ? null : "Expanded: Join.IndirectEnabled is false";
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        const double kb = 1024, mb = kb * 1024, gb = mb * 1024;
+        return bytes switch
+        {
+            >= (long)gb => string.Create(CultureInfo.InvariantCulture, $"{bytes / gb:0.##} GB"),
+            >= (long)mb => string.Create(CultureInfo.InvariantCulture, $"{bytes / mb:0.##} MB"),
+            >= (long)kb => string.Create(CultureInfo.InvariantCulture, $"{bytes / kb:0.##} KB"),
+            _ => string.Create(CultureInfo.InvariantCulture, $"{bytes} bytes")
+        };
     }
 
     /// <summary>Whether the storage mode Indirect is allowed, in a definition and as the default.</summary>

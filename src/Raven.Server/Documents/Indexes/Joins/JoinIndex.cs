@@ -115,7 +115,13 @@ public sealed class JoinIndex : Index<JoinIndexDefinition, JoinIndexField>
     {
         JoinOptions options = Options;
         if (options.ChoosesModeAtBuild(plan.Definition) == false)
+        {
+            string unchosen = options.ReasonOfAutoWithoutChoice(plan.Definition);
+            if (unchosen != null)
+                Volatile.Write(ref Counters.LastAutoModeReason, unchosen);
+
             return;
+        }
 
         if (outer.TryOpenSnapshot(out IndexSnapshot snapshot) == false)
             return;
@@ -142,7 +148,7 @@ public sealed class JoinIndex : Index<JoinIndexDefinition, JoinIndexField>
         JoinStorageMode mode = options.ResolveBuildMode(plan.Definition, facts, out string reason);
         plan.ChooseBuildMode(mode);
         Counters.Add(ref mode == JoinStorageMode.Indirect ? ref Counters.AutoModeIndirect : ref Counters.AutoModeExpanded, 1);
-        Counters.LastAutoModeReason = reason;
+        Volatile.Write(ref Counters.LastAutoModeReason, reason);
         Volatile.Write(ref Counters.LastAutoRowsPerKey, keys > 0 && entries > 0 ? entries / (double)keys : double.NaN);
     }
 
@@ -584,6 +590,8 @@ public sealed class JoinIndex : Index<JoinIndexDefinition, JoinIndexField>
                     stats.Join.ResolvedStorageMode = published.Generation.Mode;
             }
         }
+
+        stats.Join.AutoModeReason = Join.StorageMode == JoinStorageMode.Auto ? Volatile.Read(ref Counters.LastAutoModeReason) : null;
 
         double rowsPerKey = Volatile.Read(ref Counters.LastAutoRowsPerKey);
         if (double.IsNaN(rowsPerKey) == false)

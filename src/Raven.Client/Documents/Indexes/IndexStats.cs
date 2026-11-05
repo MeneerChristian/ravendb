@@ -226,6 +226,9 @@ namespace Raven.Client.Documents.Indexes
         /// <summary>The outer entries per key that the server found when it chose the mode of the last build of an Auto join index, the figure its rule compares with the threshold; null when the mode of the last build was not chosen by that rule or there were no keys to count.</summary>
         public double? RowsPerKey { get; set; }
 
+        /// <summary>Why the server chose the mode of the last build of an Auto join index, with the figures of the rule, for example "Indirect: 40.0 rows per key &gt;= 30, cache fits, memory ok" or "Expanded: the server has 1.97 GB available, the auto floor is 2.5 GB"; null when the definition names the mode or no build chose it yet.</summary>
+        public string AutoModeReason { get; set; }
+
         /// <summary>Why the join index cannot read the indexes it joins now (one is missing, disabled or in error); null when it can.</summary>
         public string PendingReason { get; set; }
 
