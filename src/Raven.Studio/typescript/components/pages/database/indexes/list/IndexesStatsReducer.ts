@@ -146,6 +146,9 @@ function mapToIndexNodeInfo(stats: IndexStats, location: databaseLocationSpecifi
                       refusedReason: stats.Join.RefusedReason ?? null,
                       generation: stats.Join.Generation,
                       isPartial: stats.Join.IsPartial,
+                      // a server that does not report them leaves the storage mode out
+                      storageMode: stats.Join.StorageMode ?? "Auto",
+                      resolvedStorageMode: stats.Join.ResolvedStorageMode ?? null,
                   }
                 : undefined,
         },

@@ -55,6 +55,10 @@ export interface IndexNodeJoinInfo {
     refusedReason: string | null;
     generation: number;
     isPartial: boolean;
+    // what the definition says; Auto leaves the choice to the server
+    storageMode: Raven.Client.Documents.Indexes.JoinStorageMode;
+    // what the current generation was built as; null while the lists are not built
+    resolvedStorageMode: Raven.Client.Documents.Indexes.JoinStorageMode | null;
 }
 
 export interface IndexNodeInfoDetails {

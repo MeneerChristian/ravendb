@@ -6,6 +6,8 @@ import {
     joinFormFromDefinition,
     joinOuterIdKey,
     getJoinListStatus,
+    getJoinListStorageModeView,
+    getJoinStorageModeView,
     utf8ByteLength,
 } from "./joinUtils";
 import { IndexesStubs } from "test/stubs/IndexesStubs";
@@ -24,6 +26,8 @@ function joinIndex(
                           refusedReason: null,
                           generation: 3,
                           isPartial: false,
+                          storageMode: "Auto",
+                          resolvedStorageMode: null,
                           ...node.joinIndex,
                       } as IndexNodeJoinInfo)
                     : undefined,
@@ -169,6 +173,60 @@ describe("joinUtils", () => {
         it("is null for a node without statistics and for an index that is not a join index", () => {
             expect(getJoinListStatus(joinIndex({}))).toBeNull();
             expect(getJoinListStatus(joinIndex())).toBeNull();
+        });
+    });
+
+    describe("storage mode", () => {
+        it("shows what the lists were built as, and that Auto chose it", () => {
+            expect(getJoinStorageModeView("Auto", ["Indirect"])).toEqual({
+                modes: ["Indirect"],
+                chosenByAuto: true,
+                notBuiltYet: false,
+            });
+            expect(getJoinStorageModeView("Expanded", ["Expanded"])).toEqual({
+                modes: ["Expanded"],
+                chosenByAuto: false,
+                notBuiltYet: false,
+            });
+        });
+
+        it("has no mode to show for an Auto join index that is not built, but knows the one of a named mode", () => {
+            expect(getJoinStorageModeView("Auto", [null])).toEqual({
+                modes: ["Auto"],
+                chosenByAuto: false,
+                notBuiltYet: true,
+            });
+            expect(getJoinStorageModeView("Indirect", [null])).toEqual({
+                modes: ["Indirect"],
+                chosenByAuto: false,
+                notBuiltYet: false,
+            });
+        });
+
+        it("treats a server that reports nothing as Auto that is not built", () => {
+            expect(getJoinStorageModeView(undefined, [undefined])).toEqual({
+                modes: ["Auto"],
+                chosenByAuto: false,
+                notBuiltYet: true,
+            });
+        });
+
+        it("lists each mode that the nodes of a join index were built as, once", () => {
+            const view = getJoinListStorageModeView(
+                joinIndex(
+                    { joinIndex: { resolvedStorageMode: "Indirect" } },
+                    { joinIndex: { resolvedStorageMode: "Expanded" } },
+                    { joinIndex: { resolvedStorageMode: "Indirect" } },
+                    { joinIndex: { resolvedStorageMode: null } }
+                )
+            );
+
+            expect(view.modes).toEqual(["Indirect", "Expanded"]);
+            expect(view.chosenByAuto).toBe(true);
+        });
+
+        it("has nothing to show for an index that is not a join index", () => {
+            expect(getJoinListStorageModeView(joinIndex({}))).toBeNull();
         });
     });
 });

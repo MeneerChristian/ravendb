@@ -189,6 +189,41 @@ function formatKindDetail(detail: string): string {
     }
 }
 
+export interface JoinStorageModeView {
+    // the modes to show: what the lists were built as, one per mode when the nodes differ; the mode of the definition while nothing is built
+    modes: JoinStorageMode[];
+    // the lists are built and the definition left the mode to the server
+    chosenByAuto: boolean;
+    // the definition leaves the mode to the server and the lists are not built yet, so the server has not chosen
+    notBuiltYet: boolean;
+}
+
+export function getJoinStorageModeView(
+    configured: JoinStorageMode | null | undefined,
+    resolved: (JoinStorageMode | null | undefined)[]
+): JoinStorageModeView {
+    const definitionMode = configured ?? "Auto";
+    const built = [...new Set(resolved.filter((x) => !!x && x !== "Auto"))];
+
+    return {
+        modes: built.length > 0 ? built : [definitionMode],
+        chosenByAuto: built.length > 0 && definitionMode === "Auto",
+        notBuiltYet: built.length === 0 && definitionMode === "Auto",
+    };
+}
+
+export function getJoinListStorageModeView(index: IndexSharedInfo): JoinStorageModeView | null {
+    const joinIndexes = index.nodesInfo.map((node) => node.details?.joinIndex).filter((x) => !!x);
+    if (joinIndexes.length === 0) {
+        return null;
+    }
+
+    return getJoinStorageModeView(
+        joinIndexes[0].storageMode,
+        joinIndexes.map((x) => x.resolvedStorageMode)
+    );
+}
+
 export type JoinListState = "refused" | "pending" | "disabled" | "building" | "partial" | "ready";
 
 export interface JoinListStatus {
