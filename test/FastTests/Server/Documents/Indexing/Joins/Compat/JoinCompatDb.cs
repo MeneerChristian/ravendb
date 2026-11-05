@@ -10,6 +10,8 @@ using Raven.Client.Documents.Session;
 using Raven.Client.ServerWide;
 using Raven.Server.Config;
 using Raven.Server.Documents;
+using Raven.Server.Documents.Indexes.Joins;
+using Raven.Server.Documents.Indexes.Joins.Serving;
 using Sparrow;
 using Tests.Infrastructure;
 using Xunit;
@@ -220,6 +222,36 @@ public sealed class CompatDb : IDisposable
         }
 
         return new Outcome(after.Served - before.Served, after.FallbackTotal - before.FallbackTotal, reasons);
+    }
+
+    public bool IsStale(string index) => Store.Maintenance.Send(new GetIndexStatisticsOperation(index)).IsStale;
+
+    /// <summary>
+    /// Waits for the indexes, then reads the join three ways: as the join index serves it, as the server joins (the join index forced to fall back) and as the query without the join that <paramref name="oracle"/> is.
+    /// The three are equal, equal to <paramref name="expected"/>, and the join index served the first read.
+    /// </summary>
+    public async Task AssertJoinExactAsync(string step, string join, string oracle, string[] expected)
+    {
+        for (int i = 0; i < 1000 && (IsStale(Games) || IsStale(Users)); i++)
+            await Task.Delay(20);
+
+        Assert.True(IsStale(Games) == false && IsStale(Users) == false, step + ": the indexes are current");
+        await WaitForTheJoinAsync();
+        JoinIndexStats before = Snapshot();
+        (List<string> served, long servedTotal) = Run(join);
+        Outcome outcome = Since(before, Snapshot());
+        JoinIndex joinIndex = (JoinIndex)Database.IndexStore.GetIndex(JoinName);
+        joinIndex.QueryHooks = new JoinIndexQueryHooks { ForceFallback = true };
+        (List<string> scan, long scanTotal) = Run(join);
+        joinIndex.QueryHooks = null;
+        (List<string> plain, long plainTotal) = Run(oracle);
+
+        Assert.True(expected.SequenceEqual(served), $"{step}: {string.Join(",", served)} instead of {string.Join(",", expected)}");
+        Assert.Equal(scan, served);
+        Assert.Equal(plain, served);
+        Assert.Equal(scanTotal, servedTotal);
+        Assert.Equal(plainTotal, servedTotal);
+        Assert.True(outcome.Served == 1, $"{step}: not served: {outcome.Describe()}");
     }
 
     public void Dispose() => Store.Dispose();
