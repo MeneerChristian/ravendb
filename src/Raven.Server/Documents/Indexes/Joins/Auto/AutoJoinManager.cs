@@ -9,6 +9,7 @@ using Raven.Client.Util;
 using Raven.Server.Config;
 using Raven.Server.Config.Categories;
 using Raven.Server.Documents.Indexes.Joins.Refresh;
+using Raven.Server.Documents.Indexes.Joins.Serving.Resident;
 using Raven.Server.Documents.Queries;
 using Raven.Server.Documents.Queries.AST;
 using Raven.Server.Documents.Sharding;
@@ -117,9 +118,15 @@ internal sealed class AutoJoinManager
             return null;
         }
 
-        if (MemoryAllows(outer, inner, configuration) == false)
+        if (MemoryAllows(outer, inner, joinIndex, configuration, out bool residentDecided) == false)
         {
             Counters.SkipForMemory();
+            if (residentDecided)
+            {
+                Counters.SkipForResidentMemory();
+                query.Timings?.AddCounter(AutoJoinCounters.SkippedResidentMemory, 1);
+            }
+
             query.Timings?.AddCounter(AutoJoinCounters.SkippedMemory, 1);
             return null;
         }
@@ -220,8 +227,9 @@ internal sealed class AutoJoinManager
     /// A build is not started when its estimated memory is more than the budget, or when the available memory without it would be less than the floor. The estimate is a base plus
     /// a share per entry of the two indexes (counted as the documents of their collections).
     /// </summary>
-    private bool MemoryAllows(Index outer, Index inner, JoinConfiguration configuration)
+    private bool MemoryAllows(Index outer, Index inner, JoinDefinition joinIndex, JoinConfiguration configuration, out bool residentDecided)
     {
+        residentDecided = false;
         long documents = CountDocuments(outer, inner);
         long estimate = configuration.AutoBuildMemoryBase.GetValue(SizeUnit.Bytes) + configuration.AutoBuildMemoryPerEntry * documents;
         if (estimate > configuration.AutoMaxBuildMemory.GetValue(SizeUnit.Bytes))
@@ -231,7 +239,37 @@ internal sealed class AutoJoinManager
                          new Size(_memory.AvailableBytes(_database.ServerStore.Server.MetricCacher.GetValue<MemoryInfoResult>(MetricCacher.Keys.Server.MemoryInfo).AvailableMemoryForProcessing.GetValue(SizeUnit.Bytes)), SizeUnit.Bytes);
         long floor = configuration.AutoMinimumAvailableMemory.GetValue(SizeUnit.Bytes);
         Counters.RecordGate(available.GetValue(SizeUnit.Bytes), estimate, floor);
-        return available.GetValue(SizeUnit.Bytes) - estimate >= floor;
+        if (available.GetValue(SizeUnit.Bytes) - estimate < floor)
+            return false;
+
+        // an Indirect join index also keeps the lists of its keys in memory: the caches that exist take their bytes from what is available, and the one of the new join index is expected to take its share of the budget they have left
+        JoinOptions options = JoinOptions.From(_database.Configuration);
+        ResidentCacheRegistry registry = ResidentCacheRegistry.Instance;
+        long residentEstimate = options.ResidentEstimateBytes(joinIndex, CountDocuments(outer), registry.FreeBytes);
+        Counters.RecordResidentEstimate(residentEstimate);
+        if (residentEstimate == 0)
+            return true;
+
+        if (available.GetValue(SizeUnit.Bytes) - estimate - residentEstimate < floor)
+        {
+            residentDecided = true;
+            return false;
+        }
+
+        return true;
+    }
+
+    private long CountDocuments(Index outer)
+    {
+        long documents = 0;
+        using (_database.DocumentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
+        using (context.OpenReadTransaction())
+        {
+            foreach (string collection in outer.Collections)
+                documents += _database.DocumentsStorage.GetNumberOfDocumentsFor(collection, context);
+        }
+
+        return documents;
     }
 
     private long CountDocuments(Index outer, Index inner)

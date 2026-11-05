@@ -8,6 +8,7 @@ namespace Raven.Server.Documents.Indexes.Joins.Auto;
 public sealed class AutoJoinCounters
 {
     public const string SkippedMemory = "AutoJoinSkippedMemory";
+    public const string SkippedResidentMemory = "AutoJoinSkippedResidentMemory";
     public const string SkippedClusterVersion = "AutoJoinSkippedClusterVersion";
     public const string NotEligiblePrefix = "AutoJoinNotEligible:";
 
@@ -19,6 +20,8 @@ public sealed class AutoJoinCounters
     private long _lastGateAvailable = -1;
     private long _lastGateEstimate;
     private long _lastGateFloor;
+    private long _skippedResidentMemory;
+    private long _lastResidentEstimate;
     private readonly ConcurrentDictionary<string, long> _notEligible = new();
 
     /// <summary>The creation of an auto join index was started by a query.</summary>
@@ -41,6 +44,12 @@ public sealed class AutoJoinCounters
     /// <summary>The floor of available memory that the last memory gate kept.</summary>
     public long LastGateFloorBytes => Interlocked.Read(ref _lastGateFloor);
 
+    /// <summary>Of the joins that were not built for memory: those for which the build fitted and the resident cache of the new join index did not (the free budget of the caches of the process is counted).</summary>
+    public long SkippedForResidentMemory => Interlocked.Read(ref _skippedResidentMemory);
+
+    /// <summary>The resident bytes that the last memory gate of a build expected for the new join index.</summary>
+    public long LastResidentEstimateBytes => Interlocked.Read(ref _lastResidentEstimate);
+
     /// <summary>No join index was put because a node of the cluster does not know the command yet.</summary>
     public long SkippedForClusterVersion => Interlocked.Read(ref _skippedClusterVersion);
 
@@ -61,6 +70,10 @@ public sealed class AutoJoinCounters
         Interlocked.Exchange(ref _lastGateEstimate, estimate);
         Interlocked.Exchange(ref _lastGateFloor, floor);
     }
+
+    internal void SkipForResidentMemory() => Interlocked.Increment(ref _skippedResidentMemory);
+
+    internal void RecordResidentEstimate(long bytes) => Interlocked.Exchange(ref _lastResidentEstimate, bytes);
 
     internal void SkipForClusterVersion() => Interlocked.Increment(ref _skippedClusterVersion);
 
