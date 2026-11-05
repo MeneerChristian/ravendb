@@ -20,7 +20,11 @@ public abstract class JoinRedTeamBase(ITestOutputHelper output) : RavenTestBase(
 {
     protected static Dictionary<string, string> ScoreSettings(params (string Key, string Value)[] more)
     {
-        var settings = new Dictionary<string, string> { [RavenConfiguration.GetKey(x => x.Indexing.CoraxIncludeDocumentScore)] = true.ToString() };
+        var settings = new Dictionary<string, string>
+        {
+            [RavenConfiguration.GetKey(x => x.Indexing.CoraxIncludeDocumentScore)] = true.ToString(),
+            [RavenConfiguration.GetKey(x => x.Join.AutoEnabled)] = true.ToString()
+        };
         foreach ((string key, string value) in more)
             settings[key] = value;
 

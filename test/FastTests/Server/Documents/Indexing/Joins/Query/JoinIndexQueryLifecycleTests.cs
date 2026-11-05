@@ -25,9 +25,12 @@ public class JoinIndexQueryLifecycleTests(ITestOutputHelper output) : RavenTestB
 {
     private static Dictionary<string, string> ScoreSettings() => new() { [RavenConfiguration.GetKey(x => x.Indexing.CoraxIncludeDocumentScore)] = true.ToString() };
 
-    private async Task<JoinIndexHarness> HarnessWithDataAsync(int seed, int operations = 120, bool putJoin = true)
+    private async Task<JoinIndexHarness> HarnessWithDataAsync(int seed, int operations = 120, bool putJoin = true, bool autoJoins = true)
     {
-        JoinIndexHarness h = await JoinIndexHarness.CreateAsync(this, ScoreSettings(), putJoin);
+        var settings = ScoreSettings();
+        settings["Join.AutoEnabled"] = autoJoins.ToString();
+
+        JoinIndexHarness h = await JoinIndexHarness.CreateAsync(this, settings, putJoin);
         h.RandomRound(new Random(seed), operations);
         if (putJoin)
             await h.AssertCurrentAsync();
@@ -240,7 +243,7 @@ public class JoinIndexQueryLifecycleTests(ITestOutputHelper output) : RavenTestB
     [RavenFact(RavenTestCategory.Querying | RavenTestCategory.Indexes)]
     public async Task JoinThatIsMissingOrDisabledIsNotUsed()
     {
-        using JoinIndexHarness h = await HarnessWithDataAsync(9, 80, putJoin: false);
+        using JoinIndexHarness h = await HarnessWithDataAsync(9, 80, putJoin: false, autoJoins: false);
         string rql = Join(" where Country = 'nl'", " order by score() limit 0, 1000");
 
         // no join index at all

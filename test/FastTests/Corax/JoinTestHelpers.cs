@@ -28,7 +28,14 @@ internal static class JoinTestHelpers
     {
         var options = RavenTestBase.Options.ForSearchEngine(RavenSearchEngineMode.Corax);
         options.ModifyDatabaseRecord += record => record.Settings[RavenConfiguration.GetKey(x => x.Indexing.CoraxIncludeDocumentScore)] = true.ToString();
+        DisableAutoJoins(options);
         return options;
+    }
+
+    // These tests measure how the server reads a join: a join index that a query creates would answer the next one
+    public static void DisableAutoJoins(RavenTestBase.Options options)
+    {
+        options.ModifyDatabaseRecord += record => record.Settings[RavenConfiguration.GetKey(x => x.Join.AutoEnabled)] = false.ToString();
     }
 
     public static double Median(IEnumerable<double> values) => Percentile(values, 0.5);

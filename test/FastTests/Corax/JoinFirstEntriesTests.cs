@@ -120,6 +120,7 @@ public class JoinFirstEntriesTests : RavenTestBase
     private IDocumentStore Seed(bool orderByScore = true)
     {
         var options = Options.ForSearchEngine(RavenSearchEngineMode.Corax);
+        JoinTestHelpers.DisableAutoJoins(options);
         if (orderByScore == false)
         {
             options.ModifyDatabaseRecord += record =>

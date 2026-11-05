@@ -105,6 +105,7 @@ public class JoinOrderedWalkTests : RavenTestBase
     private IDocumentStore Seed()
     {
         var options = Options.ForSearchEngine(RavenSearchEngineMode.Corax);
+        JoinTestHelpers.DisableAutoJoins(options);
         var store = GetDocumentStore(options);
         new CompaniesIndex().Execute(store);
         new OrdersIndex().Execute(store);

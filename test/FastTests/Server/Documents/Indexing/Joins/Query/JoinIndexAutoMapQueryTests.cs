@@ -44,7 +44,11 @@ public class JoinIndexAutoMapQueryTests(ITestOutputHelper output) : RavenTestBas
         " boost 2 order by score() limit 0, 20"
     ];
 
-    private static Dictionary<string, string> ScoreSettings() => new() { [RavenConfiguration.GetKey(x => x.Indexing.CoraxIncludeDocumentScore)] = true.ToString() };
+    private static Dictionary<string, string> ScoreSettings() => new()
+    {
+        [RavenConfiguration.GetKey(x => x.Indexing.CoraxIncludeDocumentScore)] = true.ToString(),
+        [RavenConfiguration.GetKey(x => x.Join.AutoEnabled)] = true.ToString()
+    };
 
     private static string FindAuto(IDocumentStore store, string prefix)
     {

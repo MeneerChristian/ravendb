@@ -8,6 +8,7 @@ using FastTests.Server.Documents.Indexing.Joins.Refresh;
 using Raven.Client.Documents.Indexes;
 using Raven.Client.Documents.Operations.Indexes;
 using Raven.Server.Documents.Indexes.Joins.Serving;
+using Sparrow;
 using Tests.Infrastructure;
 using Xunit;
 using static FastTests.Server.Documents.Indexing.Joins.Query.JoinIndexQueryOracle;
@@ -159,6 +160,45 @@ public class JoinCandidateTests(ITestOutputHelper output) : JoinRedTeamBase(outp
         Assert.Equal(1, BehindCount(h, names[0]));
         Assert.Equal(0, h.Join(names[1]).QueryCounters.FallbackTotal);
     }
+
+    [RavenFact(RavenTestCategory.Querying | RavenTestCategory.Indexes)]
+    public async Task AnAutoJoinIsNotMadeWhenAJoinOfTheSameKeysCouldServeAndIsMadeWhenNoneCan()
+    {
+        // a narrow join index that sorts first and a wide one: the queries that the wide one declares make no auto join index
+        string[] names = ["A_Narrow", "B_Wide"];
+        using JoinIndexHarness h = await HarnessAsync(
+        [
+            JoinOf(names[0], j => j.AddField("Rank", JoinFieldKind.Long)),
+            JoinOf(names[1], j => j.AddField("Country").AddField("Name"))
+        ], this, seed: 8);
+
+        // the memory gate looks at the real memory of the machine otherwise, which a loaded host can lower below the floor
+        h.Database.IndexStore.AutoJoins.AvailableMemoryForTesting = () => new Size(64, SizeUnit.Gigabytes);
+
+        Assert.Equal([names[1]], Check(h, names, " where Country = 'nl'"));
+        Assert.Equal([names[1]], Check(h, names, " where Country = 'nl' and Name = 'Alpha'"));
+        Assert.Equal([names[0]], Check(h, names, " where Rank = 3"));
+        Assert.Equal(0, h.Database.IndexStore.AutoJoins.Counters.Requested);
+
+        // Title is declared by none: the auto join index is made, it serves it, and the put join indexes keep serving what they declare
+        const string title = " where Title = 'fox'";
+        var oracle = new JoinIndexQueryOracle(h, names[0]) { AlsoForced = [names[1]] };
+        string rql = oracle.JoinOf(title, Tail);
+        (QueryAnswer served, QueryAnswer scan) = oracle.Both(rql);
+        AssertSame(rql, served, scan);
+        Assert.Equal(1, h.Database.IndexStore.AutoJoins.Counters.Requested);
+
+        string autoName = JoinIndexAutoQueryName;
+        await Auto.JoinIndexAutoQueryTests.WaitForTheAutoJoinAsync(h, autoName);
+
+        string[] all = [names[0], names[1], autoName];
+        Assert.Equal([autoName], Check(h, all, title));
+        Assert.Equal([names[1]], Check(h, all, " where Country = 'nl'"));
+        Assert.Equal([names[0]], Check(h, all, " where Rank = 3"));
+        Assert.Equal(1, h.Database.IndexStore.AutoJoins.Counters.Requested);
+    }
+
+    private const string JoinIndexAutoQueryName = Auto.JoinIndexAutoQueryTests.AutoName;
 
     private static long BehindCount(JoinIndexHarness h, string name) => h.Join(name).QueryCounters.Fallbacks.Where(x => x.Key == JoinFallbacks.BehindTimeout).Sum(x => x.Value);
 
