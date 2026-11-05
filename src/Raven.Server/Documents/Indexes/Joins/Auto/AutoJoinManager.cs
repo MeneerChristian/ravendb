@@ -37,6 +37,7 @@ internal sealed class AutoJoinManager
     private static readonly TimeSpan RetryAfterFailure = TimeSpan.FromSeconds(30);
 
     private readonly DocumentDatabase _database;
+    private readonly JoinMemory _memory = new();
     private readonly ConcurrentDictionary<string, Task<JoinIndex>> _pending = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, DateTime> _failed = new(StringComparer.OrdinalIgnoreCase);
 
@@ -227,8 +228,9 @@ internal sealed class AutoJoinManager
             return false;
 
         Size available = AvailableMemoryForTesting?.Invoke() ??
-                         _database.ServerStore.Server.MetricCacher.GetValue<MemoryInfoResult>(MetricCacher.Keys.Server.MemoryInfo).AvailableMemoryForProcessing;
+                         new Size(_memory.AvailableBytes(_database.ServerStore.Server.MetricCacher.GetValue<MemoryInfoResult>(MetricCacher.Keys.Server.MemoryInfo).AvailableMemoryForProcessing.GetValue(SizeUnit.Bytes)), SizeUnit.Bytes);
         long floor = configuration.AutoMinimumAvailableMemory.GetValue(SizeUnit.Bytes);
+        Counters.RecordGate(available.GetValue(SizeUnit.Bytes), estimate, floor);
         return available.GetValue(SizeUnit.Bytes) - estimate >= floor;
     }
 

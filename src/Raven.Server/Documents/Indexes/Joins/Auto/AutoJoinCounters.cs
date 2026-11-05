@@ -16,6 +16,9 @@ public sealed class AutoJoinCounters
     private long _failed;
     private long _skippedMemory;
     private long _skippedClusterVersion;
+    private long _lastGateAvailable = -1;
+    private long _lastGateEstimate;
+    private long _lastGateFloor;
     private readonly ConcurrentDictionary<string, long> _notEligible = new();
 
     /// <summary>The creation of an auto join index was started by a query.</summary>
@@ -28,6 +31,15 @@ public sealed class AutoJoinCounters
 
     /// <summary>No join index was built for a join that one could answer because the memory does not allow it.</summary>
     public long SkippedForMemory => Interlocked.Read(ref _skippedMemory);
+
+    /// <summary>The available memory that the last memory gate of a build saw (-1 before the first gate).</summary>
+    public long LastGateAvailableBytes => Interlocked.Read(ref _lastGateAvailable);
+
+    /// <summary>The estimated memory of the build that the last memory gate checked.</summary>
+    public long LastGateEstimateBytes => Interlocked.Read(ref _lastGateEstimate);
+
+    /// <summary>The floor of available memory that the last memory gate kept.</summary>
+    public long LastGateFloorBytes => Interlocked.Read(ref _lastGateFloor);
 
     /// <summary>No join index was put because a node of the cluster does not know the command yet.</summary>
     public long SkippedForClusterVersion => Interlocked.Read(ref _skippedClusterVersion);
@@ -42,6 +54,13 @@ public sealed class AutoJoinCounters
     internal void Fail() => Interlocked.Increment(ref _failed);
 
     internal void SkipForMemory() => Interlocked.Increment(ref _skippedMemory);
+
+    internal void RecordGate(long available, long estimate, long floor)
+    {
+        Interlocked.Exchange(ref _lastGateAvailable, available);
+        Interlocked.Exchange(ref _lastGateEstimate, estimate);
+        Interlocked.Exchange(ref _lastGateFloor, floor);
+    }
 
     internal void SkipForClusterVersion() => Interlocked.Increment(ref _skippedClusterVersion);
 

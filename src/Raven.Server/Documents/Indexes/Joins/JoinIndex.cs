@@ -87,9 +87,11 @@ public sealed class JoinIndex : Index<JoinIndexDefinition, JoinIndexField>
 
     internal JoinOptions Options => _options ??= JoinOptions.From(DocumentDatabase.Configuration);
 
+    private readonly JoinMemory _memory = new();
+
     internal JoinIncrementalRefresh Engine => _engine ??= new JoinIncrementalRefresh(Plan, Options, DocumentDatabase.DocumentsStorage, Counters)
     {
-        AvailableMemoryBytes = () => DocumentDatabase.ServerStore.Server.MetricCacher.GetValue<MemoryInfoResult>(MetricCacher.Keys.Server.MemoryInfo).AvailableMemoryForProcessing.GetValue(SizeUnit.Bytes)
+        AvailableMemoryBytes = () => _memory.AvailableBytes(DocumentDatabase.ServerStore.Server.MetricCacher.GetValue<MemoryInfoResult>(MetricCacher.Keys.Server.MemoryInfo).AvailableMemoryForProcessing.GetValue(SizeUnit.Bytes))
     };
 
     protected override void OnInitialization()
