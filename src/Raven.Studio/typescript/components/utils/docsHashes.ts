@@ -1,5 +1,9 @@
 import { StringWithAutocomplete } from "components/utils/common";
 
+// INTERIM: the docs have no page of the join index yet, so the join index route points to the page of creating an index.
+// When the docs team has a page and its hash, this is the only line to change.
+export const joinDocsHash = "XZXJP2";
+
 const docsHashes: Record<string, StringWithAutocomplete<"MISSING_DOCS">> = {
     "databases/documents": "H6XJDZ",
     "databases/documents/revisions/bin": "T4Y76K",
@@ -16,8 +20,7 @@ const docsHashes: Record<string, StringWithAutocomplete<"MISSING_DOCS">> = {
     "databases/indexes/visualizer": "E2NPXE",
     "databases/indexes/new": "XZXJP2",
     "databases/indexes/edit(/:indexName)": "XZXJP2",
-    // the docs have no page of the join index yet: until they have, it is the page of creating an index, like the other index types
-    "databases/indexes/join(/:indexName)": "XZXJP2",
+    "databases/indexes/join(/:indexName)": joinDocsHash,
     "databases/tasks/backups": "GMBYOH",
     "databases/tasks/editPeriodicBackupTask": "GMBYOH",
     "databases/tasks/ongoingTasks": "K4ZTNA",

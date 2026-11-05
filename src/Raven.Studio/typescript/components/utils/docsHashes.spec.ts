@@ -1,4 +1,4 @@
-import { getDocsHash } from "components/utils/docsHashes";
+import { getDocsHash, joinDocsHash } from "components/utils/docsHashes";
 
 describe("getDocsHash", () => {
     it("returns 'MISSING_DOCS' when can't find route", () => {
@@ -7,6 +7,10 @@ describe("getDocsHash", () => {
 
     it("returns hash for existing route", () => {
         expect(getDocsHash("databases/documents")).toBe("H6XJDZ");
+    });
+
+    it("takes the hash of the join index route from the one constant", () => {
+        expect(getDocsHash("databases/indexes/join(/:indexName)")).toBe(joinDocsHash);
     });
 
     it("does not leave the join index page without documentation", () => {
