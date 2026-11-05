@@ -1456,6 +1456,12 @@ namespace Raven.Server.Documents.Indexes
                 success = true;
                 return true;
             }
+            catch (Exception e) when (e is OperationCanceledException or ObjectDisposedException)
+            {
+                // the storage environment of an index that a replacement restarts is shut down while its directory is moved, and a reader that holds the index meets the shut down environment:
+                // for that moment the index has no snapshot, like an index in a storage operation
+                return false;
+            }
             finally
             {
                 if (success == false)
