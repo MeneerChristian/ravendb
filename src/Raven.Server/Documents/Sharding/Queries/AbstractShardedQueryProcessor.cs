@@ -269,7 +269,15 @@ public abstract class AbstractShardedQueryProcessor<TCommand, TResult, TCombined
 
     protected virtual void AssertQueryExecution()
     {
+        AssertNoJoins();
         AssertOrdering();
+    }
+
+    // every shard would join only with the documents it holds itself and silently leave out the matches that live on other shards
+    private void AssertNoJoins()
+    {
+        if (Query.Metadata.Query.Joins != null)
+            throw new NotSupportedInShardingException("JOIN is not supported in sharding as of yet: a shard can only join with the documents it holds itself.");
     }
 
     private void AssertOrdering()

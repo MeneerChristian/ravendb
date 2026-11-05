@@ -70,6 +70,10 @@ namespace Raven.Client.Documents.Linq
         private HashSet<Type> _loadTypes;
         private readonly HashSet<string> _loadAliasesMovedToOutputFunction;
         private int _insideLet = 0;
+
+        // the range variables of the joins of a query written with the query syntax (from g in games join u in users ...) and the alias that each has in the RQL
+        private Dictionary<string, string> _joinVariables;
+        private bool _insideJoinResultSelector;
         private string _loadAlias;
         private bool _selectLoad;
         private const string DefaultLoadAlias = "__load";
@@ -712,6 +716,7 @@ namespace Raven.Client.Documents.Linq
 
         private string GetPropertyName(string selectPath, ExpressionType type)
         {
+            var viaTransparentIdentifier = _insideJoinResultSelector || selectPath.StartsWith(JavascriptConversionExtensions.TransparentIdentifier);
             selectPath = LinqPathProvider.RemoveTransparentIdentifiersIfNeeded(selectPath);
 
             var indexOf = selectPath.IndexOf('.');
@@ -749,6 +754,10 @@ namespace Raven.Client.Documents.Linq
                         selectPath);
                 }
             }
+
+            // a field of the range variable of a join (u.Country) is a field of the joined documents, not of the main document
+            if (viaTransparentIdentifier && alias != null && _joinVariables != null && _joinVariables.TryGetValue(alias, out var joinAlias))
+                return $"{joinAlias}.{propertyName}";
 
             return AddAliasToPathIfNeeded(alias, propertyName);
         }
@@ -1404,7 +1413,9 @@ The recommended method is to use full text search (mark the field as Analyzed an
 
             if (declaringType == typeof(RavenQuery))
             {
-                //
+                if (expression.Method.Name == nameof(RavenQuery.Matches))
+                    VisitMatches(expression);
+
                 return;
             }
 
@@ -1486,6 +1497,10 @@ The recommended method is to use full text search (mark the field as Analyzed an
             {
                 case nameof(LinqExtensions.Search):
                     VisitSearch(expression);
+                    break;
+                case nameof(LinqExtensions.Join):
+                    VisitExpression(expression.Arguments[0]);
+                    VisitJoin(expression);
                     break;
                 case nameof(LinqExtensions.OrderByScore):
                     DocumentQuery.OrderByScore();
@@ -1793,6 +1808,268 @@ The recommended method is to use full text search (mark the field as Analyzed an
                 throw new NotSupportedException($"{methodName} method is only supported in dynamic map-reduce queries");
         }
 
+        private void VisitJoin(MethodCallExpression joinExpression)
+        {
+            var source = GetJoinSource(joinExpression.Arguments[1], joinExpression);
+            var outerKey = GetMember(joinExpression.Arguments[2]);
+
+            // (self, source, outerKey, left, boost) matches the joined documents by id, (self, source, outerKey, joinedKey, left, boost) by a field of them
+            var hasJoinedKey = joinExpression.Arguments.Count > 5;
+            var joinedField = hasJoinedKey
+                ? JoinedFieldPath.Get(_conventions, (LambdaExpression)StripQuotes(joinExpression.Arguments[3]))
+                : null;
+
+            var optionsIndex = hasJoinedKey ? 4 : 3;
+            var left = GetJoinConstant<bool>(joinExpression.Arguments[optionsIndex], joinExpression);
+            var boost = GetJoinConstant<double?>(joinExpression.Arguments[optionsIndex + 1], joinExpression);
+
+            AddJoin(source, outerKey.Path, joinedField, left, boost);
+        }
+
+        private static TValue GetJoinConstant<TValue>(Expression expression, Expression joinExpression)
+        {
+            if (LinqPathProvider.GetValueFromExpressionWithoutConversion(expression, out var value) == false)
+                throw new InvalidOperationException("Could not extract the left or boost argument of the join from " + joinExpression);
+
+            return (TValue)value;
+        }
+
+        /// <summary>
+        /// Query syntax: from g in games join u in users on g.OwnerId equals u.Id select g
+        /// which the compiler turns into Queryable.Join(games, users, g => g.OwnerId, u => u.Id, (g, u) => g)
+        /// </summary>
+        private void VisitQueryableJoin(MethodCallExpression joinExpression)
+        {
+            if (joinExpression.Arguments.Count != 5)
+                throw new NotSupportedException("Method not supported: " + joinExpression.Method + ". Expression: " + joinExpression);
+
+            var source = GetJoinSource(joinExpression.Arguments[1], joinExpression);
+
+            // equals u.Id joins on the id of the joined documents, any other property joins on that (indexed) field
+            var joinedField = JoinedFieldPath.Get(_conventions, (LambdaExpression)StripQuotes(joinExpression.Arguments[3]));
+
+            // the joins before this one (join ... join ...) are the first argument: they are visited first, so that the transparent identifiers they declare are known
+            VisitExpression(joinExpression.Arguments[0]);
+
+            // the key is a field of what the joins before this one produced
+            var outerKeyPath = WithoutTransparentIdentifiers(GetMember(StripQuotes(joinExpression.Arguments[2])).Path);
+
+            var resultSelector = (LambdaExpression)StripQuotes(joinExpression.Arguments[4]);
+            var isTransparentIdentifier = TryRegisterTransparentIdentifier(resultSelector);
+            var isMainDocument = isTransparentIdentifier == false && IsMainDocument(resultSelector.Body, resultSelector.Parameters[0]);
+            if (isTransparentIdentifier == false && isMainDocument == false && resultSelector.Body == resultSelector.Parameters[1])
+            {
+                throw new NotSupportedException("A join cannot select the joined document as a whole ('select u'): select its fields ('select new { u.Name }') or the documents of the outer query ('select g'). " +
+                                                "Expression: " + joinExpression);
+            }
+
+            AddJoin(source, outerKeyPath, joinedField, left: false, boost: null);
+            RegisterJoinVariable(resultSelector.Parameters[1].Name);
+
+            if (isTransparentIdentifier == false && isMainDocument == false)
+                VisitJoinProjection(resultSelector);
+        }
+
+        // Select(x => ...) of the result of a join that wrapped the documents (the parameter is the transparent identifier of the compiler), as opposed to a 'let'
+        private static bool IsSelectOverJoin(MethodCallExpression select, out LambdaExpression lambda)
+        {
+            lambda = StripQuotes(select.Arguments[1]) as LambdaExpression;
+            if (lambda is not { Parameters.Count: 1 } || lambda.Parameters[0].Name.StartsWith(JavascriptConversionExtensions.TransparentIdentifier) == false)
+                return false;
+
+            // a let declares a new range variable next to the transparent identifier: new { <>h__TransparentIdentifier0, x = ... }
+            var parameter = lambda.Parameters[0];
+            if (lambda.Body is NewExpression { Arguments: var arguments } && arguments.Any(x => x == parameter))
+                return false;
+
+            var current = select.Arguments[0];
+            while (current is MethodCallExpression call)
+            {
+                if (call.Method.DeclaringType == typeof(Queryable) && call.Method.Name is "Join" or "SelectMany")
+                    return true;
+
+                if (call.Method.Name == "Select" || call.Arguments.Count == 0)
+                    return false;
+
+                current = call.Arguments[0];
+            }
+
+            return false;
+        }
+
+        // 'from g in games join u in users on ... select new { g.Name, u.Name }': the fields of the range variables become the fields of the projection
+        private void VisitJoinProjection(LambdaExpression resultSelector)
+        {
+            _insideJoinResultSelector = true;
+            _insideSelect++;
+            try
+            {
+                VisitSelect(resultSelector);
+            }
+            finally
+            {
+                _insideSelect--;
+                _insideJoinResultSelector = false;
+            }
+        }
+
+        // the range variable names the join in the RQL (where u.Country = ..., order by u.Rank, select u.Name), unless it cannot be the name of an alias
+        private void RegisterJoinVariable(string variable)
+        {
+            var alias = JoinInfo.IsValidAlias(variable) ? variable : "_" + variable;
+            DocumentQuery.JoinAlias(alias);
+            (_joinVariables ??= new Dictionary<string, string>())[variable] = alias;
+        }
+
+        private void VisitMatches(MethodCallExpression expression)
+        {
+            var argument = expression.Arguments[0];
+            while (argument.NodeType is ExpressionType.Convert or ExpressionType.ConvertChecked)
+                argument = ((UnaryExpression)argument).Operand;
+
+            var path = LinqPathProvider.RemoveTransparentIdentifiersIfNeeded(LinqPathProvider.GetPath(argument).Path);
+            if (_joinVariables == null || _joinVariables.TryGetValue(path, out var alias) == false)
+            {
+                throw new NotSupportedException("RavenQuery.Matches takes the range variable of a join of the query syntax (from g in games join u in users on ... where RavenQuery.Matches(u)). " +
+                                                "Expression: " + expression);
+            }
+
+            DocumentQuery.WhereMatches(alias);
+        }
+
+        // 'from g in games join u in users on g.OwnerId equals u.Id into gj from u in gj.DefaultIfEmpty() ...' is a left join:
+        // Queryable.SelectMany(Queryable.GroupJoin(games, users, g => g.OwnerId, u => u.Id, (g, gj) => new { g, gj }), t => t.gj.DefaultIfEmpty(), (t, u) => ...)
+        private void VisitLeftJoin(MethodCallExpression selectMany)
+        {
+            if (selectMany.Arguments.Count != 3 || selectMany.Arguments[0] is not MethodCallExpression { Method.Name: "GroupJoin", Arguments.Count: 5 } groupJoin ||
+                groupJoin.Method.DeclaringType != typeof(Queryable) ||
+                StripQuotes(selectMany.Arguments[1]) is not LambdaExpression { Body: MethodCallExpression { Method.Name: nameof(Enumerable.DefaultIfEmpty), Arguments.Count: 1 } defaultIfEmpty } collectionSelector ||
+                defaultIfEmpty.Arguments[0] is not MemberExpression { Expression: ParameterExpression group } groupMember || group != collectionSelector.Parameters[0] ||
+                StripQuotes(groupJoin.Arguments[4]) is not LambdaExpression { Body: NewExpression { Members: { Count: 2 } groupMembers } } groupSelector ||
+                groupMember.Member.Name != groupMembers[1].Name ||
+                StripQuotes(selectMany.Arguments[2]) is not LambdaExpression resultSelector)
+            {
+                throw new NotSupportedException("A GroupJoin is supported only as the left join of the query syntax: " +
+                                                "from g in games join u in users on g.OwnerId equals u.Id into joined from u in joined.DefaultIfEmpty() ... Expression: " + selectMany);
+            }
+
+            var source = GetJoinSource(groupJoin.Arguments[1], selectMany);
+            var joinedField = JoinedFieldPath.Get(_conventions, (LambdaExpression)StripQuotes(groupJoin.Arguments[3]));
+
+            VisitExpression(groupJoin.Arguments[0]);
+            var outerKeyPath = WithoutTransparentIdentifiers(GetMember(StripQuotes(groupJoin.Arguments[2])).Path);
+
+            if (TryRegisterTransparentIdentifier(groupSelector) == false)
+                throw new NotSupportedException("Unexpected shape of a left join: " + selectMany);
+
+            var isTransparentIdentifier = TryRegisterTransparentIdentifier(resultSelector);
+            var isMainDocument = isTransparentIdentifier == false && IsMainDocument(resultSelector.Body, resultSelector.Parameters[0]);
+            if (isTransparentIdentifier == false && isMainDocument == false && resultSelector.Body == resultSelector.Parameters[1])
+            {
+                throw new NotSupportedException("A join cannot select the joined document as a whole ('select u'): select its fields ('select new { u.Name }') or the documents of the outer query ('select g'). " +
+                                                "Expression: " + selectMany);
+            }
+
+            AddJoin(source, outerKeyPath, joinedField, left: true, boost: null);
+            RegisterJoinVariable(resultSelector.Parameters[1].Name);
+
+            if (isTransparentIdentifier == false && isMainDocument == false)
+                VisitJoinProjection(resultSelector);
+        }
+
+        // 'from g in games join u in users on ... join p in publishers on ...' is compiled to Join(Join(games, users, ..., (g, u) => new { g, u }), publishers, x => x.g.PublisherId, ..., (x, p) => x.g):
+        // the result of a join that is followed by another join wraps the documents in an anonymous type (a transparent identifier)
+        private string _transparentMainDocument;
+        private HashSet<string> _transparentWrappers;
+
+        private bool TryRegisterTransparentIdentifier(LambdaExpression resultSelector)
+        {
+            if (resultSelector.Body is not NewExpression { Members: { Count: 2 } members, Arguments: { Count: 2 } arguments } ||
+                arguments[1] != resultSelector.Parameters[1])
+                return false;
+
+            if (arguments[0] == resultSelector.Parameters[0] && _transparentMainDocument == null)
+            {
+                _transparentMainDocument = members[0].Name;
+                return true;
+            }
+
+            if (arguments[0] == resultSelector.Parameters[0] && _transparentMainDocument != null)
+            {
+                (_transparentWrappers ??= new HashSet<string>()).Add(members[0].Name);
+                return true;
+            }
+
+            return false;
+        }
+
+        // the main document: the first parameter itself, or the member of the transparent identifier that holds it
+        private bool IsMainDocument(Expression body, ParameterExpression first)
+        {
+            if (body == first)
+                return _transparentMainDocument == null;
+
+            var names = new Stack<string>();
+            while (body is MemberExpression member)
+            {
+                names.Push(member.Member.Name);
+                body = member.Expression;
+            }
+
+            if (body != first || _transparentMainDocument == null || names.Count == 0)
+                return false;
+
+            while (names.Count > 1)
+            {
+                if (_transparentWrappers == null || _transparentWrappers.Contains(names.Pop()) == false)
+                    return false;
+            }
+
+            return names.Pop() == _transparentMainDocument;
+        }
+
+        // the path provider already leaves out the transparent identifier of the compiler (<>h__TransparentIdentifier0), but not the names of the anonymous type it wraps the documents in
+        private string WithoutTransparentIdentifiers(string path)
+        {
+            if (_transparentMainDocument == null)
+                return path;
+
+            var segments = path.Split('.');
+            var index = 0;
+            while (index < segments.Length - 1 && _transparentWrappers?.Contains(segments[index]) == true)
+                index++;
+
+            if (index < segments.Length - 1 && segments[index] == _transparentMainDocument)
+                return string.Join(".", segments, index + 1, segments.Length - index - 1);
+
+            return path;
+        }
+
+        private static Expression StripQuotes(Expression expression)
+        {
+            while (expression.NodeType == ExpressionType.Quote)
+                expression = ((UnaryExpression)expression).Operand;
+
+            return expression;
+        }
+
+        private static IJoinSource GetJoinSource(Expression sourceExpression, Expression joinExpression)
+        {
+            if (LinqPathProvider.GetValueFromExpressionWithoutConversion(sourceExpression, out var value) == false || value is not IJoinSource source)
+                throw new InvalidOperationException("The query to join with must be a Raven query: " + joinExpression);
+
+            return source;
+        }
+
+        private void AddJoin(IJoinSource source, string outerKeyPath, string joinedField, bool left, double? boost)
+        {
+            // the path may carry the alias of the main document (g.OwnerId) when it was already set by an earlier clause: the join adds it itself
+            if (FromAlias != null && outerKeyPath.StartsWith(FromAlias + ".", StringComparison.Ordinal))
+                outerKeyPath = outerKeyPath.Substring(FromAlias.Length + 1);
+
+            DocumentQuery.Join(source.GetIndexQuery(), outerKeyPath, joinedField, left, boost);
+        }
+
         private void VisitSearch(MethodCallExpression searchExpression)
         {
             var expressions = new List<MethodCallExpression>();
@@ -2035,6 +2312,9 @@ The recommended method is to use full text search (mark the field as Analyzed an
         {
             switch (expression.Method.Name)
             {
+                case "Join":
+                    VisitQueryableJoin(expression);
+                    break;
                 case "OfType":
                     if (expression.Arguments[0].Type.IsGenericType)
                     {
@@ -2108,8 +2388,31 @@ The recommended method is to use full text search (mark the field as Analyzed an
                         }
                         break;
                     }
+                case "SelectMany":
+                    VisitLeftJoin(expression);
+                    break;
                 case "Select":
                     {
+                        // the last clause of a join query that wrapped the documents (where ... select g, orderby ... select new { g.Name, u.Name })
+                        if (IsSelectOverJoin(expression, out var joinSelect))
+                        {
+                            VisitExpression(expression.Arguments[0]);
+                            if (IsMainDocument(joinSelect.Body, joinSelect.Parameters[0]) == false)
+                            {
+                                _insideSelect++;
+                                try
+                                {
+                                    VisitSelect(joinSelect);
+                                }
+                                finally
+                                {
+                                    _insideSelect--;
+                                }
+                            }
+
+                            break;
+                        }
+
                         if (expression.Arguments[0].Type.IsGenericType &&
                             (expression.Arguments[0].Type.GetGenericTypeDefinition() == typeof(IQueryable<>) ||
                             expression.Arguments[0].Type.GetGenericTypeDefinition() == typeof(IOrderedQueryable<>) ||
@@ -4079,6 +4382,21 @@ The recommended method is to use full text search (mark the field as Analyzed an
                 alias = "'" + alias + "'";
             }
         }
+
+        private bool IsJoinField(string field)
+        {
+            if (_joinVariables == null)
+                return false;
+
+            foreach (var alias in _joinVariables.Values)
+            {
+                if (field.StartsWith(alias + ".", StringComparison.Ordinal))
+                    return true;
+            }
+
+            return false;
+        }
+
         private bool NeedToAddFromAliasToField(string field)
         {
             return _addedDefaultAlias && FieldTypeAllowToAddAlias(field);
@@ -4087,6 +4405,7 @@ The recommended method is to use full text search (mark the field as Analyzed an
         private bool FieldTypeAllowToAddAlias(string field)
         {
             return field.StartsWith($"{FromAlias}.") == false &&
+                IsJoinField(field) == false &&
                 field.StartsWith("id(") == false &&
                 field.StartsWith("counter(") == false &&
                 field.StartsWith("counterRaw(") == false &&

@@ -8,8 +8,9 @@ namespace Raven.Server.Documents.Queries
 {
     public struct OrderByField
     {
-        public OrderByField(QueryFieldName name, OrderByFieldType orderingType, bool ascending, MethodType? method = null, Argument[] arguments = null, NullsOrderingType nullsOrdering = NullsOrderingType.Implicit)
+        public OrderByField(QueryFieldName name, OrderByFieldType orderingType, bool ascending, MethodType? method = null, Argument[] arguments = null, NullsOrderingType nullsOrdering = NullsOrderingType.Implicit, string joinAlias = null)
         {
+            JoinAlias = joinAlias;
             Method = method;
             Name = name;
             OrderingType = orderingType;
@@ -27,6 +28,9 @@ namespace Raven.Server.Documents.Queries
         }
 
         public readonly QueryFieldName Name;
+
+        // The alias of the JOIN whose index the field belongs to, null for a field of the main index
+        public readonly string JoinAlias;
 
         public readonly OrderByFieldType OrderingType;
 

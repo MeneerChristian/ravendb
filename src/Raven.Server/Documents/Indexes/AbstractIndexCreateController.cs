@@ -14,6 +14,7 @@ using Raven.Client.Util;
 using Raven.Server.Config;
 using Raven.Server.Config.Categories;
 using Raven.Server.Documents.Indexes.Auto;
+using Raven.Server.Documents.Indexes.Configuration;
 using Raven.Server.Documents.Indexes.MapReduce.OutputToCollection;
 using Raven.Server.Documents.Indexes.MapReduce.Static;
 using Raven.Server.Documents.Indexes.Persistence.Lucene;
@@ -91,6 +92,7 @@ public abstract class AbstractIndexCreateController
 
         definition.RemoveDefaultValues();
         ValidateAnalyzers(definition);
+        ValidateKeyFields(definition);
         
         ValidateConfiguration(definition);
         
@@ -228,6 +230,43 @@ public abstract class AbstractIndexCreateController
         }
     }
     
+    private void ValidateKeyFields(IndexDefinition definition)
+    {
+        if (definition.Fields == null)
+            return;
+
+        SearchEngineType? engine = null;
+        foreach (var (name, options) in definition.Fields)
+        {
+            if (options?.Indexing != FieldIndexing.Key)
+                continue;
+
+            var prefix = $"The field '{name}' of the index '{definition.Name}' is indexed with {nameof(FieldIndexing)}.{nameof(FieldIndexing.Key)}";
+
+            if (name == Constants.Documents.Indexing.Fields.AllFields)
+                throw new IndexInvalidException($"{prefix}, which is a setting of a single field and cannot be the default of all the fields.");
+
+            engine ??= new SingleIndexConfiguration(definition.Configuration, GetDatabaseConfiguration()).StaticIndexingEngineType;
+            if (engine != SearchEngineType.Corax)
+                throw new IndexInvalidException($"{prefix}, which is supported only by the Corax search engine, but this index uses '{engine}'.");
+
+            if (string.IsNullOrWhiteSpace(options.Analyzer) == false)
+                throw new IndexInvalidException($"{prefix}, so it cannot have the analyzer '{options.Analyzer}': a Key field is always one lowercased term. Remove the analyzer, or index the field with {nameof(FieldIndexing)}.{nameof(FieldIndexing.Search)}.");
+
+            if (options.Suggestions == true)
+                throw new IndexInvalidException($"{prefix}, so it cannot have suggestions.");
+
+            if (options.TermVector is { } termVector && termVector != FieldTermVector.No)
+                throw new IndexInvalidException($"{prefix}, so it cannot have the term vector '{termVector}'.");
+
+            if (options.Spatial != null)
+                throw new IndexInvalidException($"{prefix}, so it cannot have spatial options.");
+
+            if (options.Vector != null)
+                throw new IndexInvalidException($"{prefix}, so it cannot have vector options.");
+        }
+    }
+
     private static void ValidateConfiguration(IndexDefinition definition)
     {
         if (definition.Configuration == null)

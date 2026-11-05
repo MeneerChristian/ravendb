@@ -621,6 +621,54 @@ namespace Raven.Client.Documents
             return Search(self, fieldSelector, termToSearch, boost, options, @operator);
         }
 
+        /// <summary>
+        /// Joins the query with another index query: only documents whose <paramref name="outerKey"/> holds the id of a document
+        /// matched by <paramref name="source"/> are returned, and the score of that match is added to the score of the document.
+        /// Use <see cref="OrderByScore{T}"/> to sort by the combined score, best match first.
+        /// The source query is executed first, must be a query on an index. Every document it matches counts.
+        /// </summary>
+        /// <param name="source">The query that produces the ids (and scores) to join on.</param>
+        /// <param name="outerKey">The field that holds the id of the document matched by <paramref name="source"/>.</param>
+        /// <param name="left">A left join: documents without a match are kept too (with their own score), instead of being filtered out.</param>
+        /// <param name="boost">Factor applied to the score of the match before it is added to the score of the document (0: the join only fetches data, does not change the score). Sent as a query parameter. Default: 1.</param>
+        public static IRavenQueryable<T> Join<T, TSource>(this IQueryable<T> self, IQueryable<TSource> source, Expression<Func<T, object>> outerKey, bool left = false, double? boost = null)
+        {
+            var currentMethod = (MethodInfo)MethodBase.GetCurrentMethod();
+
+            currentMethod = ConvertMethodIfNecessary(currentMethod, new[] { typeof(T), typeof(TSource) });
+            var expression = ConvertExpressionIfNecessary(self);
+
+            var queryable = self.Provider.CreateQuery(Expression.Call(null, currentMethod, expression,
+                                                                      Expression.Constant(source, typeof(IQueryable<TSource>)),
+                                                                      outerKey,
+                                                                      Expression.Constant(left),
+                                                                      Expression.Constant(boost, typeof(double?))));
+            return (IRavenQueryable<T>)queryable;
+        }
+
+        /// <summary>
+        /// Joins the query on a field of the joined documents instead of their id: documents whose <paramref name="outerKey"/> has the same value as the
+        /// <paramref name="joinedKey"/> of a document matched by <paramref name="source"/> are kept, and the score of the best such document is added.
+        /// Both fields have to be indexed (with the same analyzer). The typed client cannot project the fields of the joined documents (use RQL: select alias.Field); several joined documents can match, the best scoring one counts.
+        /// </summary>
+        /// <param name="left">A left join: documents without a match are kept too (with their own score), instead of being filtered out.</param>
+        /// <param name="boost">Factor applied to the score of the match before it is added to the score of the document (0: the join only fetches data, does not change the score). Sent as a query parameter. Default: 1.</param>
+        public static IRavenQueryable<T> Join<T, TSource>(this IQueryable<T> self, IQueryable<TSource> source, Expression<Func<T, object>> outerKey, Expression<Func<TSource, object>> joinedKey, bool left = false, double? boost = null)
+        {
+            var currentMethod = (MethodInfo)MethodBase.GetCurrentMethod();
+
+            currentMethod = ConvertMethodIfNecessary(currentMethod, new[] { typeof(T), typeof(TSource) });
+            var expression = ConvertExpressionIfNecessary(self);
+
+            var queryable = self.Provider.CreateQuery(Expression.Call(null, currentMethod, expression,
+                                                                      Expression.Constant(source, typeof(IQueryable<TSource>)),
+                                                                      outerKey,
+                                                                      joinedKey,
+                                                                      Expression.Constant(left),
+                                                                      Expression.Constant(boost, typeof(double?))));
+            return (IRavenQueryable<T>)queryable;
+        }
+
         /// <inheritdoc cref="IDocumentQueryBase{T, TSelf}.OrderByScore"/>
         public static IOrderedQueryable<T> OrderByScore<T>(this IQueryable<T> self)
         {

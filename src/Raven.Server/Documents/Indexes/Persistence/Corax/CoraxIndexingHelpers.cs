@@ -170,6 +170,12 @@ public static class CoraxIndexingHelpers
                     mappingBuilder.AddBinding(fieldId, fieldNameSlice, defaultAnalyzer, hasSuggestions, FieldIndexingMode.Normal, shouldStore, hasSpatial, coraxVectorOptions);
 
                     break;
+                case FieldIndexing.Key:
+                    // ids are compared lowercased, whatever the default analyzer of the index is
+                    var keyAnalyzer = GetOrCreateAnalyzer(fieldName, typeof(LowerCaseKeywordAnalyzer), forQuerying, (_, name, type, querying) => CreateDefaultAnalyzer(name, type, querying));
+                    mappingBuilder.AddBinding(fieldId, fieldNameSlice, keyAnalyzer, false, FieldIndexingMode.Normal, shouldStore, false, null);
+                    break;
+
                 case FieldIndexing.No:
                     mappingBuilder.AddBinding(fieldId, fieldNameSlice, null, fieldIndexingMode: FieldIndexingMode.No, shouldStore: shouldStore);
                     break;

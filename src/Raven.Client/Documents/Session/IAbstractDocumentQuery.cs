@@ -260,6 +260,25 @@ namespace Raven.Client.Documents.Session
 
         void OrderByScoreDescending();
 
+        /// <summary>
+        /// Restricts this query to the documents whose <paramref name="outerKeyField"/> equals the id of a document matched by
+        /// <paramref name="source"/>, and adds the score <paramref name="source"/> gave that document to this query's score.
+        /// </summary>
+        void Join(IndexQuery source, string outerKeyField, bool left = false, double? boost = null);
+
+        /// <summary>
+        /// Joins on a field of the joined documents instead of their id: documents whose <paramref name="outerKeyField"/> has the same value as the
+        /// <paramref name="joinedField"/> of a document matched by <paramref name="source"/> are kept. Several joined documents can share a value:
+        /// the score of the best one is added.
+        /// </summary>
+        void Join(IndexQuery source, string outerKeyField, string joinedField, bool left = false, double? boost = null);
+
+        /// <summary>Names the alias of the last join (see <see cref="IDocumentQueryBase{T, TSelf}.JoinAlias"/>).</summary>
+        void JoinAlias(string alias);
+
+        /// <summary><c>matches(alias)</c> of a join (see <see cref="IDocumentQueryBase{T, TSelf}.WhereMatches"/>).</summary>
+        void WhereMatches(string joinAlias);
+
         void Highlight(string fieldName, int fragmentLength, int fragmentCount, HighlightingOptions options, out Highlightings highlightings);
 
         /// <summary>

@@ -29,6 +29,11 @@ namespace Raven.Client.Documents.Session.Tokens
 
         public override void WriteTo(StringBuilder writer)
         {
+            WriteTo(writer, Alias);
+        }
+
+        internal void WriteTo(StringBuilder writer, string alias)
+        {
             if (IndexName == null && CollectionName == null)
                 throw new NotSupportedException("Either IndexName or CollectionName must be specified");
 
@@ -46,9 +51,9 @@ namespace Raven.Client.Documents.Session.Tokens
                     .Append("'");
             }
 
-            if (Alias != null)
+            if (alias != null)
             {
-                writer.Append(" as ").Append(Alias);
+                writer.Append(" as ").Append(alias);
             }
         }
     }

@@ -6,6 +6,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Linq.Expressions;
+using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -259,6 +260,263 @@ namespace Raven.Client.Documents.Session
                 isProjectInto: IsProjectInto);
         }
 
+        /// <summary>The queries this query is joined with: the RQL of each source query (its parameters already renamed), the field of this query to join on, the field of the joined documents (null: their id), whether it is a left join and the query parameter that holds the boost (null: none).</summary>
+        internal List<JoinInfo> Joins;
+        private const string DefaultJoinAlias = "j";
+
+        private static string JoinAliasOf(int index) => index == 0 ? DefaultJoinAlias : DefaultJoinAlias + index.ToInvariantString();
+
+        /// <inheritdoc />
+        public void Join(IndexQuery source, string outerKeyField, bool left = false, double? boost = null) => Join(source, outerKeyField, joinedField: null, left, boost);
+
+        /// <inheritdoc />
+        public void Join(IndexQuery source, string outerKeyField, string joinedField, bool left = false, double? boost = null)
+        {
+            AssertNoRawQuery();
+
+            if (source == null)
+                throw new ArgumentNullException(nameof(source));
+            if (string.IsNullOrWhiteSpace(outerKeyField))
+                throw new ArgumentException("The field to join on cannot be empty.", nameof(outerKeyField));
+            if (boost.HasValue && ((double.IsNaN(boost.Value) || double.IsInfinity(boost.Value)) || boost.Value < 0))
+                throw new ArgumentOutOfRangeException(nameof(boost), boost, "The boost of a join must be a number that is not negative.");
+
+            // the source query was generated on its own, so its parameter names (p0, p1...) collide with ours
+            var renamed = new Dictionary<string, string>();
+            foreach (var parameter in source.QueryParameters ?? new Parameters())
+                renamed[parameter.Key] = AddQueryParameter(parameter.Value);
+
+            var sourceQuery = RenameParameters(source.Query, renamed);
+
+            Joins ??= new List<JoinInfo>();
+            Joins.Add(new JoinInfo(sourceQuery,
+                EnsureValidFieldName(outerKeyField, isNestedPath: false),
+                joinedField == null ? null : QueryFieldUtil.EscapeIfNecessary(joinedField, isPath: true),
+                left,
+                boost.HasValue ? AddQueryParameter(boost.Value) : null));
+        }
+
+        /// <summary>
+        /// Renames the $parameters of an RQL text. The text is scanned by token: a '$name' inside a string literal, a comment or a regular expression is text, not a parameter
+        /// (the JavaScript of a projection can hold an apostrophe in a comment or in a regular expression, which is not the start of a literal).
+        /// </summary>
+        private static string RenameParameters(string rql, Dictionary<string, string> renamed)
+        {
+            if (renamed.Count == 0)
+                return rql;
+
+            var result = new StringBuilder(rql.Length + 16);
+            for (var i = 0; i < rql.Length;)
+            {
+                var c = rql[i];
+                if (c == '/' && i + 1 < rql.Length && (rql[i + 1] == '/' || rql[i + 1] == '*'))
+                {
+                    var end = rql[i + 1] == '/' ? rql.IndexOf('\n', i) : rql.IndexOf("*/", i + 2, StringComparison.Ordinal);
+                    end = end == -1 ? rql.Length : end + (rql[i + 1] == '/' ? 0 : 2);
+                    result.Append(rql, i, end - i);
+                    i = end;
+                    continue;
+                }
+
+                if (c == '/' && CanStartRegex(rql, i))
+                {
+                    var end = i + 1;
+                    var inClass = false;
+                    while (end < rql.Length && (rql[end] != '/' || inClass) && rql[end] != '\n')
+                    {
+                        if (rql[end] == '\\')
+                            end++;
+                        else if (rql[end] == '[')
+                            inClass = true;
+                        else if (rql[end] == ']')
+                            inClass = false;
+
+                        end++;
+                    }
+
+                    // no closing slash on the line: it was a division, not a regular expression
+                    if (end < rql.Length && rql[end] == '/')
+                    {
+                        end++;
+                        result.Append(rql, i, end - i);
+                        i = end;
+                        continue;
+                    }
+                }
+
+                if (c == '\'' || c == '"' || c == '`')
+                {
+                    var end = i + 1;
+                    while (end < rql.Length && rql[end] != c)
+                        end += rql[end] == '\\' ? 2 : 1;
+
+                    end = Math.Min(end + 1, rql.Length);
+                    result.Append(rql, i, end - i);
+                    i = end;
+                    continue;
+                }
+
+                if (c == '$')
+                {
+                    var end = i + 1;
+                    while (end < rql.Length && (char.IsLetterOrDigit(rql[end]) || rql[end] == '_'))
+                        end++;
+
+                    var name = rql.Substring(i + 1, end - i - 1);
+                    result.Append('$').Append(renamed.TryGetValue(name, out var newName) ? newName : name);
+                    i = end;
+                    continue;
+                }
+
+                result.Append(c);
+                i++;
+            }
+
+            return result.ToString();
+        }
+
+        // a slash starts a regular expression after an operator or an opening bracket, and a division after a value
+        private static bool CanStartRegex(string text, int slash)
+        {
+            for (var i = slash - 1; i >= 0; i--)
+            {
+                if (char.IsWhiteSpace(text[i]))
+                    continue;
+
+                return "(,=:[!&|?{};+-*%<>~^".IndexOf(text[i]) != -1;
+            }
+
+            return true;
+        }
+
+        private LinkedList<QueryToken> AddAliasToTokens(LinkedList<QueryToken> tokens)
+        {
+            var joinAliases = GetJoinAliases(JoinOuterAlias);
+            var result = new LinkedList<QueryToken>();
+            foreach (var token in tokens)
+            {
+                result.AddLast(token switch
+                {
+                    WhereToken where when JoinInfo.IsJoinField(where.FieldName, joinAliases) => where,
+                    WhereToken where => where.AddAlias(JoinOuterAlias),
+                    OrderByToken orderBy when orderBy.IsJoinField(joinAliases) => orderBy,
+                    OrderByToken orderBy => orderBy.AddAlias(JoinOuterAlias),
+                    _ => token
+                });
+            }
+
+            return result;
+        }
+
+        /// <inheritdoc cref="IDocumentQueryBase{T, TSelf}.JoinAlias"/>
+        public void JoinAlias(string alias)
+        {
+            if (Joins == null || Joins.Count == 0)
+                throw new InvalidOperationException("JoinAlias names the alias of the last join: call Join first.");
+
+            if (string.IsNullOrWhiteSpace(alias))
+                throw new ArgumentException("The alias of a join cannot be empty.", nameof(alias));
+
+            if (JoinInfo.IsValidAlias(alias) == false)
+                throw new ArgumentException($"'{alias}' cannot be the alias of a join: an alias is a name made of letters, digits and '_', and is not a keyword of RQL.", nameof(alias));
+
+            if (alias == JoinOuterAlias || alias == FromToken?.Alias)
+                throw new ArgumentException($"'{alias}' is the alias of the main query, a join needs an alias of its own.", nameof(alias));
+
+            for (var i = 0; i < Joins.Count - 1; i++)
+            {
+                if (Joins[i].Alias == alias)
+                    throw new ArgumentException($"'{alias}' is already the alias of another join.", nameof(alias));
+            }
+
+            Joins[Joins.Count - 1].Alias = alias;
+        }
+
+        /// <summary>The aliases of the joins in the order of the joins: the one that was named with JoinAlias, otherwise j, j1, j2... by position (skipping a name that the main query or another join uses).</summary>
+        private string[] GetJoinAliases(string outerAlias)
+        {
+            if (Joins == null)
+                return Array.Empty<string>();
+
+            var aliases = new string[Joins.Count];
+            var named = new HashSet<string>();
+            foreach (var join in Joins)
+            {
+                if (join.Alias != null)
+                    named.Add(join.Alias);
+            }
+
+            var aliasIndex = 0;
+            for (var i = 0; i < Joins.Count; i++)
+            {
+                var alias = Joins[i].Alias;
+                if (alias == null)
+                {
+                    // the alias of the main document comes from the user (the lambda parameter of a projection) and could be j, j1...
+                    alias = JoinAliasOf(aliasIndex++);
+                    while (alias == outerAlias || named.Contains(alias))
+                        alias = JoinAliasOf(aliasIndex++);
+
+                    if (HasMember(typeof(T), alias))
+                        throw new InvalidOperationException($"The default alias '{alias}' of the join #{i + 1} is also the name of a member of {typeof(T).Name}, so '{alias}.<field>' could mean a field of the main document or of the joined documents. Name the join with JoinAlias.");
+                }
+                else if (alias == outerAlias)
+                {
+                    throw new InvalidOperationException($"'{alias}' is the alias of the main query, a join needs an alias of its own.");
+                }
+
+                aliases[i] = alias;
+            }
+
+            return aliases;
+        }
+
+        private static bool HasMember(Type type, string name)
+        {
+            foreach (var property in type.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+            {
+                if (string.Equals(property.Name, name, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+
+            foreach (var field in type.GetFields(BindingFlags.Public | BindingFlags.Instance))
+            {
+                if (string.Equals(field.Name, name, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private void BuildJoin(StringBuilder writer, string outerAlias)
+        {
+            if (Joins == null)
+                return;
+
+            var aliases = GetJoinAliases(outerAlias);
+            for (var i = 0; i < Joins.Count; i++)
+            {
+                var alias = aliases[i];
+                writer.Append(Joins[i].IsLeft ? " left join (" : " join (").Append(Joins[i].SourceQuery).Append(") as ").Append(alias).Append(" on ");
+
+                // the id of the main document is not a field of it
+                if (Joins[i].OuterKeyField == Constants.Documents.Indexing.Fields.DocumentIdFieldName)
+                    writer.Append("id(").Append(outerAlias).Append(')');
+                else
+                    writer.Append(outerAlias).Append('.').Append(Joins[i].OuterKeyField);
+
+                writer.Append(" = ");
+
+                if (Joins[i].JoinedField == null)
+                    writer.Append("id(").Append(alias).Append(')');
+                else
+                    writer.Append(alias).Append('.').Append(Joins[i].JoinedField);
+
+                if (Joins[i].BoostParameter != null)
+                    writer.Append(" boost $").Append(Joins[i].BoostParameter);
+            }
+        }
+
         public IndexQuery GetIndexQuery()
         {
             var serverVersion = TheSession?.RequestExecutor?.LastServerVersion;
@@ -437,6 +695,19 @@ namespace Raven.Client.Documents.Session
             IsGroupBy = true;
 
             SelectTokens.AddLast(GroupByCountToken.Create(projectedName));
+        }
+
+        /// <inheritdoc cref="IDocumentQueryBase{T, TSelf}.WhereMatches"/>
+        public void WhereMatches(string joinAlias)
+        {
+            if (string.IsNullOrWhiteSpace(joinAlias))
+                throw new ArgumentException("The alias of the join cannot be empty.", nameof(joinAlias));
+
+            var tokens = GetCurrentWhereTokens();
+            AppendOperatorIfNeeded(tokens);
+            NegateIfNeeded(tokens, null);
+
+            tokens.AddLast(MatchesToken.Create(joinAlias));
         }
 
         public void WhereTrue()
@@ -1344,7 +1615,18 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
             tokens.AddLast(whereToken);
         }
 
+        private const string JoinOuterAlias = "__alias_join";
+
         private string ToString(bool compatibilityMode)
+        {
+            // a join needs an alias for the main document: the query is rendered with one, the tokens and the fields of the query stay as they are
+            if (Joins != null && QueryRaw == null && FromToken.Alias == null)
+                return Render(compatibilityMode, JoinOuterAlias, AddAliasToTokens(WhereTokens), AddAliasToTokens(OrderByTokens), AddAliasToTokens(FilterTokens));
+
+            return Render(compatibilityMode, FromToken?.Alias, WhereTokens, OrderByTokens, FilterTokens);
+        }
+
+        private string Render(bool compatibilityMode, string outerAlias, LinkedList<QueryToken> whereTokens, LinkedList<QueryToken> orderByTokens, LinkedList<QueryToken> filterTokens)
         {
             if (QueryRaw != null)
             {
@@ -1363,12 +1645,13 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
             var queryText = new StringBuilder();
 
             BuildDeclare(queryText);
-            BuildFrom(queryText);
+            BuildFrom(queryText, outerAlias);
+            BuildJoin(queryText, outerAlias);
             BuildGroupBy(queryText);
-            BuildWhere(queryText);
-            BuildOrderBy(queryText);
+            BuildWhere(queryText, whereTokens);
+            BuildOrderBy(queryText, orderByTokens);
             BuildLoad(queryText);
-            BuildFilter(queryText);
+            BuildFilter(queryText, filterTokens);
             BuildSelect(queryText);
             BuildInclude(queryText);
 
@@ -1693,9 +1976,9 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
             }
         }
 
-        private void BuildFrom(StringBuilder writer)
+        private void BuildFrom(StringBuilder writer, string outerAlias)
         {
-            FromToken.WriteTo(writer);
+            FromToken.WriteTo(writer, outerAlias);
         }
 
         private void BuildDeclare(StringBuilder writer)
@@ -1724,9 +2007,9 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
             }
         }
 
-        private void BuildWhere(StringBuilder writer)
+        private void BuildWhere(StringBuilder writer, LinkedList<QueryToken> whereTokens)
         {
-            if (WhereTokens.Count == 0)
+            if (whereTokens.Count == 0)
                 return;
 
             writer
@@ -1735,7 +2018,7 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
             if (IsIntersect)
                 writer.Append("intersect(");
 
-            var token = WhereTokens.First;
+            var token = whereTokens.First;
             while (token != null)
             {
                 DocumentQueryHelper.AddSpaceIfNeeded(token.Previous?.Value, token.Value, writer);
@@ -1769,15 +2052,15 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
             }
         }
 
-        private void BuildFilter(StringBuilder writer)
+        private void BuildFilter(StringBuilder writer, LinkedList<QueryToken> filterTokens)
         {
-            if (FilterTokens.Count == 0)
+            if (filterTokens.Count == 0)
                 return;
 
             writer
                 .Append(" filter ");
 
-            var token = FilterTokens.First;
+            var token = filterTokens.First;
             while (token != null)
             {
                 DocumentQueryHelper.AddSpaceIfNeeded(token.Previous?.Value, token.Value, writer);
@@ -1788,15 +2071,15 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
             }
         }
 
-        private void BuildOrderBy(StringBuilder writer)
+        private void BuildOrderBy(StringBuilder writer, LinkedList<QueryToken> orderByTokens)
         {
-            if (OrderByTokens.Count == 0)
+            if (orderByTokens.Count == 0)
                 return;
 
             writer
                 .Append(" order by ");
 
-            var token = OrderByTokens.First;
+            var token = orderByTokens.First;
             while (token != null)
             {
                 if (token.Previous != null)
@@ -2128,11 +2411,15 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
             if (string.IsNullOrEmpty(fromAlias))
                 throw new InvalidOperationException("Alias cannot be null or empty");
 
+            var joinAliases = GetJoinAliases(fromAlias);
             var current = tokens.First;
             while (current != null)
             {
                 switch (current.Value)
                 {
+                    case WhereToken w when JoinInfo.IsJoinField(w.FieldName, joinAliases):
+                    case OrderByToken o when o.IsJoinField(joinAliases):
+                        break;
                     case WhereToken w:
                         current.Value = w.AddAlias(fromAlias);
                         break;
@@ -2252,6 +2539,54 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
             TransformTypeCache.Put(typeof(Guid), TransformationMode.Value);
             TransformTypeCache.Put(typeof(TimeSpan), TransformationMode.Ticks);
             TransformTypeCache.Put(typeof(DateTimeOffset), TransformationMode.Dates);
+        }
+    }
+
+    internal sealed class JoinInfo
+    {
+        public readonly string SourceQuery;
+        public readonly string OuterKeyField;
+        public readonly string JoinedField;
+        public readonly bool IsLeft;
+        public readonly string BoostParameter;
+        public string Alias;
+
+        public static bool IsValidAlias(string alias)
+        {
+            if (string.IsNullOrEmpty(alias) || (char.IsLetter(alias[0]) == false && alias[0] != '_') || QueryToken.IsKeyword(alias))
+                return false;
+
+            foreach (var c in alias)
+            {
+                if (char.IsLetterOrDigit(c) == false && c != '_')
+                    return false;
+            }
+
+            return true;
+        }
+
+        // a field written as <alias>.<field>, where the alias is the one of a join, belongs to the joined documents and not to the main document
+        public static bool IsJoinField(string fieldName, string[] joinAliases)
+        {
+            if (fieldName == null)
+                return false;
+
+            foreach (var alias in joinAliases)
+            {
+                if (fieldName.Length > alias.Length && fieldName[alias.Length] == '.' && fieldName.StartsWith(alias, StringComparison.Ordinal))
+                    return true;
+            }
+
+            return false;
+        }
+
+        public JoinInfo(string sourceQuery, string outerKeyField, string joinedField, bool isLeft, string boostParameter)
+        {
+            SourceQuery = sourceQuery;
+            OuterKeyField = outerKeyField;
+            JoinedField = joinedField;
+            IsLeft = isLeft;
+            BoostParameter = boostParameter;
         }
     }
 }

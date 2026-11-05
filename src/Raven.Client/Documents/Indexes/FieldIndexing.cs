@@ -26,7 +26,13 @@ namespace Raven.Client.Documents.Indexes
         /// <summary>
         /// Index this field using the default internal analyzer: LowerCaseKeywordAnalyzer
         /// </summary>
-        Default
+        Default,
+
+        /// <summary>
+        /// Index the field as a document id or a reference to one: every value is a single lowercased term (arrays: one term per element).
+        /// Joins and queries on ids match it without further checks. Not supported with an Analyzer, Suggestions, TermVector, Spatial or Vector options, nor by Lucene.
+        /// </summary>
+        Key
     }
 
     [Flags]

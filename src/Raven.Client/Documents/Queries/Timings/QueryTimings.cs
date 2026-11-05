@@ -22,6 +22,11 @@ namespace Raven.Client.Documents.Queries.Timings
         ///     Query timings for each part of query.
         /// </summary>
         public IDictionary<string, QueryTimings> Timings { get; set; }
+
+        /// <summary>
+        ///     Counters reported by this part of the query, for example how many entries a join scanned or how much memory it allocated.
+        /// </summary>
+        public IDictionary<string, long> Counters { get; set; }
         
         [JsonIgnore]
         public IDynamicJson QueryPlan { get; set; }
@@ -39,6 +44,7 @@ namespace Raven.Client.Documents.Queries.Timings
             
             DurationInMs = timings.DurationInMs;
             Timings = timings.Timings;
+            Counters = timings.Counters;
         }
 
         internal QueryTimings Clone()
@@ -61,6 +67,7 @@ namespace Raven.Client.Documents.Queries.Timings
             {
                 DurationInMs = DurationInMs,
                 Timings = timings,
+                Counters = Counters == null ? null : new SortedDictionary<string, long>(Counters),
                 QueryPlan = queryPlanCloned
             };
         }
@@ -69,12 +76,14 @@ namespace Raven.Client.Documents.Queries.Timings
         {
             DurationInMs = 0;
             Timings = null;
+            Counters = null;
 
             if (queryResult.Timings == null)
                 return;
 
             DurationInMs = queryResult.Timings.DurationInMs;
             Timings = queryResult.Timings.Timings;
+            Counters = queryResult.Timings.Counters;
             QueryPlan = queryResult.Timings.QueryPlan;
         }
 
@@ -86,7 +95,19 @@ namespace Raven.Client.Documents.Queries.Timings
                 [nameof(Timings)] = InnerToJson(Timings)
             };
 
+            if (Counters is { Count: > 0 })
+                djv[nameof(Counters)] = CountersToJson(Counters);
+
             return djv;
+
+            static DynamicJsonValue CountersToJson(IDictionary<string, long> counters)
+            {
+                var json = new DynamicJsonValue();
+                foreach (var kvp in counters)
+                    json[kvp.Key] = kvp.Value;
+
+                return json;
+            }
 
             DynamicJsonValue InnerToJson(IDictionary<string, QueryTimings> queryTimings)
             {
@@ -100,6 +121,8 @@ namespace Raven.Client.Documents.Queries.Timings
                         [nameof(DurationInMs)] = kvp.Value.DurationInMs
                     };
                     innerJson[nameof(Timings)] = InnerToJson(kvp.Value.Timings);
+                    if (kvp.Value.Counters is { Count: > 0 })
+                        innerJson[nameof(Counters)] = CountersToJson(kvp.Value.Counters);
                     json[kvp.Key] = innerJson;
                 }
 

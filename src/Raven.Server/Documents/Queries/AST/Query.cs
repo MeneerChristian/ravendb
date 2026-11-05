@@ -12,6 +12,18 @@ namespace Raven.Server.Documents.Queries.AST
         public QueryExpression Where;
         public QueryExpression Filter;
         public FromClause From;
+        public List<JoinClause> Joins;
+        // All the joins in the order they were written, with the chains still flat
+        public List<JoinClause> JoinChain;
+
+        // The joins of the main document before matches() of a chained alias expanded them
+        public List<JoinClause> JoinRoots;
+
+        // Some join joins on a field of another joined document
+        public bool HasJoinChain;
+
+        // The joins were validated and the alias conditions of the where clause were turned into joins
+        public bool JoinsValidated;
         public List<(QueryExpression Expression, StringSegment? Alias)> Select;
         public List<(QueryExpression Expression, StringSegment? Alias)> Load;
         public List<QueryExpression> Include;
@@ -60,6 +72,82 @@ namespace Raven.Server.Documents.Queries.AST
 
             return DeclaredFunctions.TryAdd(func.Name, func);
         }
+    }
+
+    // JOIN AS alias ON outerField = id(alias) or outerField = alias.field
+    public sealed class JoinClause
+    {
+        public Query Query;
+        public StringSegment Alias;
+
+        public BinaryExpression On;
+
+        // Null when the joined documents are matched by id (ON outerField = id(alias))
+        public string InnerField;
+
+        // ON a.A = u.A AND a.B = u.B: the equalities after the first one
+        public List<JoinKeyPair> MoreOn;
+
+        public bool IsComposite => MoreOn is { Count: > 0 };
+
+        // Every equality of the ON clause, the first one first
+        public IEnumerable<JoinKeyPair> Pairs
+        {
+            get
+            {
+                yield return new JoinKeyPair { On = On, InnerField = InnerField };
+                foreach (var more in MoreOn ?? [])
+                    yield return more;
+            }
+        }
+
+        // The fields of the joined document are selected
+        public bool ProjectsDocument;
+
+        // The where clause refers to this join with matches(alias)
+        public bool ReferencedInWhere;
+
+        // For a join that stands for matches(alias) of a chained alias
+        public StringSegment? RootAlias;
+
+        // LEFT JOIN: the join scores the rows and filters them only when the where clause refers to it (see Filters)
+        public bool IsLeft;
+
+        // BOOST n: the score of the joined documents is multiplied by this number before it is added to the score of the main query
+        public ValueExpression Boost;
+
+        // The join takes part in the boolean logic of the where clause, or is an inner join
+        public bool Filters => IsLeft == false || ReferencedInWhere;
+
+        // Set on the virtual join that stands for a comparison between fields of different documents
+        public JoinCompare Compare;
+
+        public JoinClause ShallowCopy() => (JoinClause)MemberwiseClone();
+    }
+
+    public sealed class JoinKeyPair
+    {
+        // outerField = alias.field, the field of the main document is on the left
+        public BinaryExpression On;
+
+        public string InnerField;
+    }
+
+    // A comparison of two fields that belong to different documents
+    public sealed class JoinCompare
+    {
+        public OperatorType Operator;
+        public JoinCompareOperand Left;
+        public JoinCompareOperand Right;
+    }
+
+    public sealed class JoinCompareOperand
+    {
+        // The aliases from the root join down to the alias the field belongs to
+        public List<string> Path;
+
+        // The field as written, without the alias of the joined document
+        public FieldExpression Field;
     }
 
     public sealed class DeclaredFunction

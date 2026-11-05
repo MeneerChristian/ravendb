@@ -56,6 +56,392 @@ namespace Raven.Server.Documents.Queries
         {
         }
 
+        private static void AssertJoinsAreOnIndexes(Query query, BlittableJsonReaderObject parameters)
+        {
+            if (query.Joins == null)
+                return;
+
+            if (query.From.Index == false)
+                throw new InvalidQueryException("JOIN is supported only for queries on an index (FROM INDEX '...'), not for collection queries or subscriptions.", query.QueryText, parameters);
+
+            foreach (var join in query.Joins)
+            {
+                if (join.Query.From.Index == false)
+                    throw new InvalidQueryException($"The JOIN sub-query of '{join.Alias}' must query an index (FROM INDEX '...')", query.QueryText, parameters);
+
+                AssertJoinsAreOnIndexes(join.Query, parameters);
+            }
+        }
+
+        private static void ValidateAndMarkJoinMatches(Query query, BlittableJsonReaderObject parameters, bool isSubQuery)
+        {
+            // the where clause of the main query is rewritten below
+            if (isSubQuery == false)
+            {
+                if (query.JoinsValidated)
+                    return;
+
+                query.JoinsValidated = true;
+            }
+
+            if (query.Joins != null)
+            {
+                foreach (var join in query.Joins)
+                    ValidateAndMarkJoinMatches(join.Query, parameters, isSubQuery: true);
+            }
+
+            if (isSubQuery == false)
+            {
+                AssertNoMoreLikeThisInJoins(query, parameters);
+                JoinAliasConditions.RejectFilterOnAliases(query, parameters);
+            }
+
+            if (query.Where == null)
+                return;
+
+            WalkWhere(query.Where, negated: false);
+
+            if (isSubQuery == false)
+            {
+                JoinAliasConditions.Apply(query, parameters);
+                AssertNoMoreLikeThisInJoins(query, parameters); // a condition on the fields of an alias moves into the sub-query of that alias
+            }
+
+            if (isSubQuery == false && query.HasJoinChain)
+                ExpandChainedMatches(query, parameters);
+
+            void WalkWhere(QueryExpression expression, bool negated)
+            {
+                switch (expression)
+                {
+                    case BinaryExpression { Operator: OperatorType.And or OperatorType.Or } logical:
+                        WalkWhere(logical.Left, negated);
+                        WalkWhere(logical.Right, negated);
+                        return;
+                    case NegatedExpression not:
+                        WalkWhere(not.Expression, negated: true);
+                        return;
+                    case MethodExpression method when QueryMethod.GetMethodType(method.Name.Value, throwIfNoMatch: false) == MethodType.Matches:
+                        MarkMatches(method, negated);
+                        return;
+                    default:
+                        // any other node may not contain matches()
+                        if (ContainsMatches(expression))
+                            throw new InvalidQueryException($"matches() can only be combined with 'and' and 'or' in the where clause, it cannot be used inside '{expression}'.", query.QueryText, parameters);
+                        return;
+                }
+            }
+
+            void MarkMatches(MethodExpression method, bool negated)
+            {
+                var alias = method.Arguments is [FieldExpression { Compound.Count: 1 } single] ? single.Compound[0] : (StringSegment?)null;
+                if (alias == null)
+                    throw new InvalidQueryException($"matches() expects the alias of a JOIN, for example matches(u), but got '{method}'.", query.QueryText, parameters);
+
+                if (isSubQuery)
+                    throw new InvalidQueryException($"matches({alias.Value}) cannot be used in the where clause of a JOIN sub-query, matches() is supported only in the where clause of the main query.", query.QueryText, parameters);
+
+                var found = FindJoin(query.JoinChain ?? query.Joins, alias.Value);
+                if (found == null)
+                    throw new InvalidQueryException($"matches({alias.Value}) refers to '{alias.Value}', which is not the alias of a JOIN of this query.", query.QueryText, parameters);
+
+                found.ReferencedInWhere = true;
+            }
+
+            static bool ContainsMatches(QueryExpression expression)
+            {
+                switch (expression)
+                {
+                    case MethodExpression method:
+                        if (QueryMethod.GetMethodType(method.Name.Value, throwIfNoMatch: false) == MethodType.Matches)
+                            return true;
+                        foreach (var argument in method.Arguments)
+                        {
+                            if (ContainsMatches(argument))
+                                return true;
+                        }
+
+                        return false;
+                    case BinaryExpression binary:
+                        return ContainsMatches(binary.Left) || ContainsMatches(binary.Right);
+                    case NegatedExpression not:
+                        return ContainsMatches(not.Expression);
+                    case InExpression @in:
+                        return ContainsMatches(@in.Source);
+                    case BetweenExpression between:
+                        return ContainsMatches(between.Source);
+                    default:
+                        return false;
+                }
+            }
+        }
+
+        // The morelikethis() of a query compares with a document of the main index
+        private static void AssertNoMoreLikeThisInJoins(Query query, BlittableJsonReaderObject parameters)
+        {
+            foreach (var join in query.Joins ?? [])
+            {
+                if (join.Query.Where != null && ContainsMoreLikeThis(join.Query.Where))
+                    throw new InvalidQueryException($"morelikethis() is not supported in the JOIN sub-query of '{join.Alias}' (or on the fields of that alias): the document to compare with is a document of the main index. " +
+                                                    "Use morelikethis() in the where clause of the main query.", query.QueryText, parameters);
+
+                AssertNoMoreLikeThisInJoins(join.Query, parameters);
+            }
+
+            static bool ContainsMoreLikeThis(QueryExpression expression)
+            {
+                switch (expression)
+                {
+                    case MethodExpression method:
+                        if (QueryMethod.GetMethodType(method.Name.Value, throwIfNoMatch: false) == MethodType.MoreLikeThis)
+                            return true;
+                        foreach (var argument in method.Arguments)
+                        {
+                            if (ContainsMoreLikeThis(argument))
+                                return true;
+                        }
+
+                        return false;
+                    case BinaryExpression binary:
+                        return ContainsMoreLikeThis(binary.Left) || ContainsMoreLikeThis(binary.Right);
+                    case NegatedExpression not:
+                        return ContainsMoreLikeThis(not.Expression);
+                    default:
+                        return false;
+                }
+            }
+        }
+
+        private static JoinClause FindJoin(List<JoinClause> joins, StringSegment alias)
+        {
+            if (joins != null)
+            {
+                foreach (var join in joins)
+                {
+                    if (join.Alias == alias)
+                        return join;
+                }
+            }
+
+            return null;
+        }
+
+        private static bool Contains(JoinClause node, JoinClause target)
+        {
+            if (node == target)
+                return true;
+
+            foreach (var child in node.Query.Joins ?? [])
+            {
+                if (Contains(child, target))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static bool IsReferenced(JoinClause node) => node.ReferencedInWhere || HasReferencedBelow(node);
+
+        private static bool HasReferencedBelow(JoinClause node)
+        {
+            foreach (var child in node.Query.Joins ?? [])
+            {
+                if (IsReferenced(child))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static void ExpandChainedMatches(Query query, BlittableJsonReaderObject parameters)
+        {
+            if (query.JoinRoots != null)
+                return;
+
+            var expanded = new List<JoinClause>();
+            var changed = false;
+            foreach (var root in query.Joins)
+            {
+                if (HasReferencedBelow(root) == false)
+                {
+                    expanded.Add(root);
+                    continue;
+                }
+
+                changed = true;
+                AddVariants(root, root, expanded, fieldJoin: null);
+            }
+
+            if (changed == false)
+                return;
+
+            query.JoinRoots = query.Joins;
+            query.Joins = expanded;
+
+            void AddVariants(JoinClause root, JoinClause node, List<JoinClause> into, JoinClause fieldJoin)
+            {
+                fieldJoin ??= node.InnerField != null ? node : null;
+                if (node.ReferencedInWhere)
+                {
+                    if (fieldJoin != null)
+                        throw new InvalidQueryException($"matches({JoinAliasConditions.DisplayAlias(node.Alias)}) is not supported in a chain of joins when '{JoinAliasConditions.DisplayAlias(fieldJoin.Alias)}' joins on a field instead of on the id (id(alias)).", query.QueryText, parameters);
+
+                    var variant = root.ShallowCopy();
+                    variant.Alias = node.Alias;
+                    variant.RootAlias = root.Alias;
+                    variant.ReferencedInWhere = true;
+                    variant.IsLeft = false;
+                    variant.Query = CutToPath(root.Query, node);
+                    into.Add(variant);
+                }
+
+                foreach (var child in node.Query.Joins ?? [])
+                    AddVariants(root, child, into, fieldJoin);
+            }
+        }
+
+        private static Query CutToPath(Query subQuery, JoinClause target)
+        {
+            var cut = subQuery.ShallowCopy();
+            List<JoinClause> kept = null;
+            foreach (var child in subQuery.Joins ?? [])
+            {
+                JoinClause join;
+                if (Contains(child, target))
+                {
+                    join = child.ShallowCopy();
+                    join.ReferencedInWhere = false;
+                    join.IsLeft = false;
+                    join.Query = CutToPath(child.Query, target);
+                }
+                else if (IsReferenced(child) == false)
+                    join = child;
+                else
+                    continue;
+
+                (kept ??= []).Add(join);
+            }
+
+            cut.Joins = kept;
+            return cut;
+        }
+
+        private static void AddImplicitJoinLoad(Query query, BlittableJsonReaderObject parameters)
+        {
+            var chain = query.JoinChain ?? query.Joins;
+            if (chain == null)
+                return;
+
+            var used = new HashSet<StringSegment>();
+            foreach (var join in chain)
+            {
+                var isUsed = query.SelectFunctionBody.FunctionText != null && ContainsIdentifier(query.SelectFunctionBody.FunctionText, join.Alias.Value);
+                if (isUsed == false && query.Select != null)
+                {
+                    foreach (var (expression, _) in query.Select)
+                    {
+                        if (UsesAlias(expression, join.Alias))
+                        {
+                            isUsed = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (isUsed)
+                    used.Add(join.Alias);
+            }
+
+            // the document a selected alias is joined through has to be loaded as well, since the alias is loaded by one of its fields
+            for (var i = chain.Count - 1; i >= 0; i--)
+            {
+                if (used.Contains(chain[i].Alias) && ParentAlias(chain, chain[i]) is { } parent)
+                    used.Add(parent);
+            }
+
+            foreach (var join in chain)
+            {
+                if (used.Contains(join.Alias) == false)
+                    continue;
+
+                // a join on a field can match several documents
+                join.ProjectsDocument = true;
+
+                // the documents of this join are not loaded by a field of the main document: they are the ones whose field holds its id, an array like the alias of 'load field as alias[]'
+                if (join.On.Left is MethodExpression)
+                {
+                    if (chain.Any(other => other != join && ParentAlias(chain, other) == join.Alias))
+                        throw new InvalidQueryException($"The alias '{join.Alias}' cannot be used to join other documents, because the JOIN with '{join.Alias}' matches the id of the main document against a field ({join.On}): " +
+                                                        $"it stands for the array of the documents whose field holds the id of the row.", query.QueryText, parameters);
+
+                    if (query.Load != null && query.Load.Any(x => x.Alias != null && x.Alias.Value.AsSpan().TrimEnd("[]").SequenceEqual(join.Alias.Value)))
+                        continue;
+
+                    (query.Load ??= new List<(QueryExpression Expression, StringSegment? Alias)>()).Add((join.On.Left, new StringSegment(join.Alias.Value + "[]")));
+                    continue;
+                }
+
+                if (query.Load != null && query.Load.Any(x => x.Alias != null && x.Alias.Value.AsSpan().TrimEnd("[]").SequenceEqual(join.Alias.Value)))
+                    continue; // already loaded explicitly
+
+                query.Load ??= new List<(QueryExpression Expression, StringSegment? Alias)>();
+                query.Load.Add((join.On.Left, join.Alias));
+            }
+
+            // the alias as an identifier of the function: 'm' is not in 'Name', and g.m is a property of g, not the alias
+            static bool ContainsIdentifier(string text, string identifier)
+            {
+                var start = 0;
+                while ((start = text.IndexOf(identifier, start, StringComparison.Ordinal)) != -1)
+                {
+                    var end = start + identifier.Length;
+                    var before = start == 0 ? ' ' : text[start - 1];
+                    var after = end == text.Length ? ' ' : text[end];
+                    if (IsIdentifierChar(before) == false && before != '.' && IsIdentifierChar(after) == false)
+                        return true;
+
+                    start = end;
+                }
+
+                return false;
+            }
+
+            static bool IsIdentifierChar(char c) => char.IsLetterOrDigit(c) || c == '_' || c == '$';
+
+            static StringSegment? ParentAlias(List<JoinClause> chain, JoinClause join)
+            {
+                if (join.On.Left is not FieldExpression { Compound.Count: > 1 } left)
+                    return null;
+
+                foreach (var other in chain)
+                {
+                    if (other != join && other.Alias == left.Compound[0])
+                        return other.Alias;
+                }
+
+                return null;
+            }
+
+            static bool UsesAlias(QueryExpression expression, StringSegment alias)
+            {
+                switch (expression)
+                {
+                    case FieldExpression field:
+                        return field.Compound.Count > 0 && field.Compound[0] == alias;
+                    case MethodExpression method:
+                        foreach (var argument in method.Arguments)
+                        {
+                            if (UsesAlias(argument, alias))
+                                return true;
+                        }
+
+                        return false;
+                    default:
+                        return false;
+                }
+            }
+        }
+
         internal static Query ParseQuery(string q, QueryType queryType)
         {
             var qp = new QueryParser();
@@ -69,6 +455,10 @@ namespace Raven.Server.Documents.Queries
             AddSpatialProperties = addSpatialProperties;
 
             Query = query;
+
+            AssertJoinsAreOnIndexes(query, parameters);
+            AddImplicitJoinLoad(query, parameters);
+            ValidateAndMarkJoinMatches(query, parameters, isSubQuery: false);
 
             QueryText = Query.QueryText;
 
@@ -124,6 +514,9 @@ function __actual_func(args) {
             {
                 foreach (var (expr, alias) in query.Load)
                 {
+                    if (expr is MethodExpression method && IsMainIdJoinLoad(method))
+                        continue;
+
                     stringBuilder.Append("  var ").Append(alias.Value.Value).Append(" = load(");
                     queryVisitor.VisitExpression(expr);
                     stringBuilder.AppendLine(");");
@@ -425,9 +818,20 @@ function execute(doc, args){
                 for (var i = 0; i < Query.OrderBy.Count; i++)
                 {
                     var order = Query.OrderBy[i];
+                    if (order.Expression is MethodExpression { Arguments: [FieldExpression { Compound.Count: 1 } joinedArgument] } && IsJoinAlias(joinedArgument.Compound[0]))
+                    {
+                        throw new InvalidQueryException($"ORDER BY {order.Expression} is not supported: only the fields of a joined index can be used in ORDER BY (ORDER BY {joinedArgument.Compound[0]}.Field).",
+                            QueryText, parameters);
+                    }
+
                     if (order.Expression is MethodExpression me)
                     {
                         OrderBy[i] = ExtractOrderByFromMethod(me, fromAlias, order.FieldType, order.Ascending, parameters, order.NullsOrdering);
+                    }
+                    else if (order.Expression is FieldExpression { Compound.Count: > 1 } joined && JoinAliasOf(joined, parameters) is { } joinAlias)
+                    {
+                        OrderBy[i] = new OrderByField(new QueryFieldName(joined.FieldValueWithoutAlias, joined.IsQuoted), order.FieldType, order.Ascending,
+                            nullsOrdering: order.NullsOrdering, joinAlias: joinAlias);
                     }
                     else if (order.Expression is FieldExpression fe)
                     {
@@ -448,6 +852,42 @@ function execute(doc, args){
 
             if (Query.DeclaredFunctions != null)
                 HandleDeclaredFunctions();
+        }
+
+        private string JoinAliasOf(FieldExpression field, BlittableJsonReaderObject parameters)
+        {
+            var chain = Query.JoinChain ?? Query.Joins;
+            if (chain == null || field.Compound[0] == Query.From.Alias)
+                return null;
+
+            foreach (var join in chain)
+            {
+                if (join.Alias != field.Compound[0])
+                    continue;
+
+                var roots = Query.JoinRoots ?? Query.Joins;
+                if (roots.Any(x => x.Alias == join.Alias) == false)
+                    throw new InvalidQueryException($"ORDER BY {field} is not supported: '{join.Alias}' is joined through another joined document (a chain of joins), " +
+                                                    "only the joins of the main document can be used in ORDER BY.", QueryText, parameters);
+
+                if (Query.Joins.Any(x => x.Alias == join.Alias) == false)
+                    throw new InvalidQueryException($"ORDER BY {field} cannot be combined with matches() of a joined document in the same chain of joins.", QueryText, parameters);
+
+                return join.Alias.Value;
+            }
+
+            return null;
+        }
+
+        private bool IsJoinAlias(StringSegment alias)
+        {
+            foreach (var join in Query.JoinChain ?? Query.Joins ?? [])
+            {
+                if (join.Alias == alias)
+                    return true;
+            }
+
+            return false;
         }
 
         private void HandleDeclaredFunctions()
@@ -1049,6 +1489,25 @@ function execute(doc, args){
                 parameters);
         }
 
+        // The path of the alias of a JOIN ON id(main) = alias.field: the joined documents of a row are looked up by its id, no field of the main document holds them
+        internal const string MainIdJoinPathPrefix = "id():";
+
+        internal static bool TryGetMainIdJoinAlias(string path, out string alias)
+        {
+            if (path != null && path.StartsWith(MainIdJoinPathPrefix, StringComparison.Ordinal))
+            {
+                alias = path.Substring(MainIdJoinPathPrefix.Length);
+                return true;
+            }
+
+            alias = null;
+            return false;
+        }
+
+        // The implicit load that AddImplicitJoinLoad adds is the id() expression of the ON clause itself
+        private bool IsMainIdJoinLoad(MethodExpression expression)
+            => (Query.JoinChain ?? Query.Joins)?.Any(join => ReferenceEquals(join.On.Left, expression)) == true;
+
         public static (string Path, string LoadFromAlias) ParseExpressionPath(QueryExpression expr, string path, StringSegment? alias)
         {
             var indexOf = path.IndexOf('.');
@@ -1085,6 +1544,10 @@ function execute(doc, args){
                 {
                     path = fe.FieldValue;
                     quoted = fe.IsQuoted;
+                }
+                else if (load.Expression is MethodExpression idOfMain && IsMainIdJoinLoad(idOfMain))
+                {
+                    path = MainIdJoinPathPrefix + alias.Value.AsSpan().TrimEnd("[]").ToString();
                 }
                 else if (load.Expression is ValueExpression ve)
                 {
@@ -1488,6 +1951,10 @@ function execute(doc, args){
                             {
                                 if (RootAliasPaths.ContainsKey(argumentExpression.FieldValue) == false)
                                     ThrowUnknownAlias(argumentExpression.FieldValue, parameters);
+                                // the joined document itself is the argument (the alias is loaded by the join field), not its id
+                                if (IsJoinAlias(argumentExpression.Compound[0]))
+                                    return SelectField.CreateMethodCall("id", alias, new[] { GetSelectValue(null, argumentExpression, parameters) });
+
                                 return SelectField.CreateMethodCall("id", alias, new[] { SelectField.Create(QueryFieldName.DocumentId, argumentExpression.FieldValue) });
                             }
                         }
@@ -1712,6 +2179,7 @@ function execute(doc, args){
 
                 if (name == null && i == 0 && (argument is FieldExpression || argument is ValueExpression))
                 {
+                    AssertFacetFieldIsNotOfAJoin(argument, parameters);
                     name = ExtractFieldNameFromArgument(argument, withoutAlias: false, "facet", parameters, QueryText);
                     continue;
                 }
@@ -1763,6 +2231,7 @@ function execute(doc, args){
 
                 if (argument is BetweenExpression bee)
                 {
+                    AssertFacetFieldIsNotOfAJoin(bee.Source, parameters);
                     if (name == null)
                         name = new QueryFieldName(((FieldExpression)bee.Source).GetText(null), false);
 
@@ -1772,6 +2241,7 @@ function execute(doc, args){
 
                 if (argument is BinaryExpression be)
                 {
+                    AssertFacetFieldIsNotOfAJoin(be.Left, parameters);
                     if (name == null)
                         name = new QueryFieldName(ExtractFieldNameFromBinaryExpression(be), false);
 
@@ -1806,11 +2276,26 @@ function execute(doc, args){
             return result;
         }
 
+        // The facets are computed over the index entries of the main index that the JOIN keeps
+        private void AssertFacetFieldIsNotOfAJoin(QueryExpression field, BlittableJsonReaderObject parameters)
+        {
+            if (Query.Joins == null || field is not FieldExpression { Compound.Count: > 1 } fe)
+                return;
+
+            foreach (var join in Query.Joins)
+            {
+                if (join.Alias == fe.Compound[0])
+                    throw new InvalidQueryException($"Facets are computed over the fields of the main index, so '{fe.FieldValue}' (a field of the JOIN alias '{join.Alias}') cannot be used in a facet. " +
+                                                    "Facet a field of the main index; the JOIN filters the documents the facets are computed over.", QueryText, parameters);
+            }
+        }
+
         private void AddFacetAggregation(MethodExpression me, FacetField field, FacetAggregation aggregation, BlittableJsonReaderObject parameters)
         {
             if (me.Arguments.Count != 1)
                 ThrowInvalidNumberOfArgumentsOfFacetAggregation(aggregation, 1, me.Arguments.Count, parameters);
 
+            AssertFacetFieldIsNotOfAJoin(me.Arguments[0], parameters);
             var methodFieldName = ExtractFieldNameFromArgument(me.Arguments[0], withoutAlias: false, me.Name.Value, parameters, QueryText);
 
             try
@@ -1846,6 +2331,7 @@ function execute(doc, args){
                     name = new QueryFieldName(expressionField.FieldValueWithoutAlias, expressionField.IsQuoted);
                     hasSourceAlias = true;
                     array = sourceAlias.Array;
+                    loadFromAlias = sourceAlias.LoadFromAlias; // an alias that is loaded by a field of another loaded document
                 }
                 else if (RootAliasPaths.Count != 0)
                 {
@@ -2396,6 +2882,10 @@ function execute(doc, args){
                             _metadata.AddWhereField(fieldName, parameters, search: true, methodName: methodName.Value);
                         else
                             _metadata.AddWhereField(fieldName, parameters, exact: _insideExact > 0, methodName: methodName.Value);
+                        break;
+
+                    case MethodType.Matches:
+                        // validated (and the JOIN marked) by ValidateAndMarkJoinMatches
                         break;
 
                     case MethodType.When:

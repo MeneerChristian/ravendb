@@ -752,9 +752,79 @@ namespace Raven.Client.Documents.Session
         }
 
         /// <inheritdoc />
+        IAsyncDocumentQuery<T> IDocumentQueryBase<T, IAsyncDocumentQuery<T>>.JoinAlias(string alias)
+        {
+            JoinAlias(alias);
+            return this;
+        }
+
+        /// <inheritdoc />
+        IAsyncDocumentQuery<T> IDocumentQueryBase<T, IAsyncDocumentQuery<T>>.WhereMatches(string joinAlias)
+        {
+            WhereMatches(joinAlias);
+            return this;
+        }
+
+        /// <inheritdoc />
         IAsyncDocumentQuery<T> IDocumentQueryBase<T, IAsyncDocumentQuery<T>>.OrderByScore()
         {
             OrderByScore();
+            return this;
+        }
+
+        /// <inheritdoc />
+        IAsyncDocumentQuery<T> IDocumentQueryBase<T, IAsyncDocumentQuery<T>>.Join<TSource>(IDocumentQuery<TSource> source, string outerKeyField, bool left, double? boost)
+        {
+            Join((source ?? throw new ArgumentNullException(nameof(source))).GetIndexQuery(), outerKeyField, left, boost);
+            return this;
+        }
+
+        /// <inheritdoc />
+        IAsyncDocumentQuery<T> IDocumentQueryBase<T, IAsyncDocumentQuery<T>>.Join<TSource>(IDocumentQuery<TSource> source, Expression<Func<T, object>> outerKey, bool left, double? boost)
+        {
+            Join((source ?? throw new ArgumentNullException(nameof(source))).GetIndexQuery(), GetMemberQueryPath(outerKey), left, boost);
+            return this;
+        }
+
+        /// <inheritdoc />
+        IAsyncDocumentQuery<T> IDocumentQueryBase<T, IAsyncDocumentQuery<T>>.Join<TSource>(IAsyncDocumentQuery<TSource> source, string outerKeyField, bool left, double? boost)
+        {
+            Join((source ?? throw new ArgumentNullException(nameof(source))).GetIndexQuery(), outerKeyField, left, boost);
+            return this;
+        }
+
+        /// <inheritdoc />
+        IAsyncDocumentQuery<T> IDocumentQueryBase<T, IAsyncDocumentQuery<T>>.Join<TSource>(IAsyncDocumentQuery<TSource> source, Expression<Func<T, object>> outerKey, bool left, double? boost)
+        {
+            Join((source ?? throw new ArgumentNullException(nameof(source))).GetIndexQuery(), GetMemberQueryPath(outerKey), left, boost);
+            return this;
+        }
+
+        /// <inheritdoc />
+        IAsyncDocumentQuery<T> IDocumentQueryBase<T, IAsyncDocumentQuery<T>>.Join<TSource>(IDocumentQuery<TSource> source, Expression<Func<T, object>> outerKey, Expression<Func<TSource, object>> joinedKey, bool left, double? boost)
+        {
+            Join((source ?? throw new ArgumentNullException(nameof(source))).GetIndexQuery(), GetMemberQueryPath(outerKey), JoinedFieldPath.Get(Conventions, joinedKey), left, boost);
+            return this;
+        }
+
+        /// <inheritdoc />
+        IAsyncDocumentQuery<T> IDocumentQueryBase<T, IAsyncDocumentQuery<T>>.Join<TSource>(IDocumentQuery<TSource> source, string outerKeyField, string joinedField, bool left, double? boost)
+        {
+            Join((source ?? throw new ArgumentNullException(nameof(source))).GetIndexQuery(), outerKeyField, joinedField, left, boost);
+            return this;
+        }
+
+        /// <inheritdoc />
+        IAsyncDocumentQuery<T> IDocumentQueryBase<T, IAsyncDocumentQuery<T>>.Join<TSource>(IAsyncDocumentQuery<TSource> source, Expression<Func<T, object>> outerKey, Expression<Func<TSource, object>> joinedKey, bool left, double? boost)
+        {
+            Join((source ?? throw new ArgumentNullException(nameof(source))).GetIndexQuery(), GetMemberQueryPath(outerKey), JoinedFieldPath.Get(Conventions, joinedKey), left, boost);
+            return this;
+        }
+
+        /// <inheritdoc />
+        IAsyncDocumentQuery<T> IDocumentQueryBase<T, IAsyncDocumentQuery<T>>.Join<TSource>(IAsyncDocumentQuery<TSource> source, string outerKeyField, string joinedField, bool left, double? boost)
+        {
+            Join((source ?? throw new ArgumentNullException(nameof(source))).GetIndexQuery(), outerKeyField, joinedField, left, boost);
             return this;
         }
 
@@ -1171,6 +1241,7 @@ namespace Raven.Client.Documents.Session
                 queryData?.FromAlias,
                 queryData?.IsProjectInto)
             {
+                Joins = Joins == null ? null : new List<JoinInfo>(Joins),
                 PageSize = PageSize,
                 SelectTokens = new LinkedList<QueryToken>(SelectTokens),
                 FieldsToFetchToken = FieldsToFetchToken,

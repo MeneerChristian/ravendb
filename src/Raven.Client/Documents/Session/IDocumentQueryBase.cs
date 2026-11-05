@@ -697,6 +697,58 @@ If you really want to do in memory filtering on the data returned from the query
         TSelf OrderByScoreDescending();
 
         /// <summary>
+        ///     Joins this query with another index query: only documents whose <paramref name="outerKeyField"/> holds the id of
+        ///     a document matched by <paramref name="source"/> are returned, and the score of that match is added to the score
+        ///     of the document (use <see cref="OrderByScore"/> to sort by the combined score, best match first).
+        ///     The source query is executed first, must be a query on an index. Every document it matches counts.
+        /// </summary>
+        /// <param name="source">The query that produces the ids (and scores) to join on.</param>
+        /// <param name="outerKeyField">The field of this query that holds the id of the document matched by <paramref name="source"/>.</param>
+        /// <param name="left">A left join: documents without a match are kept too (with their own score), instead of being filtered out.</param>
+        /// <param name="boost">Factor applied to the score of the match before it is added to the score of the document (0: the join only fetches data, does not change the score). Sent as a query parameter. Default: 1.</param>
+        TSelf Join<TSource>(IDocumentQuery<TSource> source, string outerKeyField, bool left = false, double? boost = null);
+
+        /// <inheritdoc cref="Join{TSource}(IDocumentQuery{TSource}, string, bool, double?)"/>
+        TSelf Join<TSource>(IDocumentQuery<TSource> source, Expression<Func<T, object>> outerKey, bool left = false, double? boost = null);
+
+        /// <inheritdoc cref="Join{TSource}(IDocumentQuery{TSource}, string, bool, double?)"/>
+        TSelf Join<TSource>(IAsyncDocumentQuery<TSource> source, string outerKeyField, bool left = false, double? boost = null);
+
+        /// <inheritdoc cref="Join{TSource}(IDocumentQuery{TSource}, string, bool, double?)"/>
+        TSelf Join<TSource>(IAsyncDocumentQuery<TSource> source, Expression<Func<T, object>> outerKey, bool left = false, double? boost = null);
+
+        /// <summary>
+        ///     Joins on a field of the joined documents instead of their id: documents whose <paramref name="outerKey"/> has the same value as the
+        ///     <paramref name="joinedKey"/> of a document matched by <paramref name="source"/> are kept, and the score of the best such document is added.
+        ///     Both fields have to be indexed (with the same analyzer). several joined documents can match, the best scoring one counts.
+        /// </summary>
+        TSelf Join<TSource>(IDocumentQuery<TSource> source, Expression<Func<T, object>> outerKey, Expression<Func<TSource, object>> joinedKey, bool left = false, double? boost = null);
+
+        /// <inheritdoc cref="Join{TSource}(IDocumentQuery{TSource}, Expression{Func{T, object}}, Expression{Func{TSource, object}}, bool, double?)"/>
+        TSelf Join<TSource>(IAsyncDocumentQuery<TSource> source, Expression<Func<T, object>> outerKey, Expression<Func<TSource, object>> joinedKey, bool left = false, double? boost = null);
+
+        /// <inheritdoc cref="Join{TSource}(IDocumentQuery{TSource}, Expression{Func{T, object}}, Expression{Func{TSource, object}}, bool, double?)"/>
+        TSelf Join<TSource>(IDocumentQuery<TSource> source, string outerKeyField, string joinedField, bool left = false, double? boost = null);
+
+        /// <inheritdoc cref="Join{TSource}(IDocumentQuery{TSource}, Expression{Func{T, object}}, Expression{Func{TSource, object}}, bool, double?)"/>
+        TSelf Join<TSource>(IAsyncDocumentQuery<TSource> source, string outerKeyField, string joinedField, bool left = false, double? boost = null);
+
+        /// <summary>
+        ///     Names the alias of the last <c>Join</c>, so that the query can refer to the fields of the joined documents with <c>"alias.Field"</c>:
+        ///     in <c>WhereEquals</c> and the other <c>Where</c> methods (with <c>AndAlso</c>, <c>OrElse</c>, <c>Not</c> and subclauses), in <c>OrderBy</c> and <c>OrderByDescending</c>
+        ///     (next to <c>OrderByScore</c>), and in <c>SelectFields</c>. Without a name, the joins are called <c>j</c>, <c>j1</c>, <c>j2</c>... in the order of the <c>Join</c> calls.
+        ///     A field name that starts with the alias of a join and a dot is a field of the joined documents.
+        /// </summary>
+        /// <param name="alias">A name made of letters, digits and '_' that is not used by another join or by the main query.</param>
+        TSelf JoinAlias(string alias);
+
+        /// <summary>
+        ///     <c>where matches(alias)</c>: the document is joined with a document that the source query of the join with that alias matched.
+        ///     It combines joins with <c>OrElse</c> (<c>WhereMatches("a").OrElse().WhereMatches("b")</c>), and can be combined with the other conditions of the query.
+        /// </summary>
+        TSelf WhereMatches(string joinAlias);
+
+        /// <summary>
         ///     Specifies a proximity distance between terms in the preceding Search clause,
         ///     making it return documents that contain searched terms separated by at
         ///     most that many other terms.

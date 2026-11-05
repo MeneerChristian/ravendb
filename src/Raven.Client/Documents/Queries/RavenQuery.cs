@@ -25,6 +25,18 @@ namespace Raven.Client.Documents.Queries
         }
 
         /// <summary>
+        /// <c>matches(alias)</c> of a join, in the <c>where</c> clause of a query written with the LINQ query syntax:
+        /// <c>from g in games join u in users on g.OwnerId equals u.Id where RavenQuery.Matches(u) || g.Country == "x" select g</c>.
+        /// True when the document is joined with a document that the source query of the join matched. This method is for server-side LINQ query translation only.
+        /// </summary>
+        /// <param name="joinedDocument">The range variable of the join.</param>
+        /// <exception cref="NotSupportedException">Thrown when called directly in client code.</exception>
+        public static bool Matches(object joinedDocument)
+        {
+            throw new NotSupportedException("This method is here for strongly type support of server side call during Linq queries and should never be directly called");
+        }
+
+        /// <summary>
         /// Gets the identifier of a document instance. This method is for server-side LINQ query translation only.
         /// </summary>
         /// <param name="documentInstance">The document instance.</param>

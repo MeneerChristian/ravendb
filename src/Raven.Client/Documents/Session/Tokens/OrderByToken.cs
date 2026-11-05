@@ -139,6 +139,8 @@ namespace Raven.Client.Documents.Session.Tokens
             }
         }
 
+        public bool IsJoinField(string[] joinAliases) => _isMethodField == false && JoinInfo.IsJoinField(_fieldName, joinAliases);
+
         public OrderByToken AddAlias(string alias)
         {
             if (_fieldName == Constants.Documents.Indexing.Fields.DocumentIdFieldName)

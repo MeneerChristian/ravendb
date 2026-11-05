@@ -20,6 +20,12 @@ namespace Raven.Server.Documents.Queries.AST
             if (q.From.From != null)
                 VisitFromClause(q.From.From, q.From.Alias, q.From.Filter, q.From.Index);
 
+            if (q.Joins != null)
+            {
+                foreach (var join in q.Joins)
+                    VisitJoinClause(join);
+            }
+
             if (q.GroupBy != null)
             {
                 VisitGroupByExpression(q.GroupBy);
@@ -129,6 +135,10 @@ namespace Raven.Server.Documents.Queries.AST
         public virtual void VisitSelectDistinct()
         {
 
+        }
+
+        public virtual void VisitJoinClause(JoinClause join)
+        {
         }
 
         public virtual void VisitLoad(List<(QueryExpression Expression, StringSegment? Alias)> load)

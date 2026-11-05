@@ -149,6 +149,9 @@ namespace Raven.Server.Documents.Queries
             if (string.Equals(methodName, "when", StringComparison.OrdinalIgnoreCase))
                 return MethodType.When;
             
+            if (string.Equals(methodName, "matches", StringComparison.OrdinalIgnoreCase))
+                return MethodType.Matches;
+
             if (throwIfNoMatch == false)
                 return MethodType.Unknown;
 

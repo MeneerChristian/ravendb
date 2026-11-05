@@ -16,7 +16,7 @@ namespace Raven.Client.Documents.Linq
     /// <summary>
     /// Implements <see cref="IRavenQueryable{T}"/>
     /// </summary>
-    public sealed class RavenQueryInspector<T> : IRavenQueryable<T>, IRavenQueryInspector, IAsyncEnumerable<T>
+    public sealed class RavenQueryInspector<T> : IRavenQueryable<T>, IRavenQueryInspector, IJoinSource, IAsyncEnumerable<T>
     {
         private Expression _expression;
         private IRavenQueryProvider _provider;
@@ -165,6 +165,8 @@ namespace Raven.Client.Documents.Linq
             var documentQuery = GetDocumentQuery();
             return documentQuery.ToString();
         }
+
+        IndexQuery IJoinSource.GetIndexQuery() => GetIndexQuery(_isAsync);
 
         public IndexQuery GetIndexQuery(bool isAsync = true)
         {

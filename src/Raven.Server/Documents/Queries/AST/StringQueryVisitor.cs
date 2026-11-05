@@ -389,6 +389,28 @@ namespace Raven.Server.Documents.Queries.AST
             }
         }
 
+        public override void VisitJoinClause(JoinClause join)
+        {
+            EnsureLine();
+            _sb.Append(join.IsLeft ? "LEFT JOIN (" : "JOIN (");
+            new StringQueryVisitor(_sb).Visit(join.Query);
+            _sb.Append(") AS ");
+            AppendStringSegment(join.Alias);
+            _sb.Append(" ON ");
+            VisitExpression(join.On);
+            foreach (var more in join.MoreOn ?? [])
+            {
+                _sb.Append(" AND ");
+                VisitExpression(more.On);
+            }
+
+            if (join.Boost != null)
+            {
+                _sb.Append(" BOOST ");
+                VisitExpression(join.Boost);
+            }
+        }
+
         private void AppendStringSegment(StringSegment stringSegment)
         {
             var quote = RequiresQuotes(stringSegment);

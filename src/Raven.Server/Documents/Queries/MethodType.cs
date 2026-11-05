@@ -63,6 +63,7 @@
 
         Now,
         Today,
-        When
+        When,
+        Matches
     }
 }

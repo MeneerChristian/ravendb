@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text;
 using Acornima;
@@ -73,6 +74,29 @@ namespace Raven.Server.Documents.Queries.Parser
                 return false;
 
             query.From = fromClause;
+
+            if (TryScanJoin(out var isLeftJoin))
+            {
+                if (fromClause.Alias == null)
+                    ThrowParseException("A JOIN requires an alias for the main document: FROM INDEX 'index' AS alias JOIN (...) AS joined ON alias.field = id(joined)");
+
+                query.Joins = new List<JoinClause>();
+                do
+                {
+                    var join = JoinClause(fromClause.Alias.Value);
+                    join.IsLeft = isLeftJoin;
+                    var aliasIsUsed = fromClause.Alias != null && fromClause.Alias.Value == join.Alias;
+                    foreach (var other in query.Joins)
+                        aliasIsUsed |= other.Alias == join.Alias;
+
+                    if (aliasIsUsed)
+                        ThrowParseException($"The alias '{join.Alias}' is used more than once, every JOIN needs its own alias");
+
+                    query.Joins.Add(join);
+                } while (TryScanJoin(out isLeftJoin));
+
+                NestChainedJoins(query);
+            }
 
             if (Scanner.TryScanMultiWordsToken("GROUP", "BY"))
                 query.GroupBy = GroupBy();
@@ -155,6 +179,218 @@ namespace Raven.Server.Documents.Queries.Parser
             }
 
             return true;
+        }
+
+        private bool TryScanJoin(out bool isLeft)
+        {
+            isLeft = false;
+            if (Scanner.TryScan("JOIN"))
+                return true;
+
+            var position = Scanner.Position;
+            var column = Scanner.Column;
+            if (Scanner.TryScan("LEFT") == false)
+                return false;
+
+            if (Scanner.TryScan("JOIN") == false)
+            {
+                Scanner.Reset(position);
+                Scanner.Column = column;
+                return false;
+            }
+
+            isLeft = true;
+            return true;
+        }
+
+        private JoinClause JoinClause(StringSegment mainAlias)
+        {
+            if (Scanner.TryScan('(') == false)
+                ThrowParseException("Expected '(' followed by a sub-query after JOIN");
+
+            // the sub-query gets its own parser, since parsing fills the parser's Query
+            var innerParser = new QueryParser();
+            innerParser.Init(Scanner.Input);
+            innerParser.Scanner.Reset(Scanner.Position);
+            var inner = innerParser.Parse(recursive: true);
+            Scanner.Reset(innerParser.Scanner.Position);
+
+            if (Scanner.TryScan(')') == false)
+                ThrowParseException("Expected ')' at the end of the JOIN sub-query");
+
+            if (inner.Limit != null || inner.Offset != null)
+                ThrowParseException("The JOIN sub-query cannot use LIMIT or OFFSET");
+
+            if (Scanner.TryScan("AS") == false)
+                ThrowParseException("JOIN requires an alias: JOIN (...) AS alias ON ...");
+
+            if (Field(out var alias) == false)
+                ThrowParseException("Expected an alias after AS in JOIN");
+
+            if (Scanner.TryScan("ON") == false)
+                ThrowParseException("JOIN requires an ON clause: JOIN (...) AS alias ON outerField = id(alias)");
+
+            if (Expression(out var on) == false)
+                ThrowParseException("Unable to parse the ON clause of the JOIN");
+
+            ValueExpression boost = null;
+            if (Scanner.TryScan("BOOST") && Value(out boost) == false)
+                ThrowParseException("Expected a number or a parameter after BOOST in JOIN: JOIN (...) AS alias ON ... BOOST 0.5");
+
+            var expected = $"The ON clause of a JOIN must be an equality between a field of the main document and either the id or a field of the joined documents: " +
+                           $"outerField = id({alias.FieldValue}) or outerField = {alias.FieldValue}.field, or several such equalities of fields joined by AND. " +
+                           $"The id of the main document can be matched against a field of the joined documents: id({mainAlias}) = {alias.FieldValue}.field";
+
+            var equalities = new List<BinaryExpression>();
+            if (FlattenOn(on, equalities) == false)
+                return ThrowInvalidOn(expected);
+
+            var pairs = new List<JoinKeyPair>();
+            foreach (var equality in equalities)
+            {
+                // the side that belongs to the joined documents can be written first or last
+                string innerField;
+                if (TryGetJoinedSide(equality.Right, alias.FieldValue, out innerField) && IsMainSide(equality.Left, alias.FieldValue, mainAlias, innerField))
+                    pairs.Add(new JoinKeyPair { On = equality, InnerField = innerField });
+                else if (TryGetJoinedSide(equality.Left, alias.FieldValue, out innerField) && IsMainSide(equality.Right, alias.FieldValue, mainAlias, innerField))
+                    pairs.Add(new JoinKeyPair { On = new BinaryExpression(equality.Right, equality.Left, OperatorType.Equal), InnerField = innerField }); // the main document's field first
+                else if (IsIdOf(equality.Left, mainAlias) || IsIdOf(equality.Right, mainAlias))
+                    return ThrowInvalidOn($"The ON clause of a JOIN can match id({mainAlias}) only against a field of the joined documents ({alias.FieldValue}.field), but it is matched against '{(IsIdOf(equality.Left, mainAlias) ? equality.Right : equality.Left)}'");
+                else
+                    return ThrowInvalidOn(expected);
+            }
+
+            if (pairs.Count > 1 && pairs.Any(x => IsIdOf(x.On.Left, mainAlias)))
+                return ThrowInvalidOn($"id({mainAlias}) can only be the only equality of the ON clause of a JOIN, it cannot be combined with other equalities");
+
+            if (pairs.Count == 1)
+                return new JoinClause { Query = inner, Alias = alias.FieldValue, On = pairs[0].On, InnerField = pairs[0].InnerField, Boost = boost };
+
+            for (var i = 0; i < pairs.Count; i++)
+            {
+                if (pairs[i].InnerField == null)
+                    return ThrowInvalidOn($"id({alias.FieldValue}) can only be the only equality of the ON clause of a JOIN, it cannot be combined with other equalities");
+
+                for (var j = 0; j < i; j++)
+                {
+                    if (pairs[j].InnerField == pairs[i].InnerField && pairs[j].On.Left is FieldExpression a1 && pairs[i].On.Left is FieldExpression a2 && a1.FieldValue == a2.FieldValue)
+                        return ThrowInvalidOn($"The ON clause of the JOIN repeats the equality {a1.FieldValue} = {alias.FieldValue}.{pairs[i].InnerField}");
+                }
+            }
+
+            return new JoinClause { Query = inner, Alias = alias.FieldValue, On = pairs[0].On, InnerField = pairs[0].InnerField, MoreOn = pairs.GetRange(1, pairs.Count - 1), Boost = boost };
+        }
+
+        // The equalities of an ON clause joined by AND; false when it holds anything else
+        private static bool FlattenOn(QueryExpression expression, List<BinaryExpression> equalities)
+        {
+            if (expression is not BinaryExpression binary)
+                return false;
+
+            if (binary.Operator == OperatorType.And)
+                return FlattenOn(binary.Left, equalities) && FlattenOn(binary.Right, equalities);
+
+            if (binary.Operator != OperatorType.Equal)
+                return false;
+
+            equalities.Add(binary);
+            return true;
+        }
+
+        [DoesNotReturn]
+        private JoinClause ThrowInvalidOn(string message)
+        {
+            ThrowParseException(message);
+            return null; // never reached, ThrowParseException throws
+        }
+
+        // A field of the main document, or its id when it is matched against a field of the joined documents
+        private static bool IsMainSide(QueryExpression side, StringSegment alias, StringSegment mainAlias, string innerField)
+        {
+            if (side is FieldExpression field)
+                return IsJoinedField(field, alias) == false;
+
+            return innerField != null && mainAlias != alias && IsIdOf(side, mainAlias);
+        }
+
+        private static bool IsIdOf(QueryExpression side, StringSegment alias) =>
+            side is MethodExpression { Arguments: [FieldExpression { Compound.Count: 1 } idOf] } id && idOf.FieldValue == alias &&
+            QueryMethod.GetMethodType(id.Name.Value, throwIfNoMatch: false) == MethodType.Id;
+
+        private static bool IsJoinedField(FieldExpression field, StringSegment alias) => field.Compound.Count > 0 && field.Compound[0] == alias;
+
+        private static bool TryGetJoinedSide(QueryExpression side, StringSegment alias, out string innerField)
+        {
+            innerField = null;
+
+            if (side is MethodExpression { Arguments: [FieldExpression { Compound.Count: 1 } idOf] } id)
+                return QueryMethod.GetMethodType(id.Name.Value, throwIfNoMatch: false) == MethodType.Id && idOf.FieldValue == alias;
+
+            if (side is FieldExpression { Compound.Count: >= 2 } field && field.Compound[0] == alias)
+            {
+                innerField = string.Join('.', field.Compound.Skip(1).Select(x => x.Value));
+                return true;
+            }
+
+            return false;
+        }
+
+        // A join on a joined document
+        private void NestChainedJoins(Query query)
+        {
+            var chain = new List<JoinClause>(query.Joins);
+            query.JoinChain = chain;
+
+            var roots = new List<JoinClause>();
+            for (var i = 0; i < chain.Count; i++)
+            {
+                var join = chain[i];
+                var parent = FindParentJoin(chain, i);
+                if (parent is { IsComposite: true })
+                    ThrowParseException($"The JOIN with '{join.Alias}' joins on a field of '{parent.Alias}', which matches on several fields: a chain of joins through a JOIN on several fields is not supported");
+
+                if (parent == null)
+                {
+                    foreach (var more in join.MoreOn ?? [])
+                    {
+                        if (more.On.Left is FieldExpression { Compound.Count: > 1 } left && chain.Take(i).Any(x => x.Alias == left.Compound[0]))
+                            ThrowParseException($"The JOIN with '{join.Alias}' matches on several fields, '{left.FieldValue}' belongs to the joined document '{left.Compound[0]}': only fields of the main document can be used");
+                    }
+
+                    roots.Add(join);
+                    continue;
+                }
+
+                if (join.IsComposite)
+                    ThrowParseException($"The JOIN with '{join.Alias}' matches on several fields of '{parent.Alias}': a JOIN on several fields has to join fields of the main document, not of another joined document (a chain of joins)");
+
+                var subQuery = parent.Query;
+                if (subQuery.From.Alias == null)
+                    subQuery.From = new FromClause { From = subQuery.From.From, Alias = parent.Alias, Filter = subQuery.From.Filter, Index = subQuery.From.Index };
+                else if (subQuery.From.Alias != parent.Alias)
+                    ThrowParseException($"'{join.Alias}' joins on a field of '{parent.Alias}', so the sub-query of '{parent.Alias}' has to use '{parent.Alias}' as its alias (or none), but it uses '{subQuery.From.Alias}'");
+
+                subQuery.Joins ??= new List<JoinClause>();
+                subQuery.Joins.Add(join);
+            }
+
+            query.Joins = roots;
+            query.HasJoinChain = roots.Count != chain.Count;
+        }
+
+        private static JoinClause FindParentJoin(List<JoinClause> chain, int index)
+        {
+            var left = chain[index].On.Left as FieldExpression;
+            if (left == null || left.Compound.Count < 2)
+                return null;
+
+            for (var i = 0; i < index; i++)
+            {
+                if (chain[i].Alias == left.Compound[0])
+                    return chain[i];
+            }
+
+            return null;
         }
 
         private DeclaredFunction SelectTimeSeries()
@@ -861,7 +1097,9 @@ Grouping by 'Tag' or Field is supported only as a second grouping-argument.";
             }
 
 
-            Alias(false, out var alias);
+            StringSegment? alias = null;
+            if (IsLeftJoinAhead() == false)
+                Alias(false, out alias);
 
             fromClause = new FromClause
             {
@@ -875,11 +1113,22 @@ Grouping by 'Tag' or Field is supported only as a second grouping-argument.";
             return true;
         }
 
+        private bool IsLeftJoinAhead()
+        {
+            var position = Scanner.Position;
+            var column = Scanner.Column;
+            var isLeftJoin = Scanner.TryScan("LEFT") && Scanner.TryScan("JOIN");
+            Scanner.Reset(position);
+            Scanner.Column = column;
+            return isLeftJoin;
+        }
+
         private static readonly string[] AliasKeywords =
         {
             "AS",
             "SELECT",
             "WHERE",
+            "JOIN",
             "LOAD",
             "GROUP",
             "ORDER",

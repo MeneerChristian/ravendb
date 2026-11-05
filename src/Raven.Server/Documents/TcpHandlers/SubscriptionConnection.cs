@@ -111,6 +111,8 @@ namespace Raven.Server.Documents.TcpHandlers
                 throw new NotSupportedException("Subscription cannot specify an order by clause");
             if (q.UpdateBody != null)
                 throw new NotSupportedException("Subscription cannot specify an update clause");
+            if (q.Joins != null)
+                throw new NotSupportedException("Subscription cannot specify a join");
 
             bool revisions = false;
             if (q.From.Filter is BinaryExpression filter)
