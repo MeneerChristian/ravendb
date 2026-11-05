@@ -535,10 +535,10 @@ public class JoinIndexChunkTests(ITestOutputHelper output) : RavenTestBase(outpu
         (JoinIndexHarness h, JoinIndex joinIndex) = await CreateCostlyInnerChangeAsync(limit: 0);
         using (h)
         {
-            // a change is 128 bytes, a quarter of the available memory is the queue, and the queue is never shorter than Join.MinQueuedListChanges
+            // a change is 128 bytes, a quarter of the available memory is the queue, and the queue is never shorter than 262,144 changes while 64 MiB are available and half of the available memory in changes under that, never fewer than 1,024 (Join.MinQueuedListChanges is the queue only when the available memory is not known)
             long available = 64L * 1024 * 1024 * 1024;
             joinIndex.Engine.AvailableMemoryBytes = () => available;
-            foreach ((long bytes, long expected) in new[] { (64L << 30, 4_194_304L), (1L << 30, 2_097_152L), (2000L << 20, 4_096_000L), (400L << 20, 819_200L), (100L << 20, 204_800L), (10L << 20, (long)MinQueued) })
+            foreach ((long bytes, long expected) in new[] { (64L << 30, 4_194_304L), (1L << 30, 2_097_152L), (2000L << 20, 4_096_000L), (400L << 20, 819_200L), (100L << 20, 262_144L), (10L << 20, 40_960L), (1L << 20, 4_096L), (100L << 10, 1_024L) })
             {
                 available = bytes;
                 h.PutConversation(5000 + (int)(bytes >> 20), "k1");
@@ -554,9 +554,9 @@ public class JoinIndexChunkTests(ITestOutputHelper output) : RavenTestBase(outpu
         (JoinIndexHarness h, JoinIndex joinIndex) = await CreateCostlyInnerChangeAsync(limit: 0);
         using (h)
         {
-            // the build asks for the limit with its own cap: a quarter of the available memory in changes of 128 bytes, never fewer than the floor (or than the cap itself)
+            // the build asks for the limit with its own cap: a quarter of the available memory in changes of 128 bytes, never fewer than the shortest queue of that memory (or than the cap itself)
             const int BuildCap = 524_288;
-            foreach ((long bytes, long expected) in new[] { (64L << 30, (long)BuildCap), (128L << 20, 262_144L), (10L << 20, (long)MinQueued) })
+            foreach ((long bytes, long expected) in new[] { (64L << 30, (long)BuildCap), (128L << 20, 262_144L), (10L << 20, 40_960L), (1L << 20, 4_096L) })
             {
                 joinIndex.Engine.AvailableMemoryBytes = () => bytes;
                 Assert.Equal(expected, joinIndex.Engine.QueueLimit(BuildCap));
@@ -579,7 +579,7 @@ public class JoinIndexChunkTests(ITestOutputHelper output) : RavenTestBase(outpu
             ChangeCountryOfEveryInnerDocument(h);
             await h.AssertCurrentAsync();
             Assert.True(ReferenceEquals(h.Join(), before), "the join index was reset");
-            Assert.Equal(MinQueued, before.Counters.LastQueueLimit);
+            Assert.Equal(40_960, before.Counters.LastQueueLimit);
             AssertNoRebuild(before);
             Assert.Equal(1, before.Counters.Builds);
         }

@@ -49,13 +49,13 @@ public sealed class JoinConfiguration : ConfigurationCategory
     [ConfigurationEntry("Join.MaxInnerListChangesPerOuterEntry", ConfigurationEntryScope.ServerWideOrPerDatabase)]
     public int MaxInnerListChangesPerOuterEntry { get; set; }
 
-    [Description("A refresh queues the changes of the lists and applies them when this many are queued: the most it ever queues. A change takes about 128 bytes of memory; the queue is also limited to a quarter of the available memory and is never shorter than Join.MinQueuedListChanges. A list that is changed by many small flushes is rewritten each time.")]
+    [Description("A refresh queues the changes of the lists and applies them when this many are queued: the most it ever queues. A change takes about 128 bytes of memory; the queue is also limited to a quarter of the available memory and is never shorter than 262,144 changes (32 MiB; a shorter queue flushes more often) while at least 64 MiB are available, and under that it is half of the available memory in changes, never fewer than 1,024. A list that is changed by many small flushes is rewritten each time.")]
     [DefaultValue(4_194_304)]
     [MinValue(1024)]
     [ConfigurationEntry("Join.MaxQueuedListChanges", ConfigurationEntryScope.ServerWideOrPerDatabase)]
     public int MaxQueuedListChanges { get; set; }
 
-    [Description("The shortest queue of list changes that a refresh uses when little memory is available. The default is 1,048,576 changes (128 MiB) from 16 GB of memory on, and 1/128 of the memory of the machine (or of its container limit) below that: 65,536 changes (8 MiB) at 1 GB. " +
+    [Description("The queue of list changes that a refresh uses when the available memory is not known; when it is known, the queue is a quarter of it (never shorter than 262,144 changes while at least 64 MiB are available, see Join.MaxQueuedListChanges) whatever the memory of the machine is. The default is 1,048,576 changes (128 MiB) from 16 GB of memory on, and 1/128 of the memory of the machine (or of its container limit) below that: 65,536 changes (8 MiB) at 1 GB. " +
                  "A shorter queue applies the changes to the lists more often.")]
     [DefaultValue(DefaultValueSetInConstructor)]
     [MinValue(1024)]

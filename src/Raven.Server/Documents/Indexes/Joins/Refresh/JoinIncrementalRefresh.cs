@@ -487,17 +487,31 @@ internal sealed partial class JoinIncrementalRefresh : IDisposable
 
     /// <summary>
     /// The number of list changes that are queued before they are applied: what the options say, but not more than what a quarter of the available memory holds at the cost of a queued change (a
-    /// change is 24 bytes in the queue and about 100 more in the pages of the transaction that the lists it changes touch), and not less than Join.MinQueuedListChanges (a fraction of the memory of the machine).
+    /// change is 24 bytes in the queue and about 100 more in the pages of the transaction that the lists it changes touch), and not less than <see cref="ShortestQueue"/>.
+    /// Join.MinQueuedListChanges (a fraction of the memory of the machine) is the queue only when the available memory is not known.
     /// </summary>
     internal int QueueLimit(int limit)
     {
-        int floor = Math.Min(limit, _options.MinQueuedListChanges);
         if (AvailableMemoryBytes == null)
-            return limit;
+            return Math.Min(limit, _options.MinQueuedListChanges);
 
-        long fits = AvailableMemoryBytes() / 4 / BytesPerQueuedChange;
-        return (int)Math.Clamp(fits, floor, limit);
+        long available = AvailableMemoryBytes();
+        return (int)Math.Clamp(available / 4 / BytesPerQueuedChange, Math.Min(limit, ShortestQueue(available)), limit);
     }
+
+    /// <summary>
+    /// The shortest queue for an amount of available memory: <see cref="AbsoluteMinQueuedChanges"/> (a shorter one flushes more often) while
+    /// the available memory is at least twice what it holds, and half of the available memory in changes under that, but not less than <see cref="HardMinQueuedChanges"/>.
+    /// </summary>
+    internal static int ShortestQueue(long availableBytes)
+    {
+        long halfOfAvailable = availableBytes / 2 / BytesPerQueuedChange;
+        return (int)Math.Max(HardMinQueuedChanges, Math.Min(AbsoluteMinQueuedChanges, halfOfAvailable));
+    }
+
+    internal const int AbsoluteMinQueuedChanges = 262_144;
+
+    internal const int HardMinQueuedChanges = 1024;
 
     private const int BytesPerQueuedChange = JoinConfiguration.BytesPerQueuedListChange;
 
