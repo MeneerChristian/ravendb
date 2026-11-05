@@ -24,6 +24,7 @@ using Raven.Server.Documents.Indexes.Analysis;
 using Raven.Server.Documents.Indexes.Auto;
 using Raven.Server.Documents.Indexes.Configuration;
 using Raven.Server.Documents.Indexes.Joins;
+using Raven.Server.Documents.Indexes.Joins.Auto;
 using Raven.Server.Documents.Indexes.Errors;
 using Raven.Server.Documents.Indexes.MapReduce.Auto;
 using Raven.Server.Documents.Indexes.MapReduce.OutputToCollection;
@@ -114,6 +115,8 @@ namespace Raven.Server.Documents.Indexes
 
         public readonly DatabaseIndexHasChangedController HasChanged;
 
+        internal AutoJoinManager AutoJoins { get; }
+
         public IndexStore(DocumentDatabase documentDatabase, ServerStore serverStore)
             : this(documentDatabase, serverStore,
                 new DatabaseIndexLockModeController(documentDatabase),
@@ -146,6 +149,7 @@ namespace Raven.Server.Documents.Indexes
             Create = create;
             Delete = delete;
             HasChanged = hasChanged;
+            AutoJoins = new AutoJoinManager(documentDatabase);
             IndexReadOperationFactory = indexReadOperationFactory;
             Logger = _documentDatabase.Loggers.GetLogger<IndexStore>();
 

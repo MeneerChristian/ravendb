@@ -21,9 +21,15 @@ public sealed class JoinConfiguration : ConfigurationCategory
 
     internal JoinConfiguration(Size totalPhysicalMemory)
     {
+        // a quarter more than the limit that the server keeps free for itself (Memory.LowMemoryLimit is min(2 GB, total/10), so this is min(2.5 GB, total/8)): the gate refuses a build before the server's own low memory behavior would start.
+        AutoMinimumAvailableMemory = Size.Min(new Size(2560, SizeUnit.Megabytes), totalPhysicalMemory / 8);
+
         // 1/128 of the machine, in changes of 128 bytes: 8 MiB (65,536 changes) at 1 GB, and the million changes that a refresh always queued from 16 GB on
         // the queue of a build is a sixteenth of the machine at most: 64 MiB (524,288 changes) at 1 GB, the million changes that a build always queued from 2 GB on
         MaxQueuedListChangesInBuild = (int)Math.Clamp(totalPhysicalMemory.GetValue(SizeUnit.Bytes) / 16 / BytesPerQueuedListChange, 1024, MaxDefaultMinQueuedListChanges);
+
+        // the estimated memory of a build that an auto join index may have: half of the machine at most, and at most the 512 MB of before. Not less: the estimate starts at 192 MB (Join.AutoBuildMemoryBase), so a quarter would refuse every build below 1 GB
+        AutoMaxBuildMemory = Size.Min(new Size(512, SizeUnit.Megabytes), totalPhysicalMemory / 2);
 
         long minQueuedBytes = Math.Min((long)MaxDefaultMinQueuedListChanges * BytesPerQueuedListChange, totalPhysicalMemory.GetValue(SizeUnit.Bytes) / 128);
         MinQueuedListChanges = (int)Math.Max(1024, minQueuedBytes / BytesPerQueuedListChange);
@@ -110,4 +116,41 @@ public sealed class JoinConfiguration : ConfigurationCategory
     [TimeUnit(TimeUnit.Milliseconds)]
     [ConfigurationEntry("Join.QueryWaitForNonStaleInMs", ConfigurationEntryScope.ServerWideOrPerDatabase)]
     public TimeSetting QueryWaitForNonStale { get; set; }
+
+    [Description("A JOIN that a join index could answer creates an auto join index (an auto index that keeps the join up to date), which later queries are answered from. " +
+                 "The query that creates it is read as usual and never waits for it, unless it asked to wait for non stale results. " +
+                 "It is off by default: only join indexes that are put explicitly serve JOINs, because an auto join index builds a structure of its own from the first query that could use it.")]
+    [DefaultValue(false)]
+    [ConfigurationEntry("Join.AutoEnabled", ConfigurationEntryScope.ServerWideOrPerDatabase)]
+    public bool AutoEnabled { get; set; }
+
+    [Description("An auto join index is not built while less memory than this (in megabytes) would be available to the machine after the build (the available memory minus the estimated memory of the build). " +
+                 "The default is 1.25 times the low memory limit of the server (Memory.LowMemoryLimitInMb, by default min(2 GB, a tenth of the memory)): an eighth of the memory of the machine (or of its container limit), at most 2.5 GB. In a container the available memory counts only what the process holds (the page cache is not counted).")]
+    [DefaultValue(DefaultValueSetInConstructor)]
+    [SizeUnit(SizeUnit.Megabytes)]
+    [ConfigurationEntry("Join.AutoMinimumAvailableMemoryInMb", ConfigurationEntryScope.ServerWideOrPerDatabase)]
+    public Size AutoMinimumAvailableMemory { get; set; }
+
+    [Description("An auto join index is not built when the estimated memory of its build (in megabytes) is more than this. The default is 512 MB, or half of the memory of the machine (or of its container limit) when that is less.")]
+    [DefaultValue(DefaultValueSetInConstructor)]
+    [SizeUnit(SizeUnit.Megabytes)]
+    [ConfigurationEntry("Join.AutoMaxBuildMemoryInMb", ConfigurationEntryScope.ServerWideOrPerDatabase)]
+    public Size AutoMaxBuildMemory { get; set; }
+
+    [Description("The estimated memory of the build of an auto join index is this (in megabytes) plus the memory per entry of the two indexes that it joins.")]
+    [DefaultValue(192)]
+    [SizeUnit(SizeUnit.Megabytes)]
+    [ConfigurationEntry("Join.AutoBuildMemoryBaseInMb", ConfigurationEntryScope.ServerWideOrPerDatabase)]
+    public Size AutoBuildMemoryBase { get; set; }
+
+    [Description("The memory (in bytes) that the estimate of the build of an auto join index adds for every entry of the two indexes that it joins.")]
+    [DefaultValue(8)]
+    [ConfigurationEntry("Join.AutoBuildMemoryPerEntryInBytes", ConfigurationEntryScope.ServerWideOrPerDatabase)]
+    public long AutoBuildMemoryPerEntry { get; set; }
+
+    [Description("How long a query that asked to wait for non stale results and has to create an auto join index waits (in milliseconds) for the join index to be built, when the query has no timeout of its own.")]
+    [DefaultValue(15000)]
+    [TimeUnit(TimeUnit.Milliseconds)]
+    [ConfigurationEntry("Join.AutoBuildWaitForNonStaleInMs", ConfigurationEntryScope.ServerWideOrPerDatabase)]
+    public TimeSetting AutoBuildWaitForNonStale { get; set; }
 }

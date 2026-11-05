@@ -378,7 +378,10 @@ internal sealed class JoinPredicateAnalyzer
         return field.FieldValue;
     }
 
-    private bool TryTextOf(ValueExpression value, out string text, out bool isLong)
+    private bool TryTextOf(ValueExpression value, out string text, out bool isLong) => TryTextOf(value, _parameters, out text, out isLong);
+
+    /// <summary>The text of a value of the query, and whether it is a number: the value itself, or the parameter that it names.</summary>
+    internal static bool TryTextOf(ValueExpression value, BlittableJsonReaderObject parameters, out string text, out bool isLong)
     {
         isLong = false;
         switch (value.Value)
@@ -388,7 +391,7 @@ internal sealed class JoinPredicateAnalyzer
                 return true;
             case ValueTokenType.Long:
                 isLong = true;
-                text = ((long)value.GetValue(_parameters)).ToString(CultureInfo.InvariantCulture);
+                text = ((long)value.GetValue(parameters)).ToString(CultureInfo.InvariantCulture);
                 return true;
             case ValueTokenType.True:
                 text = "true";
@@ -397,7 +400,7 @@ internal sealed class JoinPredicateAnalyzer
                 text = "false";
                 return true;
             case ValueTokenType.Parameter:
-                if (_parameters == null || _parameters.TryGetMember(value.Token.Value, out object parameter) == false)
+                if (parameters == null || parameters.TryGetMember(value.Token.Value, out object parameter) == false)
                     break;
 
                 switch (parameter)

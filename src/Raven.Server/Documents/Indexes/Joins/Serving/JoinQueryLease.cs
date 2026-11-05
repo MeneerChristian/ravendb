@@ -63,6 +63,9 @@ internal sealed class JoinQueryLease : IDisposable
             if (index.QueryHooks?.ForceFallback == true)
                 continue;
 
+            if (index.Type == IndexType.AutoJoin)
+                index.MarkUsedByQuery();
+
             if (TryServe(entry, request, logger, out served, out string fallback))
                 return true;
 

@@ -153,11 +153,22 @@ namespace Raven.Server.Documents.Queries
             return result;
         }
 
+        private static bool JoinsTheSame(JoinIndex left, JoinIndex right)
+        {
+            return string.Equals(left.InnerName, right.InnerName, StringComparison.OrdinalIgnoreCase) &&
+                   string.Equals(left.Join.OuterField, right.Join.OuterField, StringComparison.Ordinal) &&
+                   string.Equals(left.Join.InnerField, right.Join.InnerField, StringComparison.Ordinal);
+        }
+
         // Opens the snapshot of every join index of the query before the query opens the transaction of any index, so a join index is never ahead of what the query reads. A join index that is
         // behind the indexes is awaited a little. Only reads: the join index is the only writer. Null when no join index is defined for the joins of the query.
         public async ValueTask<JoinQueryLease> OpenJoinsAsync(DocumentDatabase database, IndexQueryServerSide query, Index outer, CancellationToken token)
         {
             query.JoinLease = null;
+
+            // a join that a join index could answer and that has none asks for an auto join index; only a query that waits for non stale results waits for it
+            await database.IndexStore.AutoJoins.ConsiderAsync(query, outer, token).ConfigureAwait(false);
+
             var joinIndexes = FindJoins(database, outer);
             if (joinIndexes == null)
                 return null;
@@ -165,8 +176,13 @@ namespace Raven.Server.Documents.Queries
             var lease = new JoinQueryLease(query, token);
             try
             {
-                foreach (var joinIndex in joinIndexes)
-                    lease.Entries.Add(await OpenEntryAsync(database, joinIndex, outer, query.WaitForNonStaleResults, token).ConfigureAwait(false));
+                for (int i = 0; i < joinIndexes.Count; i++)
+                {
+                    // an auto join index of a join that a put join index has is tried after it: it neither makes the query wait nor counts as used unless the put join index could not answer
+                    JoinIndex candidate = joinIndexes[i];
+                    bool secondary = candidate.Type == IndexType.AutoJoin && joinIndexes.Exists(other => other.Type == IndexType.Join && JoinsTheSame(other, candidate));
+                    lease.Entries.Add(await OpenEntryAsync(database, candidate, outer, query, secondary, token).ConfigureAwait(false));
+                }
             }
             catch
             {
@@ -178,8 +194,14 @@ namespace Raven.Server.Documents.Queries
             return lease;
         }
 
-        private static async ValueTask<JoinQueryLease.Entry> OpenEntryAsync(DocumentDatabase database, JoinIndex joinIndex, Index outer, bool waitForNonStale, CancellationToken token)
+        private static async ValueTask<JoinQueryLease.Entry> OpenEntryAsync(DocumentDatabase database, JoinIndex joinIndex, Index outer, IndexQueryServerSide query, bool secondary, CancellationToken token)
         {
+            var waitForNonStale = query.WaitForNonStaleResults && secondary == false;
+
+            // the query uses the auto join index, even when the join is read as usual: it is not idle
+            if (joinIndex.Type == IndexType.AutoJoin && secondary == false)
+                joinIndex.MarkUsedByQuery();
+
             if (joinIndex.State == IndexState.Disabled)
                 return new JoinQueryLease.Entry(joinIndex, null, JoinFallbacks.Disabled);
 
@@ -190,7 +212,7 @@ namespace Raven.Server.Documents.Queries
             if (inner == null || joinIndex.Status == IndexRunningStatus.Pending)
                 return new JoinQueryLease.Entry(joinIndex, null, JoinFallbacks.Unresolved);
 
-            var budget = waitForNonStale ? joinIndex.QueryOptions.WaitForNonStale : joinIndex.QueryOptions.Wait;
+            var budget = secondary ? TimeSpan.Zero : waitForNonStale ? joinIndex.QueryOptions.WaitForNonStale : joinIndex.QueryOptions.Wait;
             var watch = Stopwatch.StartNew();
             var waited = false;
             try
@@ -206,7 +228,16 @@ namespace Raven.Server.Documents.Queries
                     {
                         // the lists are being built: they reflect no generation yet
                         snapshot.Dispose();
-                        return new JoinQueryLease.Entry(joinIndex, null, JoinFallbacks.Building);
+
+                        // a query that waits for non stale results waits for the auto join index that it asked for, as it would for an auto index; any other query is read as usual
+                        var buildBudget = (query.WaitForNonStaleResultsTimeout ?? joinIndex.QueryOptions.AutoBuildWaitForNonStale) - watch.Elapsed;
+                        if (waitForNonStale == false || joinIndex.Type != IndexType.AutoJoin || buildBudget <= TimeSpan.Zero)
+                            return new JoinQueryLease.Entry(joinIndex, null, JoinFallbacks.Building);
+
+                        waited = true;
+                        await awaiter.WaitAsync(buildBudget).ConfigureAwait(false);
+                        token.ThrowIfCancellationRequested();
+                        continue;
                     }
 
                     // a batch is counted by the join index after its stats were written, a while after its commit: only the indexes know whether the join index is behind

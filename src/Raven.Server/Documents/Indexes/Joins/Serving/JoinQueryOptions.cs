@@ -13,6 +13,9 @@ public sealed class JoinQueryOptions
     /// <summary>The same for a query that asked to wait for non stale results, which accepts a longer wait.</summary>
     public TimeSpan WaitForNonStale { get; set; } = TimeSpan.FromMilliseconds(1000);
 
+    /// <summary>How long a query that waits for non stale results waits for an auto join index to be built, when the query has no timeout of its own.</summary>
+    public TimeSpan AutoBuildWaitForNonStale { get; set; } = TimeSpan.FromMilliseconds(15000);
+
     public static JoinQueryOptions From(RavenConfiguration configuration)
     {
         var options = new JoinQueryOptions();
@@ -22,6 +25,7 @@ public sealed class JoinQueryOptions
         JoinConfiguration joinIndex = configuration.Join;
         options.Wait = joinIndex.QueryWait.AsTimeSpan;
         options.WaitForNonStale = joinIndex.QueryWaitForNonStale.AsTimeSpan;
+        options.AutoBuildWaitForNonStale = joinIndex.AutoBuildWaitForNonStale.AsTimeSpan;
         return options;
     }
 }
