@@ -4,6 +4,7 @@ import { mockStore } from "test/mocks/store/MockStore";
 import { mockServices } from "test/mocks/services/MockServices";
 import { IndexesStubs } from "test/stubs/IndexesStubs";
 import TermsQueryResult = Raven.Client.Documents.Queries.TermsQueryResult;
+import IndexDefinition = Raven.Client.Documents.Indexes.IndexDefinition;
 import IndexTerms from "components/pages/database/indexes/list/terms/IndexTerms";
 
 export default {
@@ -15,6 +16,7 @@ interface IndexTermsStoryArgs {
     indexFieldsDto?: getIndexEntriesFieldsCommandResult[];
     indexTerms?: TermsQueryResult;
     pathParams?: string[];
+    indexDefinitions?: IndexDefinition[];
 }
 
 export const IndexTermsStory: StoryObj<IndexTermsStoryArgs> = {
@@ -26,6 +28,7 @@ export const IndexTermsStory: StoryObj<IndexTermsStoryArgs> = {
 
         indexesService.withGetIndexFields(args.indexFieldsDto);
         indexesService.withGetIndexTerms(args.indexTerms);
+        indexesService.withGetDefinitions(args.indexDefinitions);
 
         return <IndexTerms pathParams={args.pathParams} />;
     },
@@ -33,5 +36,6 @@ export const IndexTermsStory: StoryObj<IndexTermsStoryArgs> = {
         pathParams: ["Companies/StockPrices/TradeVolumeByMonth"],
         indexFieldsDto: IndexesStubs.getIndexTermFields(),
         indexTerms: IndexesStubs.getIndexTerms(),
+        indexDefinitions: [],
     },
 };

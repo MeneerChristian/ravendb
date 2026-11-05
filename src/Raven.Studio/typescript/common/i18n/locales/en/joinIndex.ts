@@ -57,6 +57,10 @@ export default {
         tooManyFields: "At most {{max}} fields can be declared",
         tooManyGroupings: "At most {{max}} groupings can be declared",
     },
+    terms: {
+        notAvailable:
+            "The join index '{{name}}' has no terms: it answers JOINs of the indexes it joins and its entries are not queried directly.",
+    },
     stats: {
         header: "Join index statistics",
         unavailable: "Statistics are not available",

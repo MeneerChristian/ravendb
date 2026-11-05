@@ -20,13 +20,16 @@ import { databaseSelectors } from "components/common/shell/databaseSliceSelector
 import { EmptySet } from "components/common/EmptySet";
 import { LoadError } from "components/common/LoadError";
 import { HStack } from "components/common/utilities/HStack";
+import { useStudioTranslation } from "hooks/useStudioTranslation";
 import Accordion from "react-bootstrap/Accordion";
 import AccordionCollapse from "react-bootstrap/AccordionCollapse";
 
 export default function IndexTerms({ pathParams }: ReactPathParamsProps) {
     const indexName = pathParams[0];
 
-    const { asyncGetIndexEntriesFields, indexTerms, termsLoadedAmount, loadMore, editUrl } = useIndexTerms(indexName);
+    const t = useStudioTranslation("joinIndex");
+    const { asyncGetIndexEntriesFields, indexTerms, termsLoadedAmount, loadMore, editUrl, isJoinIndex } =
+        useIndexTerms(indexName);
 
     if (asyncGetIndexEntriesFields.error) {
         return <LoadError error="Error during getting fields" refresh={asyncGetIndexEntriesFields.execute} />;
@@ -47,7 +50,12 @@ export default function IndexTerms({ pathParams }: ReactPathParamsProps) {
             </Row>
             <Row className="mt-3">
                 {asyncGetIndexEntriesFields.loading && <LoadingView />}
-                {!asyncGetIndexEntriesFields.loading && indexTerms.length === 0 && (
+                {!asyncGetIndexEntriesFields.loading && isJoinIndex && (
+                    <div data-testid="join-no-terms">
+                        <EmptySet iconSize="lg">{t("terms.notAvailable", { name: indexName })}</EmptySet>
+                    </div>
+                )}
+                {!asyncGetIndexEntriesFields.loading && !isJoinIndex && indexTerms.length === 0 && (
                     <EmptySet iconSize="lg">No fields were found</EmptySet>
                 )}
                 {indexTerms.map((field) => (

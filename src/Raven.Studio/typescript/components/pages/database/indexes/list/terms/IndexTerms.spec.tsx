@@ -5,6 +5,7 @@ import React from "react";
 import { IndexesStubs } from "test/stubs/IndexesStubs";
 import { within } from "@testing-library/dom";
 import { INDEX_TERMS_PAGE_LIMIT } from "components/pages/database/indexes/list/terms/useIndexTerms";
+import { mockServices } from "test/mocks/services/MockServices";
 import TermsQueryResult = Raven.Client.Documents.Queries.TermsQueryResult;
 
 const { IndexTermsStory } = composeStories(stories);
@@ -156,5 +157,31 @@ describe("IndexTerms", () => {
         const loadMoreBtn = within(accordion).queryByTestId(testIdSelectors.termLoadMoreButton);
 
         expect(loadMoreBtn).not.toBeInTheDocument();
+    });
+
+    it("does not ask the server for the terms of a join index, which has none, and says so", async () => {
+        const joinDefinition = IndexesStubs.getJoinIndexDefinition();
+        mockServices.indexesService.getMock("getIndexEntriesFields").mockClear();
+        mockServices.indexesService.getMock("getIndexTerms").mockClear();
+
+        const { screen } = rtlRender(
+            <IndexTermsStory pathParams={[joinDefinition.Name]} indexDefinitions={[joinDefinition]} />
+        );
+
+        const message = await screen.findByTestId("join-no-terms");
+
+        expect(message).toHaveTextContent(`The join index '${joinDefinition.Name}' has no terms`);
+        expect(screen.queryByText("No fields were found")).not.toBeInTheDocument();
+        expect(mockServices.indexesService.getMock("getIndexEntriesFields")).not.toHaveBeenCalled();
+        expect(mockServices.indexesService.getMock("getIndexTerms")).not.toHaveBeenCalled();
+    });
+
+    it("loads the terms of an index that is not a join index after asking for its definition", async () => {
+        const definition = { ...IndexesStubs.getJoinIndexDefinition(), Name: indexName, Type: "Map" as const };
+
+        const { screen } = rtlRender(<IndexTermsStory pathParams={pathParams} indexDefinitions={[definition]} />);
+
+        expect(await screen.findAllByTestId(testIdSelectors.termAccordion)).not.toHaveLength(0);
+        expect(screen.queryByTestId("join-no-terms")).not.toBeInTheDocument();
     });
 });

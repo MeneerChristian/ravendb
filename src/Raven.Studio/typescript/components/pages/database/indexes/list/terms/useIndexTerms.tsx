@@ -8,6 +8,7 @@ import recentError from "common/notifications/models/recentError";
 import genUtils from "common/generalUtils";
 import { useEventsCollector } from "hooks/useEventsCollector";
 import { useAppUrls } from "hooks/useAppUrls";
+import IndexUtils from "components/utils/IndexUtils";
 import { getTermsFields, getTermsLoadedAmount } from "components/pages/database/indexes/list/terms/termsUtils";
 
 export type TermsForField = {
@@ -29,10 +30,18 @@ export function useIndexTerms(indexName: string) {
     const activeDb = useAppSelector(databaseSelectors.activeDatabase);
     const locations = DatabaseUtils.getLocations(activeDb);
     const { reportEvent } = useEventsCollector();
+    const [isJoinIndex, setIsJoinIndex] = React.useState(false);
     const editUrl = urls.editIndex(indexName)();
 
     const asyncGetIndexEntriesFields = useAsync(
         async () => {
+            // the server refuses the terms of a join index (it has no terms): do not ask it
+            const joinIndex = await getIsJoinIndex();
+            setIsJoinIndex(joinIndex);
+            if (joinIndex) {
+                return [];
+            }
+
             const tasks = locations.map((location) =>
                 indexesService.getIndexEntriesFields(indexName, activeDb.name, location)
             );
@@ -48,6 +57,16 @@ export function useIndexTerms(indexName: string) {
             onSuccess: setIndexTerms,
         }
     );
+
+    async function getIsJoinIndex() {
+        try {
+            const definitions = await indexesService.getDefinitions(activeDb.name, { indexNames: [indexName] });
+            return definitions?.some((x) => x.Name === indexName && IndexUtils.isJoinIndex(x)) ?? false;
+        } catch {
+            // the terms page is useful without it: the fields of the index are loaded as before
+            return false;
+        }
+    }
 
     const loadTerms = useAsyncCallback<TermsForField>(async (indexName: string, termsForField) => {
         try {
@@ -111,5 +130,6 @@ export function useIndexTerms(indexName: string) {
         termsLoadedAmount,
         loadMore,
         editUrl,
+        isJoinIndex,
     };
 }
