@@ -80,6 +80,7 @@ public class JoinNeverServedSubQueryTests(ITestOutputHelper output) : RavenTestB
 
     [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying | RavenTestCategory.Indexes)]
     [InlineData(CompatMode.Expanded)]
+    [InlineData(CompatMode.Auto)]
     [InlineData(CompatMode.None)]
     public async Task AnIndexJoinedWithItselfIsTheJoinOfTheServerAndNoJoinIsMadeForIt(CompatMode mode)
     {
@@ -94,7 +95,16 @@ public class JoinNeverServedSubQueryTests(ITestOutputHelper output) : RavenTestB
         Assert.Equal(expected, ids);
         Assert.Equal(expected, db.Run("from index 'Games' as g where g.RelatedId in ('games/004', 'games/005', 'games/006', 'games/007', 'games/008', 'games/009', 'games/010', 'games/011') order by id() limit 0, 1000").Ids);
 
-        if (mode == CompatMode.Expanded)
+        if (mode == CompatMode.Auto)
+        {
+            // the auto join index of a join of an index with itself is not made: the rule is counted
+            await Task.Delay(300);
+            Assert.Equal(0, db.Database.IndexStore.AutoJoins.Counters.Requested);
+            Assert.Equal(0, db.Database.IndexStore.AutoJoins.Counters.Created);
+            output.WriteLine(string.Join(", ", db.Database.IndexStore.AutoJoins.Counters.NotEligible.Select(x => $"{x.Key}={x.Value}")));
+            Assert.Contains(db.Database.IndexStore.AutoJoins.Counters.NotEligible, x => x.Key.Contains("SameIndex", StringComparison.Ordinal) && x.Value == 2);
+        }
+        else if (mode == CompatMode.Expanded)
         {
             // the join index of the games and the users is not asked about the games and the games
             JoinIndexStats joinIndex = db.Join;

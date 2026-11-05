@@ -24,7 +24,10 @@ public enum CompatMode
     /// <summary>A join index that is put, storage mode Expanded.</summary>
     Expanded,
 
-    /// <summary>No join index: every join is the join of the server.</summary>
+    /// <summary>No join index is put: the first query of the join makes the auto join index.</summary>
+    Auto,
+
+    /// <summary>No join index, and no auto join index: every join is the join of the server.</summary>
     None
 }
 
@@ -67,6 +70,7 @@ public sealed class CompatDb : IDisposable
     public const string Games = "Games";
     public const string Users = "Users";
     public const string ManualJoin = "Games/WithVipOwner";
+    public const string AutoJoin = "Auto/Games/Join/Users/OnOwnerIdToId";
 
     /// <summary>The join of the matrix: the games of the owners that are vip (users/strong and users/weak).</summary>
     public const string VipJoin = "join (from index 'Users' where Kind = 'vip') as u on g.OwnerId = id(u)";
@@ -82,7 +86,7 @@ public sealed class CompatDb : IDisposable
 
     public CompatMode Mode { get; }
 
-    public string JoinName => ManualJoin;
+    public string JoinName => Mode == CompatMode.Auto ? AutoJoin : ManualJoin;
 
     private CompatDb(RavenTestBase test, DocumentStore store, CompatMode mode)
     {
@@ -98,6 +102,7 @@ public sealed class CompatDb : IDisposable
         options.ModifyDatabaseRecord += record =>
         {
             record.Settings[RavenConfiguration.GetKey(x => x.Indexing.CoraxIncludeDocumentScore)] = true.ToString();
+            record.Settings[RavenConfiguration.GetKey(x => x.Join.AutoEnabled)] = (mode == CompatMode.Auto).ToString();
             modify?.Invoke(record);
         };
 
@@ -109,6 +114,9 @@ public sealed class CompatDb : IDisposable
         DocumentStore store = test.GetDocumentStore(Options(mode, modify, runInMemory));
         var db = new CompatDb(test, store, mode);
         db.Database = await test.GetDatabase(store.Database);
+        if (mode == CompatMode.Auto)
+            db.Database.IndexStore.AutoJoins.AvailableMemoryForTesting = () => new Size(64, SizeUnit.Gigabytes);
+
         if (populate)
             await db.PopulateAsync();
 
@@ -169,9 +177,19 @@ public sealed class CompatDb : IDisposable
         return definition;
     }
 
-    /// <summary>The join index of the mode is current once the indexes are.</summary>
+    /// <summary>The join index of the mode: a put one is current once the indexes are; the auto one is made by a query of the join.</summary>
     public async Task WaitForTheJoinAsync()
     {
+        if (Mode == CompatMode.Auto)
+        {
+            // the query that asks for the auto join index is read by the server: it makes the join index
+            Run($"from index 'Games' as g {VipJoin} limit 0, 1");
+            for (int i = 0; i < 800 && Database.IndexStore.GetIndex(AutoJoin) == null; i++)
+                await Task.Delay(25);
+
+            Assert.NotNull(Database.IndexStore.GetIndex(AutoJoin));
+        }
+
         for (int i = 0; i < 400; i++)
         {
             if (JoinIsCurrent())

@@ -13,7 +13,7 @@ using Xunit;
 
 namespace FastTests.Server.Documents.Indexing.Joins.Compat;
 
-/// <summary>A join index is refused by a sharded database: through the operation of the client, through a creation task, and the join of a query is refused and makes no join index.</summary>
+/// <summary>A join index is refused by a sharded database: through the operation of the client, through a creation task, and the join of a query is refused and makes no auto join index.</summary>
 public class JoinShardedPutTests(ITestOutputHelper output) : RavenTestBase(output)
 {
     private const string Message = "[ShardedDatabase] A join index is not supported for a sharded database.";
@@ -84,7 +84,7 @@ public class JoinShardedPutTests(ITestOutputHelper output) : RavenTestBase(outpu
     }
 
     [RavenFact(RavenTestCategory.Sharding | RavenTestCategory.Indexes | RavenTestCategory.Querying)]
-    public async Task AJoinInAShardedDatabaseIsRefusedAndMakesNoJoinIndex()
+    public async Task AJoinInAShardedDatabaseIsRefusedAndMakesNoAutoJoin()
     {
         using DocumentStore store = ShardedStore();
         await new CompatDb.UsersIndex().ExecuteAsync(store);
@@ -100,7 +100,7 @@ public class JoinShardedPutTests(ITestOutputHelper output) : RavenTestBase(outpu
 
         Indexes.WaitForIndexing(store);
 
-        // asked twice: no index is made by the first query for the second
+        // asked twice: the second query is the one that would be answered by an auto join index
         for (int i = 0; i < 2; i++)
         {
             using var session = store.OpenSession();

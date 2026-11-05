@@ -74,6 +74,7 @@ public class JoinCompatRollingTests(ITestOutputHelper output) : ClusterTestBase(
             {
                 record.Settings[RavenConfiguration.GetKey(x => x.Indexing.StaticIndexingEngineType)] = "Corax";
                 record.Settings[RavenConfiguration.GetKey(x => x.Indexing.CoraxIncludeDocumentScore)] = true.ToString();
+                record.Settings[RavenConfiguration.GetKey(x => x.Join.AutoEnabled)] = false.ToString();
             }
         });
 
