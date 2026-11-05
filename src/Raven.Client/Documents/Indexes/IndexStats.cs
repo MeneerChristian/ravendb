@@ -156,6 +156,9 @@ namespace Raven.Client.Documents.Indexes
         /// </summary>
         public HashSet<string> ReferencedCollections { get; set; }
 
+        /// <summary>What a join index reports about the two indexes it joins. Null for every other index.</summary>
+        public JoinIndexStats Join { get; set; }
+
 #if FEATURE_TEST_INDEX
         /// <summary>
         /// Indicates if this is a test index (works on a limited data set - for testing purposes only)
@@ -204,5 +207,63 @@ namespace Raven.Client.Documents.Indexes
 
             public long TombstoneLag { get; set; }
         }
+    }
+    /// <summary>The part of <see cref="IndexStats"/> that only a join index has.</summary>
+    public sealed class JoinIndexStats
+    {
+        /// <summary>The name of the outer index.</summary>
+        public string OuterIndex { get; set; }
+
+        /// <summary>The name of the inner index.</summary>
+        public string InnerIndex { get; set; }
+
+        /// <summary>Why the join index cannot read the indexes it joins now (one is missing, disabled or in error); null when it can.</summary>
+        public string PendingReason { get; set; }
+
+        /// <summary>Why the join index went to the error state: an index it joins is in a definition a join index cannot read. It is enabled again by itself when they are valid again; null when it did not refuse them.</summary>
+        public string RefusedReason { get; set; }
+
+        /// <summary>The number of batches of the outer index that changed it, as the join index was told.</summary>
+        public long OuterBatches { get; set; }
+
+        /// <summary>The number of batches of the inner index that changed it, as the join index was told.</summary>
+        public long InnerBatches { get; set; }
+
+        /// <summary>The number of refreshes that changed the lists since the index was opened.</summary>
+        public long Refreshes { get; set; }
+
+        /// <summary>The number of refreshes that found nothing to do.</summary>
+        public long NoOpRefreshes { get; set; }
+
+        /// <summary>The number of times the lists were built from scratch.</summary>
+        public long Builds { get; set; }
+
+        /// <summary>The number of changed documents that the refreshes looked at.</summary>
+        public long IdsProcessed { get; set; }
+
+        /// <summary>The number of lists that the refreshes changed.</summary>
+        public long ListUpdates { get; set; }
+
+        /// <summary>How long the phases of the last refresh took.</summary>
+        public string LastRefreshBreakdown { get; set; }
+
+        /// <summary>How many times the lists were thrown away and built again, by the reason.</summary>
+        public Dictionary<string, long> RebuildsByReason { get; set; } = new();
+
+        /// <summary>The joins that were answered from the lists of this join index since the index was opened.</summary>
+        public long Served { get; set; }
+
+        /// <summary>The joins that were read as usual although this join index was asked: the sum of <see cref="Fallbacks"/>.</summary>
+        public long FallbackTotal { get; set; }
+
+        /// <summary>The joins that were read as usual although this join index was asked, by the reason.</summary>
+        public Dictionary<string, long> Fallbacks { get; set; } = new();
+
+        /// <summary>The queries that waited for the join index to catch up with the indexes.</summary>
+        public long QueryWaits { get; set; }
+
+        public double QueryWaitTotalInMs { get; set; }
+
+        public double QueryWaitMaxInMs { get; set; }
     }
 }

@@ -47,6 +47,7 @@ namespace Raven.Server.Config.Categories
         Debug,
         Ai,
         [Description("Schema Validation")]
-        SchemaValidation
+        SchemaValidation,
+        Join
     }
 }

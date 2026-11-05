@@ -46,6 +46,7 @@ public sealed partial class ClusterStateMachine
         nameof(PutSortersCommand),
         nameof(PutAnalyzersCommand),
         nameof(PutIndexCommand),
+        nameof(PutJoinIndexCommand),
         nameof(EditRevisionsConfigurationCommand),
         nameof(EditExpirationCommand),
         nameof(EditRefreshCommand),
@@ -91,6 +92,7 @@ public sealed partial class ClusterStateMachine
                 AssertMultiNodeSharding(databaseRecord, serverStore.LicenseManager.LicenseStatus, context);
                 break;
             case nameof(PutIndexCommand):
+            case nameof(PutJoinIndexCommand):
                 AssertAdditionalAssembliesFromNuGetLicenseLimits(databaseRecord, serverStore.LicenseManager.LicenseStatus, context);
                 AssertStaticIndexesCount(databaseRecord, serverStore.LicenseManager.LicenseStatus, context, items, type);
                 break;

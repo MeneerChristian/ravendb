@@ -6,6 +6,7 @@ using Raven.Client.Documents.Operations;
 using Raven.Server.Config.Categories;
 using Raven.Server.Documents.Indexes.Auto;
 using Raven.Server.Documents.Indexes.Errors;
+using Raven.Server.Documents.Indexes.Joins;
 using Raven.Server.Documents.Indexes.MapReduce.Auto;
 using Raven.Server.Documents.Indexes.MapReduce.Static;
 using Raven.Server.Documents.Indexes.Static;
@@ -31,6 +32,7 @@ public sealed class StaticIndexInformationHolder : IndexInformationHolder
             MapReduceIndex mapReduceIndex => mapReduceIndex._compiled,
             MapTimeSeriesIndex mapTimeSeries => mapTimeSeries._compiled,
             MapCountersIndex mapCountersIndex => mapCountersIndex._compiled,
+            JoinIndex => null,
             _ => throw new ArgumentOutOfRangeException(nameof(index))
         };
     }
@@ -121,6 +123,13 @@ public class IndexInformationHolder
         {
             type = mapReduce.IndexDefinition.Type;
             sourceType = mapReduce.IndexDefinition.SourceType;
+            return;
+        }
+
+        if (definition is JoinIndexDefinition joinIndex)
+        {
+            type = IndexType.Join;
+            sourceType = joinIndex.IndexDefinition.SourceType;
             return;
         }
 

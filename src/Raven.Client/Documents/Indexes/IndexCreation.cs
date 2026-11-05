@@ -73,6 +73,7 @@ namespace Raven.Client.Documents.Indexes
                         x.Conventions = oldConventions;
                     }
                 })
+                .OrderBy(x => x.Join != null) // a join index reads the indexes that are created in the same batch
                 .ToArray();
 
             return indexesToAdd;

@@ -15,12 +15,14 @@ using Raven.Server.Config;
 using Raven.Server.Config.Categories;
 using Raven.Server.Documents.Indexes.Auto;
 using Raven.Server.Documents.Indexes.Configuration;
+using Raven.Server.Documents.Indexes.Joins;
 using Raven.Server.Documents.Indexes.MapReduce.OutputToCollection;
 using Raven.Server.Documents.Indexes.MapReduce.Static;
 using Raven.Server.Documents.Indexes.Persistence.Lucene;
 using Raven.Server.Documents.Indexes.Static;
 using Raven.Server.ServerWide;
 using Raven.Server.ServerWide.Commands.Indexes;
+using Raven.Server.ServerWide.Commands;
 
 namespace Raven.Server.Documents.Indexes;
 
@@ -49,8 +51,18 @@ public abstract class AbstractIndexCreateController
 
     protected abstract ValueTask WaitForIndexNotificationAsync(long index, TimeSpan? timeout = null);
 
+    protected virtual bool IsShardedDatabase => false;
+
+    protected virtual JoinIndexFacts GetJoinIndexFacts(string name) => null;
+
     protected virtual async ValueTask ValidateStaticIndexAsync(IndexDefinition definition)
     {
+        if (definition.Join != null)
+        {
+            ValidateJoinIndex(definition);
+            return;
+        }
+
         ValidateStaticIndexInternal(definition);
 
         var databaseConfiguration = GetDatabaseConfiguration();
@@ -81,6 +93,22 @@ public abstract class AbstractIndexCreateController
         ValidateStaticIndexInternal(definition);
     }
     
+    private void ValidateJoinIndex(IndexDefinition definition)
+    {
+        if (IndexStore.IsValidIndexName(definition.Name, true, out var errorMessage) == false)
+            throw new ArgumentException(errorMessage);
+
+        if (definition.Maps.Count > 0 || string.IsNullOrWhiteSpace(definition.Reduce) == false || definition.Fields.Count > 0 || definition.AdditionalSources.Count > 0 ||
+            definition.AdditionalAssemblies.Count > 0 || definition.CompoundFields.Count > 0 || string.IsNullOrWhiteSpace(definition.OutputReduceToCollection) == false)
+            throw new IndexInvalidException($"The join index '{definition.Name}' has maps, a reduce, fields, sources or assemblies. A join index is defined by its {nameof(IndexDefinition.Join)} section only.");
+
+        ValidateConfiguration(definition);
+
+        List<JoinValidationError> errors = new JoinIndexValidator(GetJoinIndexFacts, IsShardedDatabase).Validate(definition.Join);
+        if (errors.Count > 0)
+            throw new IndexInvalidException($"Could not create the join index '{definition.Name}'.{Environment.NewLine}{JoinValidationException.BuildMessage(errors)}");
+    }
+
     private void ValidateStaticIndexInternal(IndexDefinition definition)
     {
         if (IndexStore.IsValidIndexName(definition.Name, true, out var errorMessage) == false)
@@ -121,15 +149,11 @@ public abstract class AbstractIndexCreateController
         var databaseTime = GetDatabaseTime();
         var databaseConfiguration = GetDatabaseConfiguration();
 
-        var command = new PutIndexCommand(
-            definition,
-            databaseName,
-            source,
-            databaseTime.GetUtcNow(),
-            raftRequestId,
-            databaseConfiguration.Indexing.HistoryRevisionsNumber,
-            databaseConfiguration.Indexing.StaticIndexDeploymentMode
-        );
+        CommandBase command = definition.Join != null
+            ? new PutJoinIndexCommand(definition, databaseName, source, databaseTime.GetUtcNow(), raftRequestId, databaseConfiguration.Indexing.HistoryRevisionsNumber,
+                databaseConfiguration.Indexing.StaticIndexDeploymentMode)
+            : new PutIndexCommand(definition, databaseName, source, databaseTime.GetUtcNow(), raftRequestId, databaseConfiguration.Indexing.HistoryRevisionsNumber,
+                databaseConfiguration.Indexing.StaticIndexDeploymentMode);
 
         long index = 0;
         try
@@ -372,6 +396,9 @@ public abstract class AbstractIndexCreateController
         {
             if (_command == null)
                 _command = new PutIndexesCommand(_controller.GetDatabaseName(), source, createdAt, raftRequestId, _historyRevisionsNumber, _defaultAutoDeploymentMode, _defaultStaticDeploymentMode);
+
+            if (definition.Join != null)
+                throw new InvalidOperationException($"The join index '{definition.Name}' is created by itself, after the indexes that are saved in the batch: it reads them.");
 
             await _controller.ValidateStaticIndexAsync(definition);
 

@@ -264,7 +264,7 @@ public static partial class CoraxQueryBuilder
             if (metadata.Query.Joins != null)
             {
                 var whereMatch = metadata.Query.Where is null ? null : coraxQuery;
-                var walk = JoinOrderedWalkOf(builderParameters, sortMetadata, whereMatch) ?? JoinFirstEntriesOf(builderParameters, sortMetadata, whereMatch);
+                var walk = JoinServedPageOf(builderParameters, sortMetadata, whereMatch) ?? JoinOrderedWalkOf(builderParameters, sortMetadata, whereMatch) ?? JoinFirstEntriesOf(builderParameters, sortMetadata, whereMatch);
                 if (walk != null)
                 {
                     coraxQuery = walk;
@@ -285,7 +285,17 @@ public static partial class CoraxQueryBuilder
                     {
                         // an optional join: every entry stays, the score of the joined document is added to the entries that have one
                         var leftMatch = BuildJoinMatch(builderParameters, i, leftJoin: true);
-                        if (leftMatch is ScoreMapMatch scores)
+                        if (leftMatch != null && builderParameters.Query.JoinResults[i].Served != null)
+                        {
+                            // the match of a join index holds the entries that have a joined document, it is not read for anything else than their scores
+                            if (leftMatch.Confidence != QueryCountConfidence.High || leftMatch.Count > 0)
+                            {
+                                coraxQuery = new ScoreAddMemberMatch<IQueryMatch, IQueryMatch>(indexSearcher.Allocator, coraxQuery, leftMatch);
+                                // the scores it adds are lost when a following join takes the place of the match
+                                coraxIsAllEntries = false;
+                            }
+                        }
+                        else if (leftMatch is ScoreMapMatch scores)
                         {
                             if (scores.Count > 0)
                             {
@@ -305,7 +315,8 @@ public static partial class CoraxQueryBuilder
                     }
 
                     var joinMatch = BuildJoinMatch(builderParameters, i);
-                    coraxQuery = indexSearcher.And(coraxQuery, joinMatch);
+                    // an answer of a join index that holds existing entries only is the match as it is: the intersection with all entries would only hide its count and its stream
+                    coraxQuery = coraxIsAllEntries && builderParameters.Query.JoinResults[i].Served is { EntriesOnly: true } ? joinMatch : indexSearcher.And(coraxQuery, joinMatch);
                     coraxIsAllEntries = false;
                     if (builderParameters.Query.JoinResults[i].RankedByInnerOrder && joinMatch is ScoreMapMatch joinRanks)
                     {
@@ -372,6 +383,51 @@ public static partial class CoraxQueryBuilder
         return false;
     }
 
+    // The join that orders by the joined index and that a join index answers with the page itself: it is never scanned, ranked or sorted
+    private static IQueryMatch JoinServedPageOf(Parameters builderParameters, OrderMetadata[] sortMetadata, IQueryMatch outer)
+    {
+        var metadata = builderParameters.Metadata;
+        var served = builderParameters.Query.JoinResults?[0].Served;
+        if (served?.OrderedPage == null)
+            return null;
+
+        // the join was offered to the join index only for a query that has all of this
+        if (metadata.Query.Joins.Count != 1 || builderParameters.AllowJoinOrderedWalk == false || sortMetadata is not [{ FieldType: MatchCompareFieldType.Rank }])
+            throw new InvalidOperationException($"The join '{metadata.Query.Joins[0].Alias}' was answered with an ordered page by a join index, but the query is not one that reads the first page of a join " +
+                                                $"(joins {metadata.Query.Joins.Count}, allowed {builderParameters.AllowJoinOrderedWalk}, sort {(sortMetadata == null ? "none" : string.Join(",", sortMetadata.Select(x => x.FieldType)))}).");
+
+        builderParameters.BuildSteps?.Add($"Join served by a join index, ordered: {metadata.Query.Joins[0].On}{(served.Description != null ? $" ({served.Description})" : string.Empty)}");
+        // the sort reads a match the same way: every entry of it at once, which it then scores
+        var where = outer == null || outer is MemoizationMatch ? outer : builderParameters.IndexSearcher.Memoize(outer).Replay();
+        var whereScore = 0f;
+        var whereHoldsEveryEntry = where != null && ExistsHoldsEveryEntry(builderParameters, out whereScore);
+        var page = served.OrderedPage(builderParameters.IndexSearcher, where, whereHoldsEveryEntry, whereScore, builderParameters.Take, builderParameters.NeedsScoresBuffer());
+        builderParameters.Query.JoinResults[0].Timings?.AddCounter("JoinServedPage", 1);
+        builderParameters.Query.JoinResults[0].Timings?.AddCounter("JoinServedPageWhereRead", where != null && whereHoldsEveryEntry == false ? 1 : 0);
+        return page;
+    }
+
+    // The where clause is exists() of a field that every entry has once: it matches every entry, which is known from the counts of its terms, so the page does not have to read the entries of the where clause
+    private static bool ExistsHoldsEveryEntry(Parameters builderParameters, out float score)
+    {
+        score = 0f;
+        var metadata = builderParameters.Metadata;
+        if (metadata.Query.Where is not MethodExpression { Arguments.Count: 1 } exists || QueryMethod.GetMethodType(exists.Name.Value) != MethodType.Exists)
+            return false;
+
+        if (IndexDefinitionBaseServerSide.IndexVersion.IsPerEntryMultipleTermsMarkerSupported(builderParameters.Index.Definition.Version) == false)
+            return false;
+
+        var fieldName = QueryBuilderHelper.ExtractIndexFieldName(metadata.Query, builderParameters.QueryParameters, exists.Arguments[0], metadata);
+        var fieldMetadata = QueryBuilderHelper.GetFieldMetadata(builderParameters.Allocator, fieldName, builderParameters.Index, builderParameters.IndexFieldsMapping,
+            builderParameters.FieldsToFetch, builderParameters.HasDynamics, builderParameters.DynamicFields, hasBoost: builderParameters.HasBoost);
+
+        return builderParameters.IndexSearcher.TryGetExistsOfEveryEntry(fieldMetadata, ExistsCountMaxTerms, out score);
+    }
+
+    // More terms than this are not counted: a field with so many has an exists() that is not the case this is made for
+    private const int ExistsCountMaxTerms = 256;
+
     // The join that orders by its sub-query, answered by the first entries of the order of the joined index. Null when the rank of every entry is needed.
     private static IQueryMatch JoinOrderedWalkOf(Parameters builderParameters, OrderMetadata[] sortMetadata, IQueryMatch outer)
     {
@@ -418,7 +474,7 @@ public static partial class CoraxQueryBuilder
 
         var join = metadata.Query.Joins[0];
         var joinResult = builderParameters.Query.JoinResults?[0];
-        if (joinResult == null || joinResult.RankedByInnerOrder || joinResult.OrderedKeys != null)
+        if (joinResult == null || joinResult.Served != null || joinResult.RankedByInnerOrder || joinResult.OrderedKeys != null)
             return null;
 
         if (join.IsLeft || join.IsComposite || join.ReferencedInWhere || join.Compare != null || join.Query.Joins != null)
@@ -517,6 +573,26 @@ public static partial class CoraxQueryBuilder
     {
         var metadata = builderParameters.Metadata;
         var join = metadata.Query.Joins[joinIndex];
+        var served = builderParameters.Query.JoinResults?[joinIndex].Served;
+        if (served != null)
+        {
+            builderParameters.BuildSteps?.Add($"{(leftJoin ? "Left join" : "Join")} served by a join index: {join.On}{(served.Description != null ? $" ({served.Description})" : string.Empty)}");
+            var scored = scoreNeeded && builderParameters.Query.JoinResults[joinIndex].Boost != 0f;
+
+            // a LEFT JOIN that is not scored adds nothing, every entry stays
+            if (leftJoin && scored == false)
+                return null;
+
+            if (inWhere && scored)
+            {
+                // the where clause may match an entry with another clause only (OR), and the score of the join belongs to the entries of the join
+                var stream = served.CreateMatch(builderParameters.IndexSearcher, false);
+                return new ScoreAddMemberMatch<IQueryMatch, IQueryMatch>(builderParameters.IndexSearcher.Allocator, stream, served.CreateMatch(builderParameters.IndexSearcher, true));
+            }
+
+            return served.CreateMatch(builderParameters.IndexSearcher, scored);
+        }
+
         var keys = builderParameters.Query.JoinResults?[joinIndex].Keys
                    ?? throw new InvalidQueryException("JOIN is not supported in this kind of query (it works in queries, index entries queries, streaming and facets, " +
                                                       "not in suggestions or more-like-this queries).", metadata.QueryText, builderParameters.QueryParameters);

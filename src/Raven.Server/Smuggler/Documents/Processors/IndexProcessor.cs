@@ -47,6 +47,7 @@ namespace Raven.Server.Smuggler.Documents.Processors
                         case IndexType.MapReduce:
                         case IndexType.JavaScriptMap:
                         case IndexType.JavaScriptMapReduce:
+                        case IndexType.Join:
                             return JsonDeserializationServer.IndexDefinition(reader);
 
                         default:
@@ -77,6 +78,7 @@ namespace Raven.Server.Smuggler.Documents.Processors
                 case IndexType.MapReduce:
                 case IndexType.JavaScriptMap:
                 case IndexType.JavaScriptMapReduce:
+                case IndexType.Join:
                     var indexDefinition = (IndexDefinition)definition;
                     if (removeAnalyzers)
                     {

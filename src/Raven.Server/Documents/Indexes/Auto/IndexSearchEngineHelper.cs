@@ -16,6 +16,9 @@ public static class IndexSearchEngineHelper
 
     public static SearchEngineType GetSearchEngineType(Index index)
     {
+        if (index.Type.IsJoin())
+            return SearchEngineType.Corax;
+
         return index.Type.IsAuto() switch
         {
             // We only support Vectors in Corax, so if an auto-index is using it, let's already set it up as such, regardless

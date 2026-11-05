@@ -23,6 +23,7 @@ using Raven.Server.Config.Settings;
 using Raven.Server.Documents.Indexes.Analysis;
 using Raven.Server.Documents.Indexes.Auto;
 using Raven.Server.Documents.Indexes.Configuration;
+using Raven.Server.Documents.Indexes.Joins;
 using Raven.Server.Documents.Indexes.Errors;
 using Raven.Server.Documents.Indexes.MapReduce.Auto;
 using Raven.Server.Documents.Indexes.MapReduce.OutputToCollection;
@@ -70,6 +71,25 @@ namespace Raven.Server.Documents.Indexes
         public SemaphoreSlim StoppedConcurrentIndexBatches { get; }
 
         internal Action<(string IndexName, bool DidWork)> IndexBatchCompleted;
+
+        /// <summary>
+        /// Raised on the indexing thread of an index after one of its indexing batches finished and its transaction was committed, with the name of the index and whether the batch mapped any document.
+        /// A batch that did no work changed nothing in the index. Handlers must be quick and must not throw: a handler that throws is logged and does not affect indexing.
+        /// </summary>
+        public event Action<string, bool> BatchCommitted;
+
+        internal void RaiseBatchCommitted(string indexName, bool didWork)
+        {
+            try
+            {
+                BatchCommitted?.Invoke(indexName, didWork);
+            }
+            catch (Exception e)
+            {
+                if (Logger.IsErrorEnabled)
+                    Logger.Error($"A handler of the batch committed event of index '{indexName}' failed.", e);
+            }
+        }
 
         private const int PathLengthLimit = 259; // Roslyn's MetadataWriter.PathLengthLimit = 259
 
@@ -698,7 +718,9 @@ namespace Raven.Server.Documents.Indexes
                     }
                 }
 
-                var index = CreateIndexFromDefinition(definition, _documentDatabase);
+                var index = definition.Join != null
+                    ? JoinIndex.CreateNew(definition, _documentDatabase, ResolveJoinCollections(definition))
+                    : CreateIndexFromDefinition(definition, _documentDatabase);
 
                 if (index is MapReduceIndex mapReduceIndex)
                 {
@@ -710,6 +732,59 @@ namespace Raven.Server.Documents.Indexes
                 
                 return index;
             }
+        }
+
+        /// <summary>
+        /// The collections of the two indexes that a join index joins: of the indexes of this node, else of their definitions in the database record (the indexes of one batch
+        /// of the record are created before any of them is added to the store).
+        /// </summary>
+        public HashSet<string> ResolveJoinCollections(IndexDefinition joinIndex)
+        {
+            var collections = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            RawDatabaseRecord record = null;
+            IDisposable contextScope = null;
+            IDisposable transaction = null;
+
+            try
+            {
+                foreach ((string name, string role) in new[] { (joinIndex.Join.OuterIndex, "outer"), (joinIndex.Join.InnerIndex, "inner") })
+                {
+                    if (_indexes.TryGetByName(name, out Index index))
+                    {
+                        collections.UnionWith(index.Collections);
+                        continue;
+                    }
+
+                    if (record == null)
+                    {
+                        contextScope = _serverStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context);
+                        transaction = context.OpenReadTransaction();
+                        record = _serverStore.Cluster.ReadRawDatabaseRecord(context, _documentDatabase.Name);
+                    }
+
+                    if (record.Indexes != null && record.Indexes.TryGetValue(name, out IndexDefinition definition))
+                    {
+                        collections.UnionWith(IndexCompilationCache.GetIndexInstance(definition, _documentDatabase.Configuration, IndexDefinitionBaseServerSide.IndexVersion.CurrentVersion).Maps.Keys);
+                        continue;
+                    }
+
+                    if (record.AutoIndexes != null && record.AutoIndexes.TryGetValue(name, out AutoIndexDefinition autoDefinition))
+                    {
+                        collections.Add(autoDefinition.Collection);
+                        continue;
+                    }
+
+                    throw new InvalidOperationException($"The {role} index '{name}' of the join index '{joinIndex.Name}' does not exist.");
+                }
+            }
+            finally
+            {
+                record?.Dispose();
+                transaction?.Dispose();
+                contextScope?.Dispose();
+            }
+
+            return collections;
         }
 
         public Index CreateTestIndexFromDefinition(IndexDefinition indexDefinition, DocumentDatabase documentDatabase, DocumentsOperationContext context, int maxDocumentsPerIndex)
@@ -985,6 +1060,10 @@ namespace Raven.Server.Documents.Indexes
                         case IndexType.MapReduce:
                         case IndexType.JavaScriptMapReduce:
                             MapReduceIndex.Update(existingIndex, definition, _documentDatabase);
+                            break;
+
+                        case IndexType.Join:
+                            JoinIndex.Update(existingIndex, definition, _documentDatabase);
                             break;
 
                         default:
@@ -1465,6 +1544,10 @@ namespace Raven.Server.Documents.Indexes
                                         index = MapReduceIndex.CreateNew<MapReduceIndex>(staticIndexDefinition, _documentDatabase, isIndexReset: true);
                                         break;
 
+                                    case IndexType.Join:
+                                        index = JoinIndex.CreateNew(staticIndexDefinition, _documentDatabase, ResolveJoinCollections(staticIndexDefinition));
+                                        break;
+
                                     default:
                                         throw new NotSupportedException($"Cannot create {staticIndexDefinition.Type} index from IndexDefinition");
                                 }
@@ -1855,6 +1938,9 @@ namespace Raven.Server.Documents.Indexes
         {
             return _indexes.GetForCollection(collection);
         }
+
+        /// <summary>In a fixed order, shared: do not change.</summary>
+        internal JoinIndex[] GetJoins() => _indexes.OrderedJoins;
 
         public IEnumerable<Index> GetIndexes()
         {

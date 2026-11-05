@@ -30,8 +30,8 @@ internal abstract class AbstractIndexHandlerProcessorForSource<TRequestHandler, 
             return;
         }
 
-        if (index.Type.IsStatic() == false)
-            throw new InvalidOperationException("Source can be only retrieved for static indexes.");
+        if (index.Type.IsStatic() == false || index.Type.IsJoin())
+            throw new InvalidOperationException("Source can be only retrieved for static indexes that have maps.");
 
         var staticIndex = (StaticIndexInformationHolder)index;
         var source = staticIndex.Compiled.Source;

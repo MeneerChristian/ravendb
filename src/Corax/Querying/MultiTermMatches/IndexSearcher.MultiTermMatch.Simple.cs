@@ -5,6 +5,7 @@ using Corax.Mappings;
 using Corax.Querying.Matches;
 using Corax.Querying.Matches.Meta;
 using Corax.Querying.Matches.TermProviders;
+using Corax.Utils;
 using Voron;
 using Voron.Data.Lookups;
 using static Voron.Data.CompactTrees.CompactTree;
@@ -67,7 +68,43 @@ public partial class IndexSearcher
             : MultiTermMatchBuilder<ExistsTermProvider<Lookup<CompactKeyLookup>.BackwardIterator>>(field, default(Slice), streamingEnabled: streamingEnabled, token: token, scoreAsConstant: true);
     }
 
-    
+
+    /// <summary>
+    /// Whether <see cref="ExistsQuery"/> of the field matches every entry of the index, found from the number of entries under the terms of the field instead of by reading them.
+    /// False when that cannot be told: an entry may have several terms in the field (the counts would add up an entry more than once) or the field has more than
+    /// <paramref name="maxTerms"/> terms. <paramref name="score"/> is what the match adds to the score of every entry, as <see cref="MultiTermMatch.Score"/> would.
+    /// </summary>
+    public unsafe bool TryGetExistsOfEveryEntry(in FieldMetadata field, long maxTerms, out float score)
+    {
+        // the scoring mode of the match is the one MultiTermMatch picks for a boosting field with a provider that fills
+        score = field.HasBoost ? Bm25Relevance.ConstantScoreValue : 0f;
+        if (HasMultipleTermsInField(field))
+            return false;
+
+        long entries = 0;
+        if (TryGetPostingListForNull(field, out var nullPostingListId))
+            entries += GetPostingList(nullPostingListId)?.State.NumberOfEntries ?? 0;
+
+        var terms = _fieldsTree?.CompactTreeFor(field.FieldName);
+        if (terms != null)
+        {
+            if (terms.NumberOfEntries > maxTerms)
+                return false;
+
+            var iterator = terms.Iterate<Lookup<CompactKeyLookup>.ForwardIterator>();
+            iterator.Reset();
+            long* containers = stackalloc long[64];
+            int read;
+            while ((read = iterator.Fill(new System.Span<long>(containers, 64))) > 0)
+            {
+                for (int i = 0; i < read; i++)
+                    entries += NumberOfDocumentsUnderSpecificTerm(containers[i]);
+            }
+        }
+
+        return entries == NumberOfEntries;
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public MultiTermMatch PatternQuery(in FieldMetadata field, Slice pattern, bool forward = true, bool streamingEnabled = false, in CancellationToken token = default)
     {

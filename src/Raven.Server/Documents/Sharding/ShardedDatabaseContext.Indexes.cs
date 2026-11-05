@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using JetBrains.Annotations;
 using Raven.Client.Documents.Indexes;
+using Raven.Client.Exceptions.Sharding;
 using Raven.Server.Documents.Indexes;
 using Raven.Server.Documents.Indexes.Analysis;
 using Raven.Server.Documents.Indexes.MapReduce.Static;
@@ -107,6 +108,8 @@ public partial class ShardedDatabaseContext
                     case IndexType.JavaScriptMapReduce:
                         indexInformationHolder = MapReduceIndex.CreateIndexInformationHolder(definition, DatabaseContext.Configuration, IndexDefinitionBaseServerSide.IndexVersion.CurrentVersion, out _);
                         break;
+                    case IndexType.Join:
+                        throw new NotSupportedInShardingException("A join index is not supported for a sharded database.");
                     default:
                         throw new ArgumentOutOfRangeException(nameof(definition.Type), definition.Type, "Unknown index type");
                 }

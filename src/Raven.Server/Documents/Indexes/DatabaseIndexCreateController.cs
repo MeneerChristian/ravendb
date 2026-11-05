@@ -4,6 +4,8 @@ using System.Threading.Tasks;
 using JetBrains.Annotations;
 using Raven.Client.Util;
 using Raven.Server.Config;
+using Raven.Server.Documents.Indexes.Joins;
+using Raven.Server.Documents.Sharding;
 using Raven.Server.ServerWide.Context;
 
 namespace Raven.Server.Documents.Indexes;
@@ -31,6 +33,13 @@ public class DatabaseIndexCreateController : AbstractIndexCreateController
             return null;
 
         return index.ToIndexInformationHolder();
+    }
+
+    protected override bool IsShardedDatabase => _database is ShardedDocumentDatabase;
+
+    protected override JoinIndexFacts GetJoinIndexFacts(string name)
+    {
+        return JoinIndexFactsReader.Read(_database.IndexStore.GetIndex(name));
     }
 
     protected override IEnumerable<string> GetIndexNames()

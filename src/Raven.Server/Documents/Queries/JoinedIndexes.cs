@@ -2,12 +2,18 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Threading;
+using System.Threading.Tasks;
+using Raven.Client;
+using Raven.Client.Documents.Indexes;
 using Raven.Client.Exceptions;
 using Raven.Client.Exceptions.Documents.Indexes;
 using Raven.Server.Config;
 using Raven.Server.Documents.Indexes;
 using Index = Raven.Server.Documents.Indexes.Index;
+using Raven.Server.Documents.Indexes.Joins;
+using Raven.Server.Documents.Indexes.Joins.Serving;
 using Raven.Server.Documents.Queries.AST;
+using Raven.Server.Documents.Indexes.Joins.Storage;
 using Sparrow.Server;
 
 namespace Raven.Server.Documents.Queries
@@ -16,6 +22,7 @@ namespace Raven.Server.Documents.Queries
     {
         private readonly List<Index> _indexes = new();
         private DocumentDatabase _database;
+        private readonly List<string> _innerNames = new();
         private Dictionary<Index, (long DocumentCutoff, long? ReferenceCutoff, long? CompareExchangeReferenceCutoff)> _cutoffs;
 
         // Null when the query has no joins
@@ -26,6 +33,9 @@ namespace Raven.Server.Documents.Queries
 
             var result = new JoinedIndexes { _database = database };
             result.Add(database, query);
+            foreach (var join in query.Joins)
+                result._innerNames.Add(join.Query.From.From.FieldValue);
+
             return result;
         }
 
@@ -116,6 +126,123 @@ namespace Raven.Server.Documents.Queries
             }
 
             return null;
+        }
+
+        // The join indexes of the outer index that join one of the indexes of the query, in the order they are tried: put join indexes first. A join index that is being replaced by another definition is not asked.
+        // All join indexes of the same join are kept: the first that can answer the query answers it
+        private List<JoinIndex> FindJoins(DocumentDatabase database, Index outer)
+        {
+            List<JoinIndex> result = null;
+            foreach (var joinIndex in database.IndexStore.GetJoins())
+            {
+                if (string.Equals(joinIndex.OuterName, outer.Name, StringComparison.OrdinalIgnoreCase) == false ||
+                    joinIndex.Name.StartsWith(Constants.Documents.Indexing.SideBySideIndexNamePrefix, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                foreach (var inner in _innerNames)
+                {
+                    if (string.Equals(joinIndex.InnerName, inner, StringComparison.OrdinalIgnoreCase) == false)
+                        continue;
+
+                    result ??= new List<JoinIndex>(1);
+                    result.Add(joinIndex);
+                    break;
+                }
+            }
+
+            return result;
+        }
+
+        // Opens the snapshot of every join index of the query before the query opens the transaction of any index, so a join index is never ahead of what the query reads. A join index that is
+        // behind the indexes is awaited a little. Only reads: the join index is the only writer. Null when no join index is defined for the joins of the query.
+        public async ValueTask<JoinQueryLease> OpenJoinsAsync(DocumentDatabase database, IndexQueryServerSide query, Index outer, CancellationToken token)
+        {
+            query.JoinLease = null;
+            var joinIndexes = FindJoins(database, outer);
+            if (joinIndexes == null)
+                return null;
+
+            var lease = new JoinQueryLease(query, token);
+            try
+            {
+                foreach (var joinIndex in joinIndexes)
+                    lease.Entries.Add(await OpenEntryAsync(database, joinIndex, outer, query.WaitForNonStaleResults, token).ConfigureAwait(false));
+            }
+            catch
+            {
+                lease.Dispose();
+                throw;
+            }
+
+            query.JoinLease = lease;
+            return lease;
+        }
+
+        private static async ValueTask<JoinQueryLease.Entry> OpenEntryAsync(DocumentDatabase database, JoinIndex joinIndex, Index outer, bool waitForNonStale, CancellationToken token)
+        {
+            if (joinIndex.State == IndexState.Disabled)
+                return new JoinQueryLease.Entry(joinIndex, null, JoinFallbacks.Disabled);
+
+            if (joinIndex.State == IndexState.Error)
+                return new JoinQueryLease.Entry(joinIndex, null, JoinFallbacks.Faulted);
+
+            var inner = database.IndexStore.GetIndex(joinIndex.InnerName);
+            if (inner == null || joinIndex.Status == IndexRunningStatus.Pending)
+                return new JoinQueryLease.Entry(joinIndex, null, JoinFallbacks.Unresolved);
+
+            var budget = waitForNonStale ? joinIndex.QueryOptions.WaitForNonStale : joinIndex.QueryOptions.Wait;
+            var watch = Stopwatch.StartNew();
+            var waited = false;
+            try
+            {
+                while (true)
+                {
+                    // taken before the snapshot, so a batch that the join index completes in between is not missed
+                    var awaiter = joinIndex.GetIndexingBatchAwaiter();
+                    if (joinIndex.TryOpenJoinSnapshot(out var snapshot) == false)
+                        return new JoinQueryLease.Entry(joinIndex, null, JoinFallbacks.SnapshotUnavailable);
+
+                    if (snapshot.Generation.OuterEnvironmentId == Guid.Empty)
+                    {
+                        // the lists are being built: they reflect no generation yet
+                        snapshot.Dispose();
+                        return new JoinQueryLease.Entry(joinIndex, null, JoinFallbacks.Building);
+                    }
+
+                    // a batch is counted by the join index after its stats were written, a while after its commit: only the indexes know whether the join index is behind
+                    var remaining = budget - watch.Elapsed;
+                    if (remaining <= TimeSpan.Zero || joinIndex.Status != IndexRunningStatus.Running || Peek(joinIndex, outer, inner, snapshot.Generation) != JoinServing.Outcome.Behind)
+                        return new JoinQueryLease.Entry(joinIndex, snapshot, null);
+
+                    snapshot.Dispose();
+                    waited = true;
+                    joinIndex.Expedite();
+                    await awaiter.WaitAsync(remaining).ConfigureAwait(false);
+                    token.ThrowIfCancellationRequested();
+                }
+            }
+            finally
+            {
+                if (waited)
+                    joinIndex.QueryCounters.Waited(watch.ElapsedTicks);
+            }
+        }
+
+        // Compares a generation with what the indexes have consumed now. Neither snapshot is kept
+        private static JoinServing.Outcome Peek(JoinIndex joinIndex, Index outer, Index inner, JoinIndexGeneration published)
+        {
+            joinIndex.QueryCounters.Peeked();
+            if (outer.TryOpenSnapshot(out var outerSnapshot) == false)
+                return JoinServing.Outcome.OtherHistory;
+
+            using (outerSnapshot)
+            {
+                if (inner.TryOpenSnapshot(out var innerSnapshot) == false)
+                    return JoinServing.Outcome.OtherHistory;
+
+                using (innerSnapshot)
+                    return JoinServing.Compare(published, outerSnapshot.EnvironmentId, outerSnapshot.Consumed, innerSnapshot.EnvironmentId, innerSnapshot.Consumed);
+            }
         }
     }
 }

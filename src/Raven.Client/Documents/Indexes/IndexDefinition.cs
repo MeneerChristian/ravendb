@@ -81,6 +81,11 @@ namespace Raven.Client.Documents.Indexes
         }
 
         public IndexSchemaDefinitions SchemaDefinitions { get; set; }
+
+        /// <summary>
+        /// The join that a join index keeps up to date. A definition that has it has no maps and no fields of its own, and its type is <see cref="IndexType.Join"/>.
+        /// </summary>
+        public JoinDefinition Join { get; set; }
         
         private IndexSourceType? _indexSourceType;
 
@@ -228,6 +233,9 @@ namespace Raven.Client.Documents.Indexes
 
             if (DictionaryExtensions.ContentEquals(SchemaDefinitions, other.SchemaDefinitions) == false)
                 result |= IndexDefinitionCompareDifferences.SchemaValidationConfiguration;
+
+            if (JoinDefinition.IsSameJoin(Join, other.Join) == false)
+                result |= IndexDefinitionCompareDifferences.Join;
             
             if (DictionaryExtensions.ContentEquals(AdditionalSources, other.AdditionalSources) == false)
             {
@@ -286,10 +294,12 @@ namespace Raven.Client.Documents.Indexes
 
             var configurationEquals = result.HasFlag(IndexDefinitionCompareDifferences.Configuration) == false;
             var fieldsEquals = result.HasFlag(IndexDefinitionCompareDifferences.Fields) == false;
+            var joinEquals = result.HasFlag(IndexDefinitionCompareDifferences.Join) == false;
 
             return mapsReduceEquals
                    && configurationEquals
-                   && fieldsEquals;
+                   && fieldsEquals
+                   && joinEquals;
         }
 
         private static int DictionaryHashCode<TKey, TValue>(IEnumerable<KeyValuePair<TKey, TValue>> x)
@@ -374,6 +384,9 @@ namespace Raven.Client.Documents.Indexes
                 result = (result * 397) ^ AdditionalAssemblies.Count;
                 result = (result * 397) ^ AdditionalAssemblies.GetEnumerableHashCode();
                 result = (result * 397) ^ (OutputReduceToCollection?.GetHashCode() ?? 0);
+                if (Join != null)
+                    result = (result * 397) ^ Join.GetJoinHashCode();
+
                 return result;
             }
         }
@@ -461,6 +474,9 @@ namespace Raven.Client.Documents.Indexes
 
         public IndexSourceType DetectStaticIndexSourceType()
         {
+            if (Join != null)
+                return IndexSourceType.Documents;
+
             if (Maps == null || Maps.Count == 0)
                 throw new ArgumentNullException("Index definition contains no Maps");
 
@@ -483,6 +499,9 @@ namespace Raven.Client.Documents.Indexes
 
         public IndexType DetectStaticIndexType()
         {
+            if (Join != null)
+                return IndexType.Join;
+
             var firstMap = Maps.FirstOrDefault();
             if (firstMap == null)
                 throw new ArgumentNullException("Index definitions contains no Maps");
@@ -573,6 +592,8 @@ namespace Raven.Client.Documents.Indexes
             definition.DeploymentMode = DeploymentMode;
             definition.ClusterState = (ClusterState == null) ? null : new IndexDefinitionClusterState(ClusterState);
             definition.CompoundFields = CompoundFields;
+            definition.Join = Join?.Clone();
+            definition._indexType = _indexType;
 
             foreach (var kvp in _configuration)
                 definition.Configuration[kvp.Key] = kvp.Value;
@@ -596,7 +617,8 @@ namespace Raven.Client.Documents.Indexes
             IndexDefinitionCompareDifferences.Fields | 
             IndexDefinitionCompareDifferences.Configuration | 
             IndexDefinitionCompareDifferences.AdditionalSources | 
-            IndexDefinitionCompareDifferences.AdditionalAssemblies;
+            IndexDefinitionCompareDifferences.AdditionalAssemblies |
+            IndexDefinitionCompareDifferences.Join;
     }
 
     public enum IndexDeploymentMode
@@ -643,7 +665,8 @@ namespace Raven.Client.Documents.Indexes
         CompoundFields = 1 << 13,
         ArchivedDataProcessingBehavior = 1 << 14,
         SchemaValidationConfiguration = 1 << 15,
+        Join = 1 << 16,
 
-        All = Maps | Reduce | Fields | Configuration | LockMode | Priority | State | AdditionalSources | AdditionalAssemblies | DeploymentMode | CompoundFields | ArchivedDataProcessingBehavior | SchemaValidationConfiguration,
+        All = Maps | Reduce | Fields | Configuration | LockMode | Priority | State | AdditionalSources | AdditionalAssemblies | DeploymentMode | CompoundFields | ArchivedDataProcessingBehavior | SchemaValidationConfiguration | Join,
     }
 }

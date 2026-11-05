@@ -23,6 +23,7 @@ using Raven.Client.Documents.Queries.MoreLikeThis;
 using Raven.Client.Exceptions;
 using Raven.Client.Exceptions.Corax;
 using Raven.Server.Documents.Indexes.Debugging;
+using Raven.Server.Documents.Indexes.Joins.Serving;
 using Raven.Server.Documents.Indexes.Static.Spatial;
 using Raven.Server.Documents.Queries;
 using Raven.Server.Documents.Queries.AST;
@@ -329,6 +330,42 @@ namespace Raven.Server.Documents.Indexes.Persistence.Corax
             finally
             {
                 entries.Dispose();
+            }
+        }
+
+        // The term that a query on this index looks for when it asks for a value of a field: analyzed the way the index analyzes the field. No term when the index has no such field, a split when the analyzer does not make one term of the value
+        internal EncodedTerm EncodeTerm(string field, string text)
+        {
+            if (_fieldMappings.TryGetByFieldName(_allocator, field, out var binding) == false)
+                return default;
+
+            return IndexSearcher.TryEncodeAndApplyAnalyzer(binding.Metadata, text, out var term)
+                ? new EncodedTerm(term.AsReadOnlySpan().ToArray())
+                : EncodedTerm.Split;
+        }
+
+        // The score the sub-query gives to the entries it matches, scored the way the scan of the sub-query scores them: uniform when every entry has the score of the first
+        internal JoinScoreProbe ProbeSubQueryScore(IndexQueryServerSide query, DocumentsOperationContext documentsContext, CancellationToken token)
+        {
+            if (TryScoreSubQuery(query, documentsContext, out var ids, out var scores, token) == false)
+                return default;
+
+            try
+            {
+                var span = scores.ToSpan();
+                var first = span[0];
+                for (var i = 1; i < span.Length; i++)
+                {
+                    if (span[i] != first)
+                        return new JoinScoreProbe(hasMatches: true, isUniform: false, first);
+                }
+
+                return new JoinScoreProbe(hasMatches: true, isUniform: true, first);
+            }
+            finally
+            {
+                ids.Dispose();
+                scores.Dispose();
             }
         }
 
@@ -857,6 +894,59 @@ namespace Raven.Server.Documents.Indexes.Persistence.Corax
             }
             finally
             {
+                ids.Dispose();
+                scores.Dispose();
+            }
+        }
+
+        // The sub-query side of a JOIN on a field, restricted to some keys (the terms of the join field, one after the other in keyBytes, keyEnds holds where each of them ends):
+        // the terms of the field that the entries of the sub-query have, among those keys. Only the entries of the groups of the given keys are looked at.
+        internal JoinTermScores ScanTermScoresAmong(IndexQueryServerSide query, DocumentsOperationContext documentsContext, string joinField, ReadOnlySpan<byte> keyBytes, ReadOnlySpan<int> keyEnds,
+            CancellationToken token)
+        {
+            var output = new JoinTermScores(_allocator);
+            var among = new JoinTermScores(_allocator);
+            ContextBoundNativeList<long> ids = default;
+            ContextBoundNativeList<float> scores = default;
+            try
+            {
+                var queryMatch = BuildSubQuery(query, documentsContext, out _, token);
+                if (queryMatch is null || keyEnds.Length == 0)
+                    return output;
+
+                among.EnsureCapacity(keyEnds.Length, keyBytes.Length);
+                var start = 0;
+                foreach (var end in keyEnds)
+                {
+                    among.Add(keyBytes.Slice(start, end - start), 0f);
+                    start = end;
+                }
+
+                // the keys are terms of the joined index: they are matched as they are
+                var groups = IndexSearcher.InQuery(IndexSearcher.FieldMetadataBuilder(joinField), among, keysAreIndexedTerms: true, token);
+                ids = ReadAllEntries(IndexSearcher.And(queryMatch, groups, token), token);
+                if (ids.Count == 0)
+                    return output;
+
+                Sort.Run(ids.ToSpan());
+
+                // nothing reads the scores of these entries
+                scores = new ContextBoundNativeList<float>(_allocator);
+                scores.GrowFitting(ids.Count + 1);
+                scores.Count = ids.Count;
+                scores.ToSpan().Fill(Bm25Relevance.InitialScoreValue);
+
+                ScanFieldTerms(joinField, JoinFieldScan.Auto, ids.ToSpan(), scores.ToSpan(), output);
+                return output;
+            }
+            catch
+            {
+                output.Dispose();
+                throw;
+            }
+            finally
+            {
+                among.Dispose();
                 ids.Dispose();
                 scores.Dispose();
             }

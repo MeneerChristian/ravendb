@@ -1703,6 +1703,16 @@ namespace Raven.Server.Json
             }
             writer.WriteEndObject();
 
+            if (indexDefinition.Join != null)
+            {
+                writer.WriteComma();
+                writer.WritePropertyName(nameof(indexDefinition.Join));
+                using (BlittableJsonReaderObject joinIndex = context.ReadObject(indexDefinition.Join.ToJson(), nameof(indexDefinition.Join)))
+                {
+                    writer.WriteObject(joinIndex);
+                }
+            }
+
             writer.WriteEndObject();
         }
 

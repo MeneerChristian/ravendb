@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Security.Cryptography;
 using System.Threading.Tasks;
 using JetBrains.Annotations;
@@ -17,6 +18,7 @@ public sealed class DatabaseIndexActions : IIndexActions
     private readonly SystemTime _time;
     private readonly AbstractIndexCreateController.IndexBatchScope _batch;
     private readonly RavenConfiguration _configuration;
+    private readonly List<IndexDefinition> _joins = new();
 
     public DatabaseIndexActions([NotNull] AbstractIndexCreateController controller, [NotNull] SystemTime time)
     {
@@ -52,10 +54,18 @@ public sealed class DatabaseIndexActions : IIndexActions
         if (_configuration.Security.AuthenticationEnabled &&
             authorizationStatus == AuthorizationStatus.ValidUser &&
             (indexDefinition.Type == IndexType.Map ||
-             indexDefinition.Type == IndexType.MapReduce))
+             indexDefinition.Type == IndexType.MapReduce ||
+             indexDefinition.Type == IndexType.Join))
         {
             throw new CryptographicException(
                 $"Could not import '{indexDefinition.Name}' index: Your existing certificate lacks the necessary permissions to create indexes.");
+        }
+
+        if (indexDefinition.Join != null)
+        {
+            // a join index reads the indexes that the import creates, whatever the order of the stream
+            _joins.Add(indexDefinition);
+            return;
         }
 
         if (_batch != null)
@@ -72,9 +82,10 @@ public sealed class DatabaseIndexActions : IIndexActions
 
     public async ValueTask DisposeAsync()
     {
-        if (_batch == null)
-            return;
+        if (_batch != null)
+            await _batch.SaveAsync();
 
-        await _batch.SaveAsync();
+        foreach (IndexDefinition joinIndex in _joins)
+            await _controller.CreateIndexAsync(joinIndex, RaftIdGenerator.DontCareId, _source);
     }
 }

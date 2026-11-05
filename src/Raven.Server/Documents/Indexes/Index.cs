@@ -34,6 +34,7 @@ using Raven.Server.Documents.Handlers.Admin;
 using Raven.Server.Documents.Includes;
 using Raven.Server.Documents.Indexes.Auto;
 using Raven.Server.Documents.Indexes.Debugging;
+using Raven.Server.Documents.Indexes.Joins;
 using Raven.Server.Documents.Indexes.MapReduce.Auto;
 using Raven.Server.Documents.Indexes.MapReduce.Exceptions;
 using Raven.Server.Documents.Indexes.MapReduce.Static;
@@ -488,6 +489,9 @@ namespace Raven.Server.Documents.Indexes
                                         case IndexType.MapReduce:
                                         case IndexType.JavaScriptMapReduce:
                                             return MapReduceIndex.CreateNew<MapReduceIndex>(staticDef, documentDatabase);
+
+                                        case IndexType.Join:
+                                            return JoinIndex.CreateNew(staticDef, documentDatabase, documentDatabase.IndexStore.ResolveJoinCollections(staticDef));
                                     }
                                     break;
 
@@ -565,6 +569,9 @@ namespace Raven.Server.Documents.Indexes
                             case IndexType.MapReduce:
                             case IndexType.JavaScriptMapReduce:
                                 return MapReduceIndex.Open<MapReduceIndex>(environment, documentDatabase);
+
+                            case IndexType.Join:
+                                return JoinIndex.Open(environment, documentDatabase);
 
                             default:
                                 throw new ArgumentException($"Unknown index type {type} for index {name}");
@@ -739,7 +746,7 @@ namespace Raven.Server.Documents.Indexes
                     documentDatabase.IoChanges, documentDatabase.CatastrophicFailureNotification, LoggingResource.Database(documentDatabase.Name),
                     LoggingComponent.Name(Name));
 
-            var searchEngineType = Type.IsAuto() ? configuration.AutoIndexingEngineType : configuration.StaticIndexingEngineType;
+            var searchEngineType = Type.IsJoin() ? SearchEngineType.Corax : Type.IsAuto() ? configuration.AutoIndexingEngineType : configuration.StaticIndexingEngineType;
             InitializeOptions(options, documentDatabase, name, searchEngineType: searchEngineType);
 
             return options;
@@ -1398,6 +1405,65 @@ namespace Raven.Server.Documents.Indexes
                 using (indexContext.OpenReadTransaction())
                 {
                     return IsStale(queryContext, indexContext, cutoff?.DocumentCutoff, cutoff?.ReferenceCutoff, cutoff?.CompareExchangeReferenceCutoff);
+                }
+            }
+        }
+
+        internal IReadOnlyDictionary<string, (long Doc, long Tombstone)> ReadConsumed(RavenTransaction indexTx)
+        {
+            var consumed = new Dictionary<string, (long Doc, long Tombstone)>(Collections.Count);
+            foreach (string collection in Collections)
+                consumed[collection] = (_indexStorage.ReadLastIndexedEtag(indexTx, collection), ReadLastProcessedTombstoneEtag(indexTx, collection));
+
+            return consumed;
+        }
+
+        internal Guid EnvironmentId => _environment.DbId;
+
+        /// <summary>
+        /// Opens a read snapshot of a Corax index without promoting it from idle and without marking it as queried.
+        /// Returns false when the index is not open, faulty, in a storage operation or not a Corax index.
+        /// </summary>
+        internal bool TryOpenSnapshot(out IndexSnapshot snapshot)
+        {
+            snapshot = null;
+
+            if (_initialized == false || _disposeOnce.Disposed || Type == IndexType.Faulty || Type.IsJoin() || SearchEngineType != SearchEngineType.Corax || State is IndexState.Disabled or IndexState.Error)
+                return false;
+
+            IndexQueryDoneRunning queryLock = CurrentlyInUse(out bool available);
+            IDisposable context = null;
+            IDisposable transaction = null;
+            IDisposable reader = null;
+            bool success = false;
+            try
+            {
+                if (available == false || _contextPool == null || _environment == null)
+                    return false;
+
+                context = _contextPool.AllocateOperationContext(out TransactionOperationContext indexContext);
+                RavenTransaction indexTx = indexContext.OpenReadTransaction();
+                transaction = indexTx;
+
+                var consumed = ReadConsumed(indexTx);
+
+                IndexReadOperationBase readOperation = IndexPersistence.OpenIndexReader(indexTx.InnerTransaction);
+                reader = readOperation;
+                if (readOperation is not CoraxIndexReadOperation coraxReader)
+                    return false;
+
+                snapshot = new IndexSnapshot(_environment.DbId, coraxReader.Searcher, indexTx.InnerTransaction, consumed, ((CoraxIndexPersistence)IndexPersistence).GetFieldsMappingForReaders(), reader, transaction, context, queryLock);
+                success = true;
+                return true;
+            }
+            finally
+            {
+                if (success == false)
+                {
+                    reader?.Dispose();
+                    transaction?.Dispose();
+                    context?.Dispose();
+                    queryLock.Dispose();
                 }
             }
         }
@@ -2115,6 +2181,8 @@ namespace Raven.Server.Documents.Indexes
             }
             
             TestRun?.BatchCompleted.Set();
+
+            DocumentDatabase.IndexStore.RaiseBatchCommitted(Name, didWork);
 
             var batchCompletedAction = DocumentDatabase.IndexStore.IndexBatchCompleted;
             batchCompletedAction?.Invoke((Name, didWork));
@@ -3486,6 +3554,7 @@ namespace Raven.Server.Documents.Indexes
                     // https://issues.hibernatingrhinos.com/issue/RavenDB-5576
                     var frozenAwaiter = GetIndexingBatchAwaiter();
                     var joinedAwaiters = joinedIndexes?.GetAwaiters();
+                    using (joinedIndexes == null ? null : await joinedIndexes.OpenJoinsAsync(DocumentDatabase, query, this, token.Token).ConfigureAwait(false))
                     using (_contextPool.AllocateOperationContext(out TransactionOperationContext indexContext))
                     using (var indexTx = indexContext.OpenReadTransaction())
                     {
@@ -3527,7 +3596,7 @@ namespace Raven.Server.Documents.Indexes
 
                         FillQueryResult(resultToFill, isStale, query.Metadata, queryContext, indexContext, queryTime);
 
-                        using (var joinSource = OpenJoinSource(query, queryContext, indexTx, token))
+                        using (var joinSource = OpenJoinSource(query, queryContext, indexTx, token, allowOrderedPage: true))
                         using (var reader = IndexPersistence.OpenIndexReader(indexTx.InnerTransaction, query))
                         {
                             query.JoinResults = joinSource?.Results;
@@ -3769,15 +3838,17 @@ namespace Raven.Server.Documents.Indexes
             }
         }
 
-        private JoinSources OpenJoinSource(IndexQueryServerSide query, QueryOperationContext queryContext, RavenTransaction indexTransaction, OperationCancelToken token)
+        private JoinSources OpenJoinSource(IndexQueryServerSide query, QueryOperationContext queryContext, RavenTransaction indexTransaction, OperationCancelToken token, bool allowOrderedPage = false)
         {
             if (query.Metadata.Query.Joins == null)
                 return null;
 
+            _forTestingPurposes?.BeforeJoinSourcesOpened?.Invoke();
+
             using (var joinScope = query.Timings?.For(nameof(QueryTimingsScope.Names.Join)))
             {
                 query.JoinTimings = joinScope;
-                return JoinSources.Open(DocumentDatabase, query, this, indexTransaction, queryContext.Documents, joinScope, Configuration.CoraxIncludeDocumentScore, keepWinners: false, token.Token);
+                return JoinSources.Open(DocumentDatabase, query, this, indexTransaction, queryContext.Documents, joinScope, Configuration.CoraxIncludeDocumentScore, keepWinners: false, allowOrderedPage, token.Token);
             }
         }
 
@@ -3808,6 +3879,7 @@ namespace Raven.Server.Documents.Indexes
                     await marker.HoldLockAsync();
                     var frozenAwaiter = GetIndexingBatchAwaiter();
                     var joinedAwaiters = joinedIndexes?.GetAwaiters();
+                    using (joinedIndexes == null ? null : await joinedIndexes.OpenJoinsAsync(DocumentDatabase, query, this, token.Token).ConfigureAwait(false))
                     using (_contextPool.AllocateOperationContext(out TransactionOperationContext indexContext))
                     using (var indexTx = indexContext.OpenReadTransaction())
                     {
@@ -3978,6 +4050,7 @@ namespace Raven.Server.Documents.Indexes
                     AssertIndexState();
                     await marker.HoldLockAsync();
 
+                    using (joinedIndexes == null ? null : await joinedIndexes.OpenJoinsAsync(DocumentDatabase, query, this, token.Token).ConfigureAwait(false))
                     using (_contextPool.AllocateOperationContext(out TransactionOperationContext indexContext))
                     {
                         // we take the awaiter _before_ the indexing transaction happens,
@@ -4653,6 +4726,7 @@ namespace Raven.Server.Documents.Indexes
             if (query?.Joins == null)
                 return 0;
 
+            // the answer of a join that a join index serves is the answer of the join of the same snapshots: the state of the join index is not part of it
             return GetJoinedIndexesEtagOfJoins(context, query, joinSource);
         }
 
@@ -5962,6 +6036,8 @@ namespace Raven.Server.Documents.Indexes
             internal bool ShouldRenewTransaction;
 
             internal Action BeforeClosingDocumentsReadTransactionForHandleReferences;
+
+            internal Action BeforeJoinSourcesOpened;
 
             internal IDisposable CallDuringFinallyOfExecuteIndexing(Action action)
             {

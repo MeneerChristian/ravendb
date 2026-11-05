@@ -7,6 +7,7 @@ using Corax;
 using Corax.Querying;
 using Index = Raven.Server.Documents.Indexes.Index;
 using Raven.Server.Documents.Indexes.Persistence.Corax;
+using Raven.Server.Documents.Indexes.Joins.Serving;
 using Raven.Server.Documents.Queries.AST;
 using Raven.Server.Documents.Queries.Timings;
 using Raven.Server.ServerWide.Context;
@@ -71,6 +72,9 @@ namespace Raven.Server.Documents.Queries
 
         public ByteStringContext InnerAllocator { get; init; }
 
+        // Set when a join index answered the join: there are no keys, the match comes from the join index
+        public JoinServed Served { get; init; }
+
         private JoinTermScores ProbeKeys => CompositeProbe ?? Keys;
 
         // Join on several fields whose joined document is projected
@@ -122,7 +126,7 @@ namespace Raven.Server.Documents.Queries
         public void AddDocumentIdsOfMainId(string mainId, List<string> ids, CancellationToken token)
         {
             if (Keys == null || Reader == null)
-                throw new InvalidOperationException($"The join '{Alias}' has no joined documents to look the id '{mainId}' up in.");
+                throw new InvalidOperationException($"The join '{Alias}' was answered by a join index: it has no joined documents to look the id '{mainId}' up in.");
 
             var maxBytes = Encoding.UTF8.GetMaxByteCount(mainId.Length);
             var rented = ArrayPool<byte>.Shared.Rent(maxBytes * 4);
@@ -156,7 +160,7 @@ namespace Raven.Server.Documents.Queries
         public bool MatchedDocument(string id)
         {
             if (Keys == null)
-                throw new InvalidOperationException($"The join '{Alias}' has no keys to look the document '{id}' up in.");
+                throw new InvalidOperationException($"The join '{Alias}' was answered by a join index: it has no keys to look the document '{id}' up in.");
 
             var maxBytes = Encoding.UTF8.GetMaxByteCount(id.Length);
             var rented = maxBytes <= 512 ? null : ArrayPool<byte>.Shared.Rent(maxBytes);

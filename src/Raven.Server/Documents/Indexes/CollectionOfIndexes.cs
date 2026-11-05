@@ -4,6 +4,8 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Threading;
+using Raven.Server.Documents.Indexes.Joins;
 using Sparrow.Collections;
 using AsyncManualResetEvent = Sparrow.Server.AsyncManualResetEvent;
 
@@ -45,9 +47,52 @@ namespace Raven.Server.Documents.Indexes
 
         private void Registered() => _registered.SetAndResetAtomically();
 
+        private readonly ConcurrentDictionary<string, JoinIndex> _joinsByName = new ConcurrentDictionary<string, JoinIndex>(IndexNameComparer.Instance);
+
+        /// <summary>The join indexes, empty most of the time: a query with joins looks for the ones of its indexes.</summary>
+        public IEnumerable<JoinIndex> Joins => _joinsByName.IsEmpty ? Enumerable.Empty<JoinIndex>() : _joinsByName.Values;
+
+        private sealed class OrderedJoinSet(int version, JoinIndex[] joinIndexes)
+        {
+            public readonly int Version = version;
+            public readonly JoinIndex[] Joins = joinIndexes;
+        }
+
+        private int _joinsVersion;
+        private OrderedJoinSet _orderedJoins;
+
+        /// <summary>
+        /// The join indexes in one fixed order: each by name. A query that has several join indexes of the same join tries them in this order.
+        /// The array is shared by all queries and rebuilt after the join indexes changed.
+        /// </summary>
+        public JoinIndex[] OrderedJoins
+        {
+            get
+            {
+                int version = Volatile.Read(ref _joinsVersion);
+                OrderedJoinSet cached = Volatile.Read(ref _orderedJoins);
+                if (cached != null && cached.Version == version)
+                    return cached.Joins;
+
+                JoinIndex[] ordered = _joinsByName.Values.ToArray();
+                Array.Sort(ordered, static (x, y) => string.CompareOrdinal(x.Name, y.Name));
+
+                // read before the join indexes were listed: a change that happens in between makes the next read build again
+                Volatile.Write(ref _orderedJoins, new OrderedJoinSet(version, ordered));
+                return ordered;
+            }
+        }
+
+        private void JoinsChanged() => Interlocked.Increment(ref _joinsVersion);
+
         public void Add(Index index)
         {
             _indexesByName[index.Name] = index;
+            if (index is JoinIndex joinIndex)
+            {
+                _joinsByName[index.Name] = joinIndex;
+                JoinsChanged();
+            }
 
             Registered();
 
@@ -63,8 +108,18 @@ namespace Raven.Server.Documents.Indexes
             Debug.Assert(oldIndex == null || IndexNameComparer.Instance.Equals(name, oldIndex.Name));
 
             _indexesByName.AddOrUpdate(name, newIndex, (key, oldValue) => newIndex);
+            if (newIndex is JoinIndex joinIndex)
+                _joinsByName[name] = joinIndex;
+            else
+                _joinsByName.TryRemove(name, out _);
+
             if (newIndex.Name != name)
+            {
                 _indexesByName.TryRemove(newIndex.Name, out Index _);
+                _joinsByName.TryRemove(newIndex.Name, out _);
+            }
+
+            JoinsChanged();
 
             Registered();
 
@@ -92,10 +147,22 @@ namespace Raven.Server.Documents.Indexes
             if (_indexesByName.TryRemove(name, out index) == false)
                 return false; // already removed?
 
+            if (index is JoinIndex)
+            {
+                _joinsByName.TryRemove(name, out _);
+                JoinsChanged();
+            }
+
             if (index != existingInstance)
             {
                 // here for correctness only, don't expect this to ever happen
                 _indexesByName.TryAdd(name, index);// re-add the removed one
+                if (index is JoinIndex readded)
+                {
+                    _joinsByName[name] = readded;
+                    JoinsChanged();
+                }
+
                 return false;
             }
 

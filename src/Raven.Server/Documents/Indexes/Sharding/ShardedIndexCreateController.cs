@@ -25,6 +25,8 @@ public sealed class ShardedIndexCreateController : AbstractIndexCreateController
 
     protected override string GetDatabaseName() => _context.DatabaseName;
 
+    protected override bool IsShardedDatabase => true;
+
     public override SystemTime GetDatabaseTime() => _context.Time;
 
     public override RavenConfiguration GetDatabaseConfiguration() => _context.Configuration;

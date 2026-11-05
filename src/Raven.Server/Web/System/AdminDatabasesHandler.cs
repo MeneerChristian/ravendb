@@ -28,6 +28,7 @@ using Raven.Server.Config.Settings;
 using Raven.Server.Documents;
 using Raven.Server.Documents.Commands;
 using Raven.Server.Documents.Indexes.Auto;
+using Raven.Server.Documents.Indexes.Joins;
 using Raven.Server.Documents.Operations;
 using Raven.Server.Documents.Patch;
 using Raven.Server.Documents.PeriodicBackup.Restore;
@@ -447,6 +448,7 @@ namespace Raven.Server.Web.System
                             case IndexType.MapReduce:
                             case IndexType.JavaScriptMap:
                             case IndexType.JavaScriptMapReduce:
+                            case IndexType.Join:
                                 var indexDefinition = index.GetIndexDefinition();
                                 if (indexDefinition.Name.StartsWith(Constants.Documents.Indexing.SideBySideIndexNamePrefix, StringComparison.OrdinalIgnoreCase))
                                 {

@@ -23,6 +23,7 @@ using Voron.Data.Graphs;
 using Voron.Impl;
 using Constants = Raven.Client.Constants;
 using IndexWriter = Corax.Indexing.IndexWriter;
+using IndexFieldsMapping = Corax.Mappings.IndexFieldsMapping;
 
 namespace Raven.Server.Documents.Indexes.Persistence.Corax;
 
@@ -100,6 +101,9 @@ public sealed class CoraxIndexPersistence : IndexPersistenceBase
         return IndexReadOperationFactory.CreateCoraxIndexReadOperation(_index, _logger, readTransaction, _index._queryBuilderFactories,
             _converter.GetKnownFieldsForQuerying(), query);
     }
+
+    /// <summary>The fields of the index as its readers know them: the analyzer of a field says how a value that is looked up in it has to be encoded.</summary>
+    internal IndexFieldsMapping GetFieldsMappingForReaders() => _converter.GetKnownFieldsForQuerying();
 
     public override bool ContainsField(string field)
     {

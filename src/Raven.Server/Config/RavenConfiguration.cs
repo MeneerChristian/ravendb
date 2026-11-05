@@ -58,6 +58,8 @@ namespace Raven.Server.Config
         
         public AiConfiguration Ai { get; }
 
+        public JoinConfiguration Join { get; }
+
         public QueueSinkConfiguration QueueSink { get; }
 
         public CdcSinkConfiguration CdcSink { get; }
@@ -157,6 +159,7 @@ namespace Raven.Server.Config
             Cluster = new ClusterConfiguration();
             Etl = new EtlConfiguration();
             Ai = new AiConfiguration();
+            Join = new JoinConfiguration();
             Storage = new StorageConfiguration();
             Security = new SecurityConfiguration();
             Backup = new BackupConfiguration();
@@ -227,6 +230,7 @@ namespace Raven.Server.Config
             Cluster.Initialize(Settings, settingsNames, ServerWideSettings, serverWideSettingsNames, ResourceType, ResourceName);
             Etl.Initialize(Settings, settingsNames, ServerWideSettings, serverWideSettingsNames, ResourceType, ResourceName);
             Ai.Initialize(Settings, settingsNames, ServerWideSettings, serverWideSettingsNames, ResourceType, ResourceName);
+            Join.Initialize(Settings, settingsNames, ServerWideSettings, serverWideSettingsNames, ResourceType, ResourceName);
             Queries.Initialize(Settings, settingsNames, ServerWideSettings, serverWideSettingsNames, ResourceType, ResourceName);
             Patching.Initialize(Settings, settingsNames, ServerWideSettings, serverWideSettingsNames, ResourceType, ResourceName);
             Logs.Initialize(Settings, settingsNames, ServerWideSettings, serverWideSettingsNames, ResourceType, ResourceName);

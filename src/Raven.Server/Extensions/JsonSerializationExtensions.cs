@@ -133,6 +133,9 @@ namespace Raven.Server.Extensions
 
             result[nameof(IndexDefinition.AdditionalAssemblies)] = new DynamicJsonArray(additionalAssemblies);
 
+            if (definition.Join != null)
+                result[nameof(IndexDefinition.Join)] = definition.Join.ToJson();
+
             return result;
         }
     }

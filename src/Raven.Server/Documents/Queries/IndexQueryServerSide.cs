@@ -13,6 +13,7 @@ using Raven.Client.Documents.Changes;
 using Raven.Client.Documents.Queries;
 using Raven.Client.Exceptions;
 using Raven.Server.Documents.Indexes.Static.Spatial;
+using Raven.Server.Documents.Indexes.Joins.Serving;
 using Raven.Server.Documents.Queries.AST;
 using Raven.Server.Documents.Queries.Timings;
 using Raven.Server.Json;
@@ -59,6 +60,10 @@ namespace Raven.Server.Documents.Queries
 
         [JsonDeserializationIgnore]
         internal List<JoinResult> JoinResults;
+
+        /// <summary>What the join indexes hold for the current attempt of this query.</summary>
+        [JsonDeserializationIgnore]
+        internal JoinQueryLease JoinLease;
 
         [JsonDeserializationIgnore]
         internal bool IsJoinSource;

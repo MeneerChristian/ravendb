@@ -755,6 +755,7 @@ namespace Raven.Server.Smuggler.Documents
                         case IndexType.MapReduce:
                         case IndexType.JavaScriptMap:
                         case IndexType.JavaScriptMapReduce:
+                        case IndexType.Join:
                             var indexDefinition = (IndexDefinition)index.IndexDefinition;
                             if (string.Equals(indexDefinition.Name, "Raven/DocumentsByEntityName", StringComparison.OrdinalIgnoreCase))
                             {

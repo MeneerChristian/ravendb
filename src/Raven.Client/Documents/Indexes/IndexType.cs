@@ -14,6 +14,7 @@
         Faulty              = 5,
         JavaScriptMap       = 6,
         JavaScriptMapReduce = 7,
+        Join              = 8,
     }
 
     internal static class IndexTypeExtensions
@@ -45,7 +46,12 @@
 
         public static bool IsStatic(this IndexType self)
         {
-            return self == IndexType.Map || self == IndexType.MapReduce || self == IndexType.JavaScriptMap || self == IndexType.JavaScriptMapReduce;
+            return self == IndexType.Map || self == IndexType.MapReduce || self == IndexType.JavaScriptMap || self == IndexType.JavaScriptMapReduce || self == IndexType.Join;
+        }
+
+        public static bool IsJoin(this IndexType self)
+        {
+            return self == IndexType.Join;
         }
 
         public static bool IsJavaScript(this IndexType self)

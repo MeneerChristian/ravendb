@@ -73,7 +73,7 @@ internal abstract class AbstractAdminIndexHandlerProcessorForPut<TRequestHandler
                     RequestHandler.LogAuditForDatabase("PUT", $"Index '{indexDefinition.Name}' with definition: {indexToAdd}");
                 }
 
-                if (indexDefinition.Maps == null || indexDefinition.Maps.Count == 0)
+                if (indexDefinition.Join == null && (indexDefinition.Maps == null || indexDefinition.Maps.Count == 0))
                     throw new ArgumentException("Index must have a 'Maps' fields");
 
                 indexDefinition.Type = indexDefinition.DetectStaticIndexType();
@@ -90,7 +90,13 @@ internal abstract class AbstractAdminIndexHandlerProcessorForPut<TRequestHandler
                         $"Index name must not start with '{Constants.Documents.Indexing.SideBySideIndexNamePrefix}'. Provided index name: '{indexDefinition.Name}'");
                 }
 
-                if (batch != null)
+                if (batch != null && indexDefinition.Join != null)
+                {
+                    // a join index reads the indexes of the batch
+                    await batch.SaveAsync();
+                }
+
+                if (batch != null && indexDefinition.Join == null)
                 {
                     await batch.AddIndexAsync(indexDefinition, source, processor.GetDatabaseTime().GetUtcNow(), $"{raftRequestId}/{indexDefinition.Name}");
                     await batch.SaveIfNeeded();

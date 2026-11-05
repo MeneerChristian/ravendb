@@ -312,6 +312,42 @@ public sealed unsafe partial class IndexSearcher : IDisposable
     }
 
 
+    // The term of a text value as the field is analyzed, for a caller that has to know instead of failing: false when the analyzer does not turn the text into exactly one term (it splits the text, or drops it)
+    public bool TryEncodeAndApplyAnalyzer(in FieldMetadata binding, string term, out Slice value)
+    {
+        var useDefaultAnalyzer = binding.FieldId == Constants.IndexWriter.DynamicField && binding.Mode is not (FieldIndexingMode.Exact or FieldIndexingMode.No);
+        if (string.IsNullOrEmpty(term) || term == Constants.EmptyString || term == Constants.NullValue || (useDefaultAnalyzer == false && (binding.Mode is FieldIndexingMode.Exact || binding.Analyzer is null)))
+        {
+            value = EncodeAndApplyAnalyzer(binding, term);
+            return true;
+        }
+
+        var analyzer = useDefaultAnalyzer ? _fieldMapping.DefaultAnalyzer : binding.Analyzer;
+        var originalTerm = Encodings.Utf8.GetBytes(term);
+        analyzer.GetOutputBuffersSize(originalTerm.Length, out int outputSize, out int tokenSize);
+        var buffer = Analyzer.BufferPool.Rent(outputSize);
+        var tokens = Analyzer.TokensPool.Rent(tokenSize);
+        try
+        {
+            Span<byte> bufferSpan = buffer.AsSpan();
+            Span<Token> tokensSpan = tokens.AsSpan();
+            analyzer.Execute(originalTerm, ref bufferSpan, ref tokensSpan);
+            if (tokensSpan.Length != 1)
+            {
+                value = default;
+                return false;
+            }
+
+            Indexing.IndexWriter.CreateNormalizedTerm(Allocator, bufferSpan, out value);
+            return true;
+        }
+        finally
+        {
+            Analyzer.TokensPool.Return(tokens);
+            Analyzer.BufferPool.Return(buffer);
+        }
+    }
+
     public void ApplyAnalyzer(in FieldMetadata binding, Analyzer analyzer, ReadOnlySpan<byte> originalTerm, out Slice value)
     {
         if (binding.FieldId == Constants.IndexWriter.DynamicField && binding.Mode is not (FieldIndexingMode.Exact or FieldIndexingMode.No))

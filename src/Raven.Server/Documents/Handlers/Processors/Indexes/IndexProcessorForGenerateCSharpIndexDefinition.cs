@@ -32,6 +32,9 @@ internal sealed class IndexProcessorForGenerateCSharpIndexDefinition : AbstractI
         if (index.Type.IsAuto())
             throw new InvalidOperationException("Can't create C# index definition from auto indexes");
 
+        if (index.Type.IsJoin())
+            throw new InvalidOperationException("Can't create C# index definition from a join index");
+
         var indexDefinition = index.GetIndexDefinition();
 
         return WriteResultAsync(new IndexDefinitionCodeGenerator(indexDefinition).Generate());

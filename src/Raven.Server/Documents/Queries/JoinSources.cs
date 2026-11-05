@@ -9,6 +9,7 @@ using Raven.Server.Config;
 using Raven.Client.Documents.Indexes;
 using Raven.Client.Exceptions;
 using Raven.Client.Exceptions.Documents.Indexes;
+using Raven.Server.Documents.Indexes.Joins.Serving;
 using Index = Raven.Server.Documents.Indexes.Index;
 using Raven.Server.Documents.Indexes.Persistence.Corax;
 using Raven.Server.Documents.Queries.AST;
@@ -38,13 +39,13 @@ namespace Raven.Server.Documents.Queries
 
         // outerIndex and outerTransaction: the index the query runs on and the transaction it reads with
         public static JoinSources Open(DocumentDatabase database, IndexQueryServerSide outerQuery, Index outerIndex, RavenTransaction outerTransaction,
-            DocumentsOperationContext documentsContext, QueryTimingsScope timings, bool returnsScores, bool keepWinners, CancellationToken token)
+            DocumentsOperationContext documentsContext, QueryTimingsScope timings, bool returnsScores, bool keepWinners, bool allowOrderedPage, CancellationToken token)
         {
             var sources = new JoinSources();
             try
             {
                 foreach (var join in outerQuery.Metadata.Query.Joins)
-                    sources.OpenJoin(database, outerQuery, outerIndex, outerTransaction, join, documentsContext, timings, returnsScores, keepWinners, token);
+                    sources.OpenJoin(database, outerQuery, outerIndex, outerTransaction, join, documentsContext, timings, returnsScores, keepWinners, allowOrderedPage, token);
 
                 return sources;
             }
@@ -86,7 +87,7 @@ namespace Raven.Server.Documents.Queries
         }
 
         private void OpenJoin(DocumentDatabase database, IndexQueryServerSide outerQuery, Index outerIndex, RavenTransaction outerTransaction, JoinClause join,
-            DocumentsOperationContext documentsContext, QueryTimingsScope timings, bool returnsScores, bool keepWinners, CancellationToken token)
+            DocumentsOperationContext documentsContext, QueryTimingsScope timings, bool returnsScores, bool keepWinners, bool allowOrderedPage, CancellationToken token)
         {
             // the entry of the joined document of a row is read to compare its fields
             keepWinners |= join.Compare != null;
@@ -98,6 +99,10 @@ namespace Raven.Server.Documents.Queries
 
             var indexName = join.Query.From.From.FieldValue;
             var index = ResolveInnerIndex(database, indexName);
+
+            if (index.Type.IsJoin())
+                throw new InvalidQueryException($"The JOIN sub-query of '{join.Alias}' reads the join index '{indexName}', which is not queried directly. Join the indexes that it joins.",
+                    outerQuery.Query, outerQuery.QueryParameters);
 
             // the joined index is queried too: it has to stay alive (and not be idle) for as long as this query reads it
             index = HoldInnerIndex(database, indexName, index, out IDisposable inUse);
@@ -136,16 +141,29 @@ namespace Raven.Server.Documents.Queries
             _disposables.Add(transaction);
             Snapshots[join] = indexContext;
 
-            var reader = index.IndexPersistence.OpenIndexReader(transaction.InnerTransaction, subQuery);
-            _disposables.Add(reader);
-            if (reader is not CoraxIndexReadOperation corax)
-                throw new InvalidQueryException($"JOIN is supported only for Corax indexes, but '{indexName}' is not one.", outerQuery.Query, outerQuery.QueryParameters);
+            // a join index that answers the join reads the sub-query only for its score and for the terms of its fields: the reader is opened when something asks for it
+            CoraxIndexReadOperation corax = null;
+            CoraxIndexReadOperation OpenReader()
+            {
+                if (corax != null)
+                    return corax;
+
+                var reader = index.IndexPersistence.OpenIndexReader(transaction.InnerTransaction, subQuery);
+                _disposables.Add(reader);
+                return corax = reader as CoraxIndexReadOperation
+                               ?? throw new InvalidQueryException($"JOIN is supported only for Corax indexes, but '{indexName}' is not one.", outerQuery.Query, outerQuery.QueryParameters);
+            }
+
+            if (TryServe(outerQuery, outerIndex, outerTransaction, join, index, transaction, OpenReader, innerOrder, subQuery, joinTimings, returnsScores, indexName, documentsContext, allowOrderedPage, token))
+                return;
+
+            OpenReader();
 
             // a chain of joins: the sub-query joins other documents itself, those joins have to be read before the sub-query can be
             List<JoinResult> nestedResults = null;
             if (subQuery.Metadata.Query.Joins != null)
             {
-                var nested = Open(database, subQuery, index, transaction, documentsContext, joinTimings, false, keepWinners, token);
+                var nested = Open(database, subQuery, index, transaction, documentsContext, joinTimings, false, keepWinners, false, token);
                 _disposables.Add(nested);
                 foreach ((JoinClause nestedJoin, TransactionOperationContext nestedContext) in nested.Snapshots)
                     Snapshots[nestedJoin] = nestedContext;
@@ -255,6 +273,114 @@ namespace Raven.Server.Documents.Queries
             joinTimings?.Dispose();
         }
 
+        // A join index answers the join instead of the scan of its sub-query. Only the joins of the main query are offered:
+        // a leaf of a chain has the sub-query as its outer query and no join indexes
+        private bool TryServe(IndexQueryServerSide outerQuery, Index outerIndex, RavenTransaction outerTransaction, JoinClause join, Index innerIndex,
+            RavenTransaction innerTransaction, Func<CoraxIndexReadOperation> innerReader, List<(QueryExpression Expression, OrderByFieldType FieldType, bool Ascending, NullsOrderingType NullsOrdering)> innerOrder,
+            IndexQueryServerSide subQuery, QueryTimingsScope joinTimings, bool returnsScores, string innerIndexName, DocumentsOperationContext documentsContext, bool allowOrderedPage, CancellationToken token)
+        {
+            JoinQueryLease lease = outerQuery.JoinLease;
+            // a join index is defined on a field of the outer index, or on the id of the outer documents when the join matches id(main) against a field of the joined index
+            // (the joined alias is then read per row, which a join index does not do: ProjectsDocument)
+            if (lease == null || outerQuery.IsJoinSource || join.IsComposite || join.Compare != null || join.Query.Joins != null || join.ProjectsDocument ||
+                join.On.Left is not (FieldExpression or MethodExpression) || (join.On.Left is MethodExpression && join.InnerField == null))
+                return false;
+
+            // the first page of a query that is ordered by this join and by nothing else is answered by the join index in that order
+            JoinOrderField[] order = null;
+            if (innerOrder != null)
+            {
+                if (allowOrderedPage == false || OrderedPageMayApply(join, outerQuery) == false)
+                    return false;
+
+                order = innerOrder.Select(x => new JoinOrderField(((FieldExpression)x.Expression).FieldValue, x.Ascending, x.FieldType)).ToArray();
+            }
+
+            var request = new JoinServeRequest
+            {
+                Query = outerQuery,
+                Join = join,
+                IsLeft = join.IsLeft,
+                InnerOrder = order,
+                OuterIndexName = outerIndex.Name,
+                InnerIndexName = innerIndexName,
+                OuterField = QueryBuilderHelper.ExtractIndexFieldName(outerQuery.Metadata.Query, outerQuery.QueryParameters, join.On.Left, outerQuery.Metadata).Value,
+                Outer = new JoinIndexState { EnvironmentId = outerIndex.EnvironmentId, Consumed = outerIndex.ReadConsumed(outerTransaction) },
+                Inner = new JoinIndexState { EnvironmentId = innerIndex.EnvironmentId, Consumed = innerIndex.ReadConsumed(innerTransaction) },
+                ScoresNeeded = returnsScores,
+                ScoresAsked = returnsScores || outerQuery.Metadata.OrderBy?.Any(x => x.OrderingType == OrderByFieldType.Score) == true,
+                ScoresMayMatter = ScoresMayMatter(outerQuery, outerIndex),
+                Boost = BoostOf(join, outerQuery),
+                Timings = joinTimings,
+                ProbeKey = () => $"{join.Query}|{outerQuery.QueryParameters}",
+                ProbeFunc = () =>
+                {
+                    // the relevance of the sub-query is read without its order, the way the scan scores it
+                    var probeQuery = innerOrder == null ? subQuery : CreateSubQuery(join.Query, outerQuery, null);
+                    probeQuery.JoinTimings = joinTimings;
+                    return innerReader().ProbeSubQueryScore(probeQuery, documentsContext, token);
+                },
+                EncodeFunc = (field, text) => innerReader().EncodeTerm(field, text),
+                ScanKeys = join.InnerField == null || innerOrder != null
+                    ? null
+                    : (keyBytes, keyEnds) => innerReader().ScanTermScoresAmong(subQuery, documentsContext, join.InnerField, keyBytes, keyEnds, token)
+            };
+
+            if (lease.TryServe(request, Logger, out JoinServed served) == false || served == null)
+                return false;
+
+            if ((order != null) != (served.OrderedPage != null))
+            {
+                if (Logger.IsErrorEnabled)
+                    Logger.Error($"A join index answered the join of '{join.Alias}' with the wrong kind of answer. The join is read as usual.");
+
+                return false;
+            }
+
+            var result = new JoinResult
+            {
+                Alias = join.Alias.Value,
+                RootAlias = (join.RootAlias ?? join.Alias).Value,
+                KeysAreTerms = join.InnerField != null,
+                InnerIndexName = innerIndexName,
+                Timings = joinTimings,
+                OuterPath = OuterPathOf(join.On, outerQuery),
+                IsOptional = (join.ReferencedInWhere || join.IsLeft) && join.InnerField == null,
+                Boost = BoostOf(join, outerQuery),
+                SubQuery = subQuery,
+                InnerIndex = innerIndex,
+                Served = served
+            };
+            _disposables.Add(result);
+            Results.Add(result);
+
+            if (served.Counters != null)
+            {
+                foreach (var counter in served.Counters)
+                    joinTimings?.AddCounter(counter.Key, counter.Value);
+            }
+
+            joinTimings?.Dispose();
+            return true;
+        }
+
+        // False only when nothing in the query can use the score of the join: it is ordered by fields of the main documents and nothing boosts or ranks.
+        // True whenever it is not sure, so it may be true although the query builder does not score the join.
+        internal static bool ScoresMayMatter(IndexQueryServerSide outerQuery, Index outerIndex)
+        {
+            var metadata = outerQuery.Metadata;
+            if (metadata.OrderBy == null || metadata.OrderBy.Length == 0)
+                return true;
+
+            foreach (var order in metadata.OrderBy)
+            {
+                if (order.OrderingType == OrderByFieldType.Score || order.JoinAlias != null)
+                    return true;
+            }
+
+            return metadata.HasBoost || outerIndex.HasBoostedFields || metadata.HasMoreLikeThis || metadata.HasVectorSearch || metadata.HasHighlightings || metadata.HasFacet || metadata.HasExplanations;
+        }
+
         // The table of the dictionary of the outer index when the ids of the join can be kept encoded for it, null when they are decoded
         private static ulong? OuterKeyTable(IndexQueryServerSide outerQuery, Index outerIndex, LowLevelTransaction outerTransaction, JoinClause join, Index innerIndex)
         {
@@ -263,6 +389,28 @@ namespace Raven.Server.Documents.Queries
 
             var outerField = QueryBuilderHelper.ExtractIndexFieldName(outerQuery.Metadata.Query, outerQuery.QueryParameters, field, outerQuery.Metadata).Value;
             return JoinEncodedKeys.KeysReachTreeUnchanged(innerIndex, outerIndex, outerField) ? JoinEncodedKeys.TableOf(outerTransaction) : null;
+        }
+
+        // The query asks for a small first page, ordered by the fields of this join only: the builder takes the page of the join index as it takes the ordered walk
+        internal static bool OrderedPageMayApply(JoinClause join, IndexQueryServerSide outerQuery)
+        {
+            var metadata = outerQuery.Metadata;
+            if (metadata.Query.Joins.Count != 1 || join.IsLeft || join.ReferencedInWhere || join.Compare != null || join.Query.Joins != null)
+                return false;
+
+            if (outerQuery.PageSize <= 0 || (long)outerQuery.Start + outerQuery.PageSize > JoinOrderedWalkSettings.MaximumTake)
+                return false;
+
+            if (metadata.HasMoreLikeThis || metadata.HasVectorSearch || metadata.HasHighlightings || metadata.HasFacet || metadata.HasExplanations || metadata.FilterScript != null)
+                return false;
+
+            foreach (var order in metadata.OrderBy)
+            {
+                if (order.JoinAlias != join.Alias.Value)
+                    return false;
+            }
+
+            return true;
         }
 
         // The outer query can answer a join that orders the result by walking the joined index in that order, when the page is small
@@ -288,7 +436,7 @@ namespace Raven.Server.Documents.Queries
         }
 
         // BOOST of the join: a non-negative finite number, or a parameter that holds one
-        private static float BoostOf(JoinClause join, IndexQueryServerSide outerQuery)
+        internal static float BoostOf(JoinClause join, IndexQueryServerSide outerQuery)
         {
             if (join.Boost == null)
                 return 1f;
@@ -326,7 +474,7 @@ namespace Raven.Server.Documents.Queries
         }
 
         // The ORDER BY fields of the main query that belong to this join, as the ORDER BY of the sub-query
-        private static List<(QueryExpression Expression, OrderByFieldType FieldType, bool Ascending, NullsOrderingType NullsOrdering)> InnerOrderOf(JoinClause join, IndexQueryServerSide outerQuery)
+        internal static List<(QueryExpression Expression, OrderByFieldType FieldType, bool Ascending, NullsOrderingType NullsOrdering)> InnerOrderOf(JoinClause join, IndexQueryServerSide outerQuery)
         {
             var orderBy = outerQuery.Metadata.OrderBy;
             if (orderBy == null)
