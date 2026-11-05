@@ -5,6 +5,7 @@ import conflicts from "./conflicts.json";
 import documentRefresh from "./documentRefresh.json";
 import editCustomSorter from "./editCustomSorter.json";
 import featureAvailabilitySummary from "./featureAvailabilitySummary.json";
+import joinIndex from "./joinIndex.json";
 import revisionsBin from "./revisionsBin.json";
 import studioGlobalConfiguration from "./studioGlobalConfiguration.json";
 
@@ -15,6 +16,7 @@ const pl: LanguageResources = {
     documentRefresh,
     editCustomSorter,
     featureAvailabilitySummary,
+    joinIndex,
     revisionsBin,
     studioGlobalConfiguration,
 };

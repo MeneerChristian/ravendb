@@ -16,6 +16,8 @@ const docsHashes: Record<string, StringWithAutocomplete<"MISSING_DOCS">> = {
     "databases/indexes/visualizer": "E2NPXE",
     "databases/indexes/new": "XZXJP2",
     "databases/indexes/edit(/:indexName)": "XZXJP2",
+    // the docs have no page of the join index yet: until they have, it is the page of creating an index, like the other index types
+    "databases/indexes/join(/:indexName)": "XZXJP2",
     "databases/tasks/backups": "GMBYOH",
     "databases/tasks/editPeriodicBackupTask": "GMBYOH",
     "databases/tasks/ongoingTasks": "K4ZTNA",
@@ -72,7 +74,6 @@ const docsHashes: Record<string, StringWithAutocomplete<"MISSING_DOCS">> = {
     "admin/settings/serverWideCustomSorters": "XI6BMT",
     // routs for which the documentation is missing (there may be more)
     "databases/indexes/terms/(:indexName)": "MISSING_DOCS",
-    "databases/indexes/join(/:indexName)": "MISSING_DOCS",
     "databases/indexes/cleanup": "MISSING_DOCS",
     "databases/status/buckets/report": "MISSING_DOCS",
     "databases/indexes/indexErrors": "MISSING_DOCS",

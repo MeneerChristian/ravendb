@@ -67,6 +67,17 @@ describe("i18n", () => {
         expect(i18n.t("common:save")).toBe("Zapisz");
     });
 
+    it("translates every string of the join index page to Polish", async () => {
+        await changeLanguage("pl");
+
+        const untranslated = flattenEntries(en.joinIndex)
+            .map(([key]) => key)
+            .filter((key) => !i18n.exists(`joinIndex:${key}`, { lng: "pl", fallbackLng: false }));
+
+        expect(untranslated).toEqual([]);
+        expect(i18n.t("joinIndex:save")).toBe("Zapisz");
+    });
+
     it("falls back to English for unsupported language", async () => {
         await i18n.changeLanguage("de");
         expect(i18n.t("common:save")).toBe("Save");
