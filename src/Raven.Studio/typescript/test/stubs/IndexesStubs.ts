@@ -84,6 +84,7 @@ export class IndexesStubs {
             StorageMode: "Auto",
             ResolvedStorageMode: "Expanded",
             RowsPerKey: 8.2,
+            AutoModeReason: "Expanded: 8.2 rows per key < 30",
             ResidentBytes: 0,
             ResidentKeys: 0,
             ResidentHits: 0,

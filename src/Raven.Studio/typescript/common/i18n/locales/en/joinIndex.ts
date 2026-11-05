@@ -105,6 +105,9 @@ export default {
         chosenByAuto: "(chosen by Auto)",
         storageModeNotBuiltHelp:
             "The definition leaves the choice between Expanded and Indirect to the server. It chooses when it builds the lists, which are not built yet",
+        autoModeReason: "Why Auto chose this",
+        autoModeReasonHelp:
+            "The reason of the last decision of Auto, with the figures it compared, as the server reported it",
         rowsPerKey: "Outer entries per key",
         rowsPerKeyHelp:
             "What Auto measured when it last built the lists: the outer entries divided by their distinct keys. From 30 on it builds Indirect, else Expanded",

@@ -81,6 +81,21 @@ describe("JoinIndexPage", () => {
         expect(screen.getByTestId("join-rows-per-key")).toHaveTextContent("8.2");
     });
 
+    it("shows why Auto chose the storage mode, in the panel and as the tooltip of the chosen by Auto text", async () => {
+        const { screen } = rtlRender(<StaticJoin />);
+
+        await screen.findByTestId("join-stats");
+        expect(screen.getByTestId("join-auto-mode-reason")).toHaveTextContent("Expanded: 8.2 rows per key < 30");
+        expect(screen.getByTestId("join-chosen-by-auto")).toHaveAttribute("title", "Expanded: 8.2 rows per key < 30");
+    });
+
+    it("shows no reason of Auto when the definition names the storage mode", async () => {
+        const { screen } = rtlRender(<IndirectJoin />);
+
+        await screen.findByTestId("join-stats");
+        expect(screen.queryByTestId("join-auto-mode-reason")).not.toBeInTheDocument();
+    });
+
     it("shows the storage mode of the definition and no rows per key when the definition names it", async () => {
         const { screen } = rtlRender(<IndirectJoin />);
 

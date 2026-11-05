@@ -99,6 +99,8 @@
         "storageMode": "Tryb przechowywania",
         "chosenByAuto": "(wybrany przez Auto)",
         "storageModeNotBuiltHelp": "Definicja zostawia serwerowi wybór między Expanded i Indirect. Serwer wybiera przy budowie list, a listy nie są jeszcze zbudowane",
+        "autoModeReason": "Dlaczego Auto to wybrało",
+        "autoModeReasonHelp": "Powód ostatniej decyzji Auto wraz z porównanymi wartościami, w brzmieniu zgłoszonym przez serwer",
         "rowsPerKey": "Wpisy zewnętrzne na klucz",
         "rowsPerKeyHelp": "Wartość, którą Auto zmierzyło przy ostatniej budowie list: wpisy zewnętrzne podzielone przez ich różne klucze. Od 30 buduje Indirect, w przeciwnym razie Expanded",
         "notBuilt": "Jeszcze nie zbudowany",

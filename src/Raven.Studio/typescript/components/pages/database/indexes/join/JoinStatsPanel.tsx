@@ -82,11 +82,23 @@ export function JoinStatsPanel({ stats }: JoinStatsPanelProps) {
                             <>
                                 {storageMode.modes[0]}
                                 {storageMode.chosenByAuto && (
-                                    <span className="fs-6 text-muted"> {t("stats.chosenByAuto")}</span>
+                                    <span
+                                        className="fs-6 text-muted"
+                                        title={joinIndex.AutoModeReason ?? undefined}
+                                        data-testid="join-chosen-by-auto"
+                                    >
+                                        {" "}
+                                        {t("stats.chosenByAuto")}
+                                    </span>
                                 )}
                             </>
                         )}
                     </StatItem>
+                    {joinIndex.AutoModeReason && (
+                        <StatItem label={t("stats.autoModeReason")} testId="join-auto-mode-reason">
+                            <span title={t("stats.autoModeReasonHelp")}>{joinIndex.AutoModeReason}</span>
+                        </StatItem>
+                    )}
                     {joinIndex.RowsPerKey != null && (
                         <StatItem label={t("stats.rowsPerKey")} testId="join-rows-per-key">
                             <span title={t("stats.rowsPerKeyHelp")}>
