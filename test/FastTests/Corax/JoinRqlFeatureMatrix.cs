@@ -6,6 +6,7 @@ using Raven.Client.Documents;
 using Raven.Client.Documents.Indexes;
 using Raven.Client.Documents.Operations;
 using Raven.Client.Documents.Session;
+using FastTests.Server.Documents.Indexing.Joins.Compat;
 using Tests.Infrastructure;
 using Xunit;
 using static FastTests.Corax.JoinTestHelpers;
@@ -19,18 +20,18 @@ public class JoinRqlFeatureMatrix(ITestOutputHelper output, SharedJoinDatabase s
     private const string Join = "join (from index 'Users' where search(Name, 'chris')) as u on g.OwnerId = id(u)";
     private const string Owners = "g.OwnerId in ('users/strong', 'users/weak')";
 
-    private enum Mode
+    internal enum Mode
     {
         Ordered, // same rows in the same order
         Unordered, // same rows
         Count // same number of rows (random order, ties)
     }
 
-    private sealed record Case(string Name, string Where = null, string Order = null, string Load = null, string Filter = null, string Select = null,
+    internal sealed record Case(string Name, string Where = null, string Order = null, string Load = null, string Filter = null, string Select = null,
         string Limit = Everything, string Include = null, Mode Mode = Mode.Unordered, bool Entities = true, string Declare = null, bool Unsupported = false, string GroupBy = null, string JoinRejects = null);
 
 
-    private static readonly Case[] WhereCases =
+    internal static readonly Case[] WhereCases =
     [
         new("equals", "g.Rank = 4"),
         new("not equals", "g.Rank != 4"),
@@ -71,7 +72,7 @@ public class JoinRqlFeatureMatrix(ITestOutputHelper output, SharedJoinDatabase s
         new("empty result", "g.Rank > 1000"),
     ];
 
-    private static readonly Case[] OrderCases =
+    internal static readonly Case[] OrderCases =
     [
         new("long", Order: "order by g.Rank as long", Mode: Mode.Ordered),
         new("long desc", Order: "order by g.Rank as long desc", Mode: Mode.Ordered),
@@ -95,7 +96,7 @@ public class JoinRqlFeatureMatrix(ITestOutputHelper output, SharedJoinDatabase s
         new("spatial within and distance", "spatial.within(g.Location, spatial.circle(30, 52.5, 5))", "order by spatial.distance(Location, spatial.point(52.45, 5)), g.Rank as long", Mode: Mode.Ordered),
     ];
 
-    private static readonly Case[] ProjectionCases =
+    internal static readonly Case[] ProjectionCases =
     [
         new("one field", Order: "order by g.Rank as long", Select: "select g.Name", Mode: Mode.Ordered, Entities: false),
         new("fields", Order: "order by g.Rank as long", Select: "select g.Name, g.Rank, g.Country", Mode: Mode.Ordered, Entities: false),
@@ -121,7 +122,7 @@ public class JoinRqlFeatureMatrix(ITestOutputHelper output, SharedJoinDatabase s
         new("where filter", "g.Rank > 1", "order by g.Rank as long", Filter: "filter g.Rank < 9", Mode: Mode.Ordered),
     ];
 
-    private static readonly Case[] PagingCases =
+    internal static readonly Case[] PagingCases =
     [
         new("limit", Order: "order by g.Rank as long", Limit: "limit 3", Mode: Mode.Ordered),
         new("limit offset", Order: "order by g.Rank as long", Limit: "limit 2, 3", Mode: Mode.Ordered),
@@ -132,15 +133,24 @@ public class JoinRqlFeatureMatrix(ITestOutputHelper output, SharedJoinDatabase s
     ];
 
 
+    internal static readonly Case[] IncludeCases =
+    [
+        new("include owner", Order: "order by g.Rank as long", Include: "include g.OwnerId", Mode: Mode.Ordered),
+        new("include publisher", Order: "order by g.Rank as long", Include: "include g.PublisherId", Mode: Mode.Ordered),
+        new("include both", "g.Rank > 2", "order by g.Rank as long", Include: "include g.OwnerId, g.PublisherId", Mode: Mode.Ordered),
+        new("include and select", Order: "order by g.Rank as long", Select: "select g.Name, g.OwnerId", Include: "include g.OwnerId", Mode: Mode.Ordered, Entities: false),
+    ];
+
     [RavenTheory(RavenTestCategory.Corax | RavenTestCategory.Querying)]
     [InlineData("where")]
     [InlineData("order")]
     [InlineData("projection")]
     [InlineData("paging")]
+    [InlineData("include")]
     public void EveryFeatureGivesTheSameRowsWithAndWithoutTheJoin(string group)
     {
         using var store = SeedShared();
-        var cases = group switch { "where" => WhereCases, "order" => OrderCases, "projection" => ProjectionCases, _ => PagingCases };
+        var cases = group switch { "where" => WhereCases, "order" => OrderCases, "projection" => ProjectionCases, "include" => IncludeCases, _ => PagingCases };
 
         var report = new List<string>();
         foreach (var c in cases)
@@ -215,6 +225,13 @@ public class JoinRqlFeatureMatrix(ITestOutputHelper output, SharedJoinDatabase s
         Assert.Equal(0, ExtraRequests(joined, "include counters('likes')", ReadCounters));
         // reading the whole series is a wider range than the included last(10)
         Assert.Equal(ExtraRequests(plain, "include timeseries('Plays', last(10))", ReadTimeSeries), ExtraRequests(joined, "include timeseries('Plays', last(10))", ReadTimeSeries));
+    }
+
+    [RavenFact(RavenTestCategory.Corax | RavenTestCategory.Querying)]
+    public void IncludedDocumentsAreLoadedWithTheRowsOfTheJoin()
+    {
+        using var store = SeedShared();
+        JoinIndexServedRqlMatrixTests.AssertIncludesAreLoaded(store, Join);
     }
 
     [RavenFact(RavenTestCategory.Corax | RavenTestCategory.Querying)]

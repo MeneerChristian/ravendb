@@ -392,7 +392,38 @@ public class JoinFacetTests(ITestOutputHelper output) : RavenTestBase(output)
 
     [RavenFact(RavenTestCategory.Corax | RavenTestCategory.Querying)]
     public void AuditHighlighting() => WithSeed((store, data, ids) =>
-        AssertApplied(store, "/queries", $"{Games} {IdJoin} where search(g.Name, 'w1') include highlight(Name, 18, 2)", ids, wholeSet: false));
+    {
+        const string search = "search(g.Name, 'w1')";
+        const string highlight = "include highlight(Name, 18, 2)";
+        var joinedBody = PostRaw(store, "/queries", $"{Games} {IdJoin} where {search} {Everything} {highlight}", out var joinedOk);
+        Assert.True(joinedOk, joinedBody);
+        var returned = ReturnedIds(joinedBody);
+        Assert.NotEmpty(returned);
+        Assert.All(returned, id => Assert.Contains(id, ids));
+
+        var joinedFragments = Highlightings(joinedBody, "Name");
+        Assert.NotEmpty(joinedFragments);
+        // a fragment is given for a row of the join only, and for every row that the search matched
+        Assert.All(joinedFragments.Keys, id => Assert.Contains(id, returned));
+        Assert.Equal(returned, joinedFragments.Keys.OrderBy(x => x).ToList());
+        Assert.All(joinedFragments.Values, fragments => Assert.Contains(fragments, x => x.Contains("w1", StringComparison.Ordinal) && x.Contains("<b", StringComparison.Ordinal)));
+
+        // the same rows of the query without the join give the same fragments
+        var plainBody = PostRaw(store, "/queries", $"{Games} where g.OwnerId in ({string.Join(", ", Joined(data).Select(x => x.OwnerId).Distinct().Select(x => $"'{x}'"))}) and {search} {Everything} {highlight}", out var plainOk);
+        Assert.True(plainOk, plainBody);
+        var plainFragments = Highlightings(plainBody, "Name");
+        Assert.Equal(joinedFragments.Count, plainFragments.Count);
+        foreach (var (id, fragments) in joinedFragments)
+            Assert.Equal(plainFragments[id], fragments);
+    });
+
+    private static Dictionary<string, List<string>> Highlightings(string body, string field)
+    {
+        using var document = JsonDocument.Parse(body);
+        Assert.True(document.RootElement.TryGetProperty("Highlightings", out var all), "the response has no highlightings: " + body);
+        Assert.True(all.TryGetProperty(field, out var byDocument), $"no highlightings of {field}: {body}");
+        return byDocument.EnumerateObject().ToDictionary(x => x.Name, x => x.Value.EnumerateArray().Select(f => f.GetString()).ToList());
+    }
 
     [RavenFact(RavenTestCategory.Corax | RavenTestCategory.Querying)]
     public void AuditSuggestionsAreRejected() => WithSeed((store, data, ids) =>
@@ -421,22 +452,23 @@ public class JoinFacetTests(ITestOutputHelper output) : RavenTestBase(output)
     });
 
     [RavenFact(RavenTestCategory.Corax | RavenTestCategory.Querying)]
-    public void AuditGroupByAndDistinct() => WithSeed((store, data, ids) =>
+    public void AuditGroupByIsRejectedOnAnIndexAndDistinctIsAppliedToTheJoinedRows() => WithSeed((store, data, ids) =>
     {
-        // group by on an index that is not map-reduce, and distinct
-        foreach (var rql in new[] { $"{Games} {IdJoin} group by Country select Country, count()", $"{Games} {IdJoin} select distinct Country {Everything}" })
+        // group by is not possible on an index, with or without the join
+        foreach (var rql in new[] { $"{Games} group by Country select Country, count()", $"{Games} {IdJoin} group by Country select Country, count()" })
         {
             var body = PostRaw(store, "/queries", rql, out var ok);
-            output.WriteLine($"{rql}: {(ok ? "applied" : "rejected")} {body.Substring(0, Math.Min(body.Length, 250))}");
-            if (ok == false)
-                continue;
-
-            using var document = JsonDocument.Parse(body);
-            var results = document.RootElement.GetProperty("Results");
-            Assert.True(results.GetArrayLength() <= Expected(Joined(data), x => x.Country).Count, rql);
-            if (rql.Contains("count()"))
-                Assert.Equal(ids.Count, results.EnumerateArray().Sum(x => x.GetProperty("Count").GetInt32()));
+            Assert.False(ok, $"{rql} was accepted: {body}");
+            Assert.Contains("Can't use 'group by' when querying on an Index", body, StringComparison.Ordinal);
         }
+
+        var distinct = PostRaw(store, "/queries", $"{Games} {IdJoin} select distinct Country {Everything}", out var distinctOk);
+        Assert.True(distinctOk, distinct);
+        using var document = JsonDocument.Parse(distinct);
+        var countries = document.RootElement.GetProperty("Results").EnumerateArray().Select(x => x.TryGetProperty("Country", out var c) && c.ValueKind == JsonValueKind.String ? c.GetString() : null).OrderBy(x => x).ToList();
+        var expected = Expected(Joined(data), x => x.Country).Keys.OrderBy(x => x).ToList();
+        Assert.True(expected.Count > 1, "the data has to hold more than one country, or the distinct proves nothing");
+        Assert.Equal(expected, countries);
     });
 
     private sealed class UserDoc
