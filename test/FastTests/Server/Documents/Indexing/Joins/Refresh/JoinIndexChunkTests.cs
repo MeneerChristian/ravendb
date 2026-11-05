@@ -403,10 +403,10 @@ public class JoinIndexChunkTests(ITestOutputHelper output) : RavenTestBase(outpu
         Assert.True(joinIndex.Counters.PartialRefreshes >= 3, $"{joinIndex.Counters.PartialRefreshes} partial refreshes");
     }
 
+    /// <summary>200 inner documents with a key of their own and 10 outer entries on each key. Changing the Country of every inner document is 20 list changes for each, 2 for each outer entry.</summary>
     /// <summary>The default of a machine with 1 GB: set, so that the tests do not depend on the memory of the machine that runs them.</summary>
     private const int MinQueued = 65_536;
 
-    /// <summary>200 inner documents with a key of their own and 10 outer entries on each key. Changing the Country of every inner document is 20 list changes for each, 2 for each outer entry.</summary>
     private async Task<(JoinIndexHarness Harness, JoinIndex Join)> CreateCostlyInnerChangeAsync(int limit)
     {
         JoinIndexHarness h = await JoinIndexHarness.CreateFieldJoinAsync(this, new Dictionary<string, string>
@@ -447,6 +447,16 @@ public class JoinIndexChunkTests(ITestOutputHelper output) : RavenTestBase(outpu
         {
             long partial = before.Counters.PartialRefreshes;
             ChangeCountryOfEveryInnerDocument(h);
+            if (h.IsIndirect)
+            {
+                // the changes of an Indirect file are one for each transition of a key, however many outer entries it has: the rule stays but is not reached by this change
+                await h.AssertCurrentAsync();
+                Assert.True(ReferenceEquals(h.Join(), before), "the join index was reset");
+                AssertNoRebuild(before);
+                Assert.True(before.Counters.KeyListChanges > 0);
+                return;
+            }
+
             await WaitForRebuildAsync(h, before);
             await h.AssertCurrentAsync();
             Assert.Contains(nameof(JoinRebuildReason.InnerChangesTooCostly), before.Counters.RebuildsByReason.Keys);
@@ -522,6 +532,13 @@ public class JoinIndexChunkTests(ITestOutputHelper output) : RavenTestBase(outpu
     [RavenFact(RavenTestCategory.Indexes)]
     public async Task TheQueuedListChangesLimitSetsHowOftenTheListsAreFlushed()
     {
+        if (this is IIndirectModeTest)
+        {
+            // an Indirect refresh makes one change of a list for a pair of a key and an atom, not for every outer entry of the key: 400 changes here, which a queue of the least size holds
+            Assert.True(await FlushesOfTheCostlyInnerChangeAsync(queued: 1024) <= 1);
+            return;
+        }
+
         // the change is 4,000 changes of lists: a limit of 1,024 flushes it three times at least, a limit above it once
         long often = await FlushesOfTheCostlyInnerChangeAsync(queued: 1024);
         long rarely = await FlushesOfTheCostlyInnerChangeAsync(queued: 1_000_000);
@@ -585,3 +602,6 @@ public class JoinIndexChunkTests(ITestOutputHelper output) : RavenTestBase(outpu
         }
     }
 }
+
+/// <summary>The tests of the class with the join indexes on a field in the storage mode Indirect.</summary>
+public class JoinIndexChunkTestsIndirect(ITestOutputHelper output) : JoinIndexChunkTests(output), IIndirectModeTest;

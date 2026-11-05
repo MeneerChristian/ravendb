@@ -1,4 +1,5 @@
 using System;
+using Raven.Client.Documents.Indexes;
 using Raven.Server.Documents.Indexes.Joins;
 using Raven.Server.Documents.Indexes.Joins.Storage;
 using Raven.Server.Storage.Layout;
@@ -40,9 +41,9 @@ internal sealed class JoinStorageHarness : IDisposable
         }
     }
 
-    public static JoinSchema CreateSchema(int fields = 2, int groupings = 1, bool[] multiValued = null, long hash = 1)
+    public static JoinSchema CreateSchema(int fields = 2, int groupings = 1, bool[] multiValued = null, long hash = 1, JoinStorageMode mode = JoinStorageMode.Expanded, bool? isFieldJoin = null)
     {
-        return JoinSchema.Create(fields, groupings, hash, multiValued);
+        return JoinSchema.Create(fields, groupings, hash, multiValued, isFieldJoin ?? mode == JoinStorageMode.Indirect, mode);
     }
 
     public static JoinStorageHarness OpenInMemory(JoinSchema schema = null)

@@ -314,3 +314,6 @@ public class JoinIndexFieldJoinRefreshTests(ITestOutputHelper output) : RavenTes
         Assert.Equal(IndexState.Normal, h.Stats().State);
     }
 }
+
+/// <summary>The tests of the class with the join indexes on a field in the storage mode Indirect.</summary>
+public class JoinIndexFieldJoinRefreshTestsIndirect(ITestOutputHelper output) : JoinIndexFieldJoinRefreshTests(output), IIndirectModeTest;

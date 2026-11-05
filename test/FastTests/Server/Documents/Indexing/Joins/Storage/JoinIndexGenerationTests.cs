@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using FastTests;
+using Raven.Client.Documents.Indexes;
 using Raven.Server.Documents.Indexes.Joins.Serving;
 using Raven.Server.Documents.Indexes.Joins.Storage;
 using Tests.Infrastructure;
@@ -33,6 +34,102 @@ public class JoinIndexGenerationTests(ITestOutputHelper output) : RavenTestBase(
     public void InitialGenerationRoundTrips()
     {
         Assert.Equal(JoinIndexGeneration.Initial, JoinIndexGeneration.Deserialize(JoinIndexGeneration.Initial.Serialize()));
+    }
+
+    [RavenFact(RavenTestCategory.Voron)]
+    public void AnExpandedGenerationIsWrittenInTheFormat2WithTheBytesOfTheBuildsBeforeTheModes()
+    {
+        var generation = new JoinIndexGeneration(5, Guid.Empty, Cursors(("A", 1, 2)), Guid.Empty, JoinCursors.Empty, 9, 11, isPartial: true);
+
+        byte[] bytes = generation.Serialize();
+
+        // format, serial, the two environment ids, watermark, published, the cursors of both sides, one flag
+        var expected = new List<byte>();
+        expected.AddRange(BitConverter.GetBytes(2));
+        expected.AddRange(BitConverter.GetBytes(5L));
+        expected.AddRange(new byte[32]);
+        expected.AddRange(BitConverter.GetBytes(9L));
+        expected.AddRange(BitConverter.GetBytes(11L));
+        expected.AddRange(BitConverter.GetBytes(1));
+        expected.AddRange(BitConverter.GetBytes(1));
+        expected.Add((byte)'A');
+        expected.AddRange(BitConverter.GetBytes(1L));
+        expected.AddRange(BitConverter.GetBytes(2L));
+        expected.AddRange(BitConverter.GetBytes(0));
+        expected.Add(1);
+        Assert.Equal(expected.ToArray(), bytes);
+        Assert.Equal(2, generation.Format);
+
+        JoinIndexGeneration read = JoinIndexGeneration.Deserialize(bytes);
+        Assert.Equal(JoinStorageMode.Expanded, read.Mode);
+        Assert.True(read.IsPartial);
+        Assert.True(read.InnerPartial);
+        Assert.True(read.OuterPartial);
+        Assert.Equal(generation, read);
+    }
+
+    [RavenTheory(RavenTestCategory.Voron)]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public void AnIndirectGenerationIsTheFormat3AndRoundTripsItsFlags(bool innerPartial, bool outerPartial)
+    {
+        var generation = new JoinIndexGeneration(7, Guid.NewGuid(), Cursors(("Contexts", 10, 3)), Guid.NewGuid(), Cursors(("Messages", 123456789012, 5)), 4242, 1234, JoinStorageMode.Indirect, innerPartial, outerPartial);
+
+        byte[] bytes = generation.Serialize();
+        JoinIndexGeneration read = JoinIndexGeneration.Deserialize(bytes);
+
+        Assert.Equal(3, generation.Format);
+        Assert.Equal(3, BitConverter.ToInt32(bytes));
+        Assert.Equal(generation, read);
+        Assert.Equal(JoinStorageMode.Indirect, read.Mode);
+        Assert.Equal(innerPartial, read.InnerPartial);
+        Assert.Equal(outerPartial, read.OuterPartial);
+        Assert.Equal(innerPartial || outerPartial, read.IsPartial);
+        Assert.Equal(7, JoinIndexGeneration.PeekSerial(bytes));
+        Assert.NotEqual(generation, generation.WithSerial(8, 1235));
+        Assert.Equal(generation.WithSerial(8, 1), JoinIndexGeneration.Deserialize(generation.WithSerial(8, 1).Serialize()));
+        Assert.Equal(JoinStorageMode.Indirect, generation.WithSerial(8, 1).Mode);
+    }
+
+    [RavenFact(RavenTestCategory.Voron)]
+    public void TheInitialGenerationOfAnIndirectFileIsTheFormat3()
+    {
+        JoinIndexGeneration initial = JoinIndexGeneration.InitialOf(JoinStorageMode.Indirect);
+
+        Assert.Equal(3, initial.Format);
+        Assert.Equal(JoinIndexGeneration.Initial, JoinIndexGeneration.InitialOf(JoinStorageMode.Expanded));
+        Assert.Equal(initial, JoinIndexGeneration.Deserialize(initial.Serialize()));
+        Assert.NotEqual(JoinIndexGeneration.Initial, initial);
+    }
+
+    // The reader of the builds before the modes: it accepts the format 2 and nothing else (JoinIndexGeneration.Deserialize of a27367394d). Its check, on the bytes of a generation of the new build.
+    private static void DeserializeAsTheOldBuildDid(byte[] bytes)
+    {
+        int format = BitConverter.ToInt32(bytes);
+        if (format != 2)
+            throw new InvalidOperationException($"The generation has the format {format}, expected 2.");
+    }
+
+    [RavenFact(RavenTestCategory.Voron)]
+    public void TheFormatThatAnOlderBuildRefusesIsTheOneOfAnIndirectGenerationOnly()
+    {
+        DeserializeAsTheOldBuildDid(new JoinIndexGeneration(3, Guid.NewGuid(), Cursors(("A", 1, 1)), Guid.NewGuid(), Cursors(("B", 2, 2)), 1, 1).Serialize());
+
+        Assert.Throws<InvalidOperationException>(() => DeserializeAsTheOldBuildDid(JoinIndexGeneration.InitialOf(JoinStorageMode.Indirect).Serialize()));
+        Assert.Throws<InvalidOperationException>(() => DeserializeAsTheOldBuildDid(new JoinIndexGeneration(3, Guid.NewGuid(), Cursors(("A", 1, 1)), Guid.NewGuid(), Cursors(("B", 2, 2)), 1, 1, JoinStorageMode.Indirect, false, true).Serialize()));
+    }
+
+    [RavenFact(RavenTestCategory.Voron)]
+    public void AnIndirectGenerationNeedsTheModeByteOfTheFormat3()
+    {
+        byte[] bytes = JoinIndexGeneration.InitialOf(JoinStorageMode.Indirect).Serialize();
+        bytes[^1] = (byte)JoinStorageMode.Expanded;
+
+        Assert.Throws<InvalidOperationException>(() => JoinIndexGeneration.Deserialize(bytes));
+        Assert.Throws<ArgumentException>(() => new JoinIndexGeneration(1, Guid.Empty, JoinCursors.Empty, Guid.Empty, JoinCursors.Empty, 0, 0, JoinStorageMode.Expanded, true, false));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new JoinIndexGeneration(1, Guid.Empty, JoinCursors.Empty, Guid.Empty, JoinCursors.Empty, 0, 0, JoinStorageMode.Auto, false, false));
     }
 
     [RavenFact(RavenTestCategory.Voron)]

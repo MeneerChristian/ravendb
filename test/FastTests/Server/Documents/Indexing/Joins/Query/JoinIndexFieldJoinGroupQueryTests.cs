@@ -20,7 +20,8 @@ public class JoinIndexFieldJoinGroupQueryTests(ITestOutputHelper output) : Raven
 {
     private const string GroupResidual = "KindNotServed:GroupResidual";
     private const string MaxResidualRowsKey = "Join.MaxResidualRows";
-    private const string VerifiedRows = "Join/c/JoinVerifiedRows";
+    // the outer entries that were checked against the inner index, and for an Indirect file the keys with several inner entries that were
+    private static long Verified(QueryAnswer answer) => answer.Counters.GetValueOrDefault("Join/c/JoinVerifiedRows") + answer.Counters.GetValueOrDefault("Join/c/JoinVerifiedKeys");
 
     private static readonly string[] AndNotSubs =
     [
@@ -63,7 +64,10 @@ public class JoinIndexFieldJoinGroupQueryTests(ITestOutputHelper output) : Raven
     {
         var settings = new Dictionary<string, string> { [RavenConfiguration.GetKey(x => x.Indexing.CoraxIncludeDocumentScore)] = true.ToString() };
         if (maxResidualRows != null)
+        {
             settings[MaxResidualRowsKey] = maxResidualRows.Value.ToString();
+            settings[RavenConfiguration.GetKey(x => x.Join.MaxResidualKeys)] = maxResidualRows.Value.ToString();
+        }
 
         return settings;
     }
@@ -122,7 +126,7 @@ public class JoinIndexFieldJoinGroupQueryTests(ITestOutputHelper output) : Raven
         AssertSame("nl and n2", served, scan);
         Assert.Equal(["conversations/2"], Ids(served));
         Assert.Equal(["conversations/2"], Ids(scan));
-        Assert.True(served.Counters.GetValueOrDefault(VerifiedRows) > 0, "the group of k1 was not verified: " + string.Join(", ", served.Counters));
+        Assert.True(Verified(served) > 0, "the group of k1 was not verified: " + string.Join(", ", served.Counters));
 
         // two values of one single-valued field: only an entry of its own could have both, none does
         (served, scan) = oracle.Both(FieldJoin(" where Country = 'nl' and Country = 'de'", order));
@@ -266,6 +270,10 @@ public class JoinIndexFieldJoinGroupQueryTests(ITestOutputHelper output) : Raven
     [RavenFact(RavenTestCategory.Querying | RavenTestCategory.Indexes)]
     public async Task AboveTheBudgetOfResidualRowsTheJoinIsReadByTheServerAndIsCounted()
     {
+        // an Indirect file counts keys against the budget (JoinIndexIndirectQueryTests)
+        if (this is IIndirectModeTest)
+            return;
+
         using JoinIndexHarness h = await JoinIndexHarness.CreateFieldJoinAsync(this, Settings(maxResidualRows: 3));
 
         // 6 outer entries have the key big and 1 has the key small (both keys have two inner entries); the key one has one inner entry
@@ -331,7 +339,7 @@ public class JoinIndexFieldJoinGroupQueryTests(ITestOutputHelper output) : Raven
                 string rql = random.Next(4) == 0 ? FieldLeftJoin(sub, tail) : FieldJoin(sub, tail);
                 (QueryAnswer served, QueryAnswer scan) = oracle.Both(rql);
                 AssertSame(rql, served, scan);
-                verified += served.Counters.GetValueOrDefault(VerifiedRows);
+                verified += Verified(served);
             }
         }
 
@@ -343,3 +351,6 @@ public class JoinIndexFieldJoinGroupQueryTests(ITestOutputHelper output) : Raven
         Assert.True(verified > 0, "no outer entry was verified against its group");
     }
 }
+
+/// <summary>The tests of the class with the join indexes on a field in the storage mode Indirect.</summary>
+public class JoinIndexFieldJoinGroupQueryTestsIndirect(ITestOutputHelper output) : JoinIndexFieldJoinGroupQueryTests(output), IIndirectModeTest;

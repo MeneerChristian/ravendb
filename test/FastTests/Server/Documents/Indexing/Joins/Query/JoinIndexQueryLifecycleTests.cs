@@ -23,11 +23,72 @@ namespace FastTests.Server.Documents.Indexing.Joins.Query;
 /// <summary>What a query does when the join index is behind, ahead, being rebuilt, disabled or missing: it never changes the answer, only whether the join index serves it.</summary>
 public class JoinIndexQueryLifecycleTests(ITestOutputHelper output) : RavenTestBase(output)
 {
+    // an Indirect file is exact for any outer snapshot, so no query waits for the outer index of the join index, and a query that uses the score of the join reads the file only for the very outer snapshot the file reflects
+    private bool IsIndirect => this is IIndirectModeTest;
+
+    private sealed record Counts(long Served, Dictionary<string, long> Fallbacks)
+    {
+        public static Counts Of(JoinIndex joinIndex) => new(joinIndex.QueryCounters.ServedCount, joinIndex.QueryCounters.Fallbacks.ToDictionary(x => x.Key, x => x.Value));
+
+        public long FallbackTotal => Fallbacks.Values.Sum();
+
+        public long FallbackOf(string reason) => Fallbacks.GetValueOrDefault(reason);
+
+        public override string ToString() => $"served {Served}, fallbacks {string.Join(", ", Fallbacks.Select(x => $"{x.Key}:{x.Value}"))}";
+    }
+
+    /// <summary>The query was served by the join index and was not read by the server for any reason.</summary>
+    private static void AssertServedOnce(JoinIndex joinIndex, Counts before)
+    {
+        Counts now = Counts.Of(joinIndex);
+        Assert.True(now.Served == before.Served + 1 && now.FallbackTotal == before.FallbackTotal, $"expected one served query and no fallback: {before} -> {now}");
+    }
+
+    /// <summary>The query was read by the server for exactly this reason and was not served by the join index.</summary>
+    private static void AssertFellBackOnce(JoinIndex joinIndex, Counts before, string reason)
+    {
+        Counts now = Counts.Of(joinIndex);
+        Assert.True(now.Served == before.Served && now.FallbackOf(reason) == before.FallbackOf(reason) + 1 && now.FallbackTotal == before.FallbackTotal + 1, $"expected one {reason} fallback and no served query: {before} -> {now}");
+    }
+
+    /// <summary>
+    /// An Expanded join index makes the query wait until it is current and serves it. An Indirect one does not wait for the outer index, and a query that scores by the join reads the file only for the very outer snapshot the file reflects:
+    /// the join index that was not told about the outer batch (it cannot commit) does not answer, and the server reads the join (BehindTimeout).
+    /// </summary>
+    private void AssertAnsweredOnce(JoinIndex joinIndex, Counts before)
+    {
+        if (IsIndirect)
+            AssertFellBackOnce(joinIndex, before, JoinFallbacks.BehindTimeout);
+        else
+            AssertServedOnce(joinIndex, before);
+    }
+
+    /// <summary>The refresh of an Indirect join index cannot commit until the returned gate is set, so that it does not reflect the outer batch that the test writes.</summary>
+    private static ManualResetEventSlim HoldTheRefresh(JoinIndex joinIndex)
+    {
+        var gate = new ManualResetEventSlim(false);
+        joinIndex.ForTestingPurposes = phase =>
+        {
+            if (phase == "BeforeCommit")
+                gate.Wait(TimeSpan.FromSeconds(20));
+        };
+
+        return gate;
+    }
+
     private static Dictionary<string, string> ScoreSettings() => new() { [RavenConfiguration.GetKey(x => x.Indexing.CoraxIncludeDocumentScore)] = true.ToString() };
 
-    private async Task<JoinIndexHarness> HarnessWithDataAsync(int seed, int operations = 120, bool putJoin = true, bool autoJoins = true)
+    // a query that waits for the join index waits as long as the join index needs: whether it was served does not depend on the speed of the machine
+    private static Dictionary<string, string> PatientSettings()
     {
-        var settings = ScoreSettings();
+        Dictionary<string, string> settings = ScoreSettings();
+        settings[RavenConfiguration.GetKey(x => x.Join.QueryWait)] = "20000";
+        return settings;
+    }
+
+    private async Task<JoinIndexHarness> HarnessWithDataAsync(int seed, int operations = 120, bool putJoin = true, bool autoJoins = true, Dictionary<string, string> baseSettings = null)
+    {
+        var settings = baseSettings ?? ScoreSettings();
         settings["Join.AutoEnabled"] = autoJoins.ToString();
 
         JoinIndexHarness h = await JoinIndexHarness.CreateAsync(this, settings, putJoin);
@@ -111,7 +172,10 @@ public class JoinIndexQueryLifecycleTests(ITestOutputHelper output) : RavenTestB
     [RavenFact(RavenTestCategory.Querying | RavenTestCategory.Indexes)]
     public async Task QueryThatWaitsForNonStaleResultsWaitsLongerForTheJoin()
     {
-        using JoinIndexHarness h = await HarnessWithDataAsync(4);
+        // the budget of the wait is far above what the join index needs: only the join index decides when the query is served, not the speed of the machine
+        Dictionary<string, string> settings = ScoreSettings();
+        settings[RavenConfiguration.GetKey(x => x.Join.QueryWaitForNonStale)] = "60000";
+        using JoinIndexHarness h = await HarnessWithDataAsync(4, baseSettings: settings);
         var oracle = new JoinIndexQueryOracle(h);
         string rql = Join(" where Country = 'nl'", " order by score() limit 0, 1000");
         oracle.Check(rql);
@@ -119,29 +183,64 @@ public class JoinIndexQueryLifecycleTests(ITestOutputHelper output) : RavenTestB
         Assert.True(oracle.Wait < TimeSpan.FromMilliseconds(400));
 
         using var gate = new ManualResetEventSlim(false);
-        h.Join().ForTestingPurposes = phase =>
+        JoinIndex joinIndex = h.Join();
+        joinIndex.ForTestingPurposes = phase =>
         {
             if (phase == "BeforeCommit")
-                gate.Wait(TimeSpan.FromSeconds(20));
+                gate.Wait(TimeSpan.FromSeconds(60));
         };
 
         h.PutContext(1, "nl", "Alpha", 6, true, "again");
         await Task.Run(() => WaitForTheJoinedIndexes(h));
 
-        _ = Task.Run(async () =>
-        {
-            await Task.Delay(400);
-            gate.Set();
-        });
+        Counts before = Counts.Of(joinIndex);
+        long peeks = joinIndex.QueryCounters.PeekCount;
+        Task<QueryAnswer> query = Task.Run(() => oracle.Run(rql, waitForNonStale: true));
 
-        long served = oracle.Info.Served;
-        long timeouts = oracle.FallbacksOf(JoinFallbacks.BehindTimeout);
+        // the query found the join index behind and waits for it; it is held for longer than a query that does not wait for non stale results waits
+        await WaitForAsync(() => joinIndex.QueryCounters.PeekCount > peeks, "the query to find the join index behind");
+        await Task.Delay(oracle.Wait * 2);
+        Assert.False(query.IsCompleted);
+
+        gate.Set();
+        QueryAnswer answer = await query;
+
+        AssertServedOnce(joinIndex, before);
+        Assert.True(joinIndex.QueryCounters.WaitMaxInMs >= oracle.Wait.TotalMilliseconds, "the query did not wait for the join index");
+        joinIndex.ForTestingPurposes = null;
+        AssertSame(rql, answer, RunWithoutTheJoin(oracle, rql));
+    }
+
+    [RavenFact(RavenTestCategory.Querying | RavenTestCategory.Indexes)]
+    public async Task QueryThatWaitsForNonStaleResultsReadsTheJoinOfTheServerWhenTheJoinStaysBehindBeyondItsBudget()
+    {
+        Dictionary<string, string> settings = ScoreSettings();
+        settings[RavenConfiguration.GetKey(x => x.Join.QueryWaitForNonStale)] = "300";
+        using JoinIndexHarness h = await HarnessWithDataAsync(4, baseSettings: settings);
+        var oracle = new JoinIndexQueryOracle(h);
+        string rql = Join(" where Country = 'nl'", " order by score() limit 0, 1000");
+        oracle.Check(rql);
+
+        // the join index cannot commit before the query returns, whatever the speed of the machine
+        using var gate = new ManualResetEventSlim(false);
+        JoinIndex joinIndex = h.Join();
+        joinIndex.ForTestingPurposes = phase =>
+        {
+            if (phase == "BeforeCommit")
+                gate.Wait(TimeSpan.FromSeconds(60));
+        };
+
+        h.PutContext(1, "nl", "Alpha", 6, true, "again");
+        await Task.Run(() => WaitForTheJoinedIndexes(h));
+
+        Counts before = Counts.Of(joinIndex);
         QueryAnswer answer = oracle.Run(rql, waitForNonStale: true);
 
-        Assert.Equal(served + 1, oracle.Info.Served);
-        Assert.Equal(timeouts, oracle.FallbacksOf(JoinFallbacks.BehindTimeout));
+        AssertFellBackOnce(joinIndex, before, JoinFallbacks.BehindTimeout);
+        gate.Set();
+        joinIndex.ForTestingPurposes = null;
+        await h.AssertCurrentAsync();
         AssertSame(rql, answer, RunWithoutTheJoin(oracle, rql));
-        h.Join().ForTestingPurposes = null;
     }
 
     [RavenFact(RavenTestCategory.Querying | RavenTestCategory.Indexes)]
@@ -188,7 +287,7 @@ public class JoinIndexQueryLifecycleTests(ITestOutputHelper output) : RavenTestB
         QueryAnswer scan = RunWithoutTheJoin(oracle, rql);
 
         AssertSame(rql, served, scan);
-        Assert.Equal(1, oracle.FallbacksOf(JoinFallbacks.Ahead));
+        Assert.Equal(IsIndirect ? 0 : 1, oracle.FallbacksOf(JoinFallbacks.Ahead));
     }
 
     [RavenFact(RavenTestCategory.Querying | RavenTestCategory.Indexes)]
@@ -358,11 +457,12 @@ public class JoinIndexQueryLifecycleTests(ITestOutputHelper output) : RavenTestB
     [RavenFact(RavenTestCategory.Querying | RavenTestCategory.Indexes)]
     public async Task AQueryBetweenTheCommitOfAnUpstreamBatchAndTheNoticeOfTheJoinWaitsForTheJoin()
     {
-        using JoinIndexHarness h = await HarnessWithDataAsync(7);
+        using JoinIndexHarness h = await HarnessWithDataAsync(7, baseSettings: PatientSettings());
         var oracle = new JoinIndexQueryOracle(h);
         string rql = Join(" where Country = 'nl'", " order by score() limit 0, 20");
         oracle.Check(rql);
 
+        using ManualResetEventSlim hold = IsIndirect ? HoldTheRefresh(h.Join()) : null;
         using var committed = new ManualResetEventSlim(false);
         using var gate = new ManualResetEventSlim(false);
         bool armed = false;
@@ -384,20 +484,19 @@ public class JoinIndexQueryLifecycleTests(ITestOutputHelper output) : RavenTestB
             Assert.True(committed.Wait(TimeSpan.FromSeconds(20)));
 
             JoinIndex joinIndex = h.Join();
-            long served = joinIndex.QueryCounters.ServedCount;
-            long fallbacks = joinIndex.QueryCounters.FallbackTotal;
+            Counts before = Counts.Of(joinIndex);
             Task query = Task.Run(() => oracle.Run(rql));
             await Task.Delay(30);
             gate.Set();
             await query;
 
-            Assert.Equal(served + 1, joinIndex.QueryCounters.ServedCount);
-            Assert.Equal(fallbacks, joinIndex.QueryCounters.FallbackTotal);
+            AssertAnsweredOnce(joinIndex, before);
         }
         finally
         {
             armed = false;
             gate.Set();
+            hold?.Set();
             h.Database.Changes.OnIndexChange -= OnChange;
         }
     }
@@ -405,7 +504,7 @@ public class JoinIndexQueryLifecycleTests(ITestOutputHelper output) : RavenTestB
     [RavenFact(RavenTestCategory.Querying | RavenTestCategory.Indexes)]
     public async Task AQueryThatFindsTheJoinBehindDoesNotWaitForTheEndOfTheRefreshWindow()
     {
-        Dictionary<string, string> settings = ScoreSettings();
+        Dictionary<string, string> settings = PatientSettings();
         settings[RavenConfiguration.GetKey(x => x.Join.RefreshWindow)] = "3000";
         using JoinIndexHarness h = await JoinIndexHarness.CreateAsync(this, settings);
         h.RandomRound(new Random(8), 60);
@@ -415,8 +514,8 @@ public class JoinIndexQueryLifecycleTests(ITestOutputHelper output) : RavenTestB
         oracle.Check(rql);
 
         JoinIndex joinIndex = h.Join();
-        long served = joinIndex.QueryCounters.ServedCount;
-        long fallbacks = joinIndex.QueryCounters.FallbackTotal;
+        using ManualResetEventSlim hold = IsIndirect ? HoldTheRefresh(joinIndex) : null;
+        Counts before = Counts.Of(joinIndex);
         h.PutConversation(501, "contexts/1");
         WaitForTheJoinedIndexes(h);
 
@@ -424,8 +523,9 @@ public class JoinIndexQueryLifecycleTests(ITestOutputHelper output) : RavenTestB
         oracle.Run(rql);
 
         Assert.True(watch.ElapsedMilliseconds < 2000, "the query did not return within the bound of the test");
-        Assert.Equal(served + 1, joinIndex.QueryCounters.ServedCount);
-        Assert.Equal(fallbacks, joinIndex.QueryCounters.FallbackTotal);
+        AssertAnsweredOnce(joinIndex, before);
+        hold?.Set();
+        joinIndex.ForTestingPurposes = null;
     }
 
     [RavenFact(RavenTestCategory.Querying | RavenTestCategory.Indexes)]
@@ -449,11 +549,11 @@ public class JoinIndexQueryLifecycleTests(ITestOutputHelper output) : RavenTestB
     public async Task BatchesThatArriveWithinTheRefreshWindowAreOneRefresh()
     {
         Dictionary<string, string> settings = ScoreSettings();
-        settings[RavenConfiguration.GetKey(x => x.Join.RefreshWindow)] = "600";
+        settings[RavenConfiguration.GetKey(x => x.Join.RefreshWindow)] = "3000";
         using JoinIndexHarness h = await JoinIndexHarness.CreateAsync(this, settings);
         h.RandomRound(new Random(9), 40);
         await h.AssertCurrentAsync();
-        await Task.Delay(1500);
+        await Task.Delay(3500);
 
         JoinIndex joinIndex = h.Join();
         long refreshes = joinIndex.Counters.Refreshes;

@@ -3,10 +3,13 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using Corax.Indexing;
+using Corax.Mappings;
 using Raven.Server.Documents;
 using Raven.Server.Documents.Indexes;
 using Raven.Server.Documents.Indexes.Joins;
 using Raven.Server.Documents.Indexes.Joins.Refresh;
+using Raven.Server.Documents.Indexes.Joins.Serving;
+using Raven.Server.Documents.Indexes.Joins.Serving.Resident;
 using Raven.Server.Documents.Indexes.Joins.Storage;
 using Voron.Data.CompactTrees;
 using Voron.Util;
@@ -35,6 +38,11 @@ public static class JoinIndexInvariantChecker
         public long Joined { get; set; }
 
         public string Generation { get; init; }
+
+        /// <summary>The resident lists that were compared with the posting lists of the outer snapshot (-1: they could not be compared, see <see cref="ResidentNote"/>).</summary>
+        public int ResidentChecked { get; set; } = -1;
+
+        public string ResidentNote { get; set; }
 
         public bool Ok => Compared && Mismatches.Count == 0;
 
@@ -85,7 +93,71 @@ public static class JoinIndexInvariantChecker
 
             var result = new Result { Compared = true, Generation = generation.ToString() };
             Compare(joinSnapshot, plan, outer, inner, seen, result);
+            CompareResident(joinIndex, joinSnapshot, plan, outer, outerSnapshot, result);
             return result;
+        }
+    }
+
+    /// <summary>With an epoch that is the outer snapshot of the check, every resident list is the posting list of its key in that snapshot; without an epoch nothing is resident.</summary>
+    private static unsafe void CompareResident(JoinIndex joinIndex, JoinIndexSnapshot joinSnapshot, JoinPlan plan, IndexView outer, IndexSnapshot outerSnapshot, Result result)
+    {
+        JoinResident resident = joinIndex.Resident;
+        if (resident == null || plan.IsFieldJoin == false || joinSnapshot.Schema.IsIndirect == false)
+        {
+            result.ResidentNote = "no cache";
+            return;
+        }
+
+        ResidentKeyListCache cache = resident.Cache;
+        ResidentEpoch epoch = cache.Epoch;
+        if (epoch.IsNone)
+        {
+            result.ResidentNote = "no epoch";
+            if (cache.ResidentKeys != 0)
+                result.Mismatches.Add($"the cache has no epoch and holds {cache.ResidentKeys} lists");
+
+            result.ResidentChecked = 0;
+            return;
+        }
+
+        // the check is a reader of this snapshot: when the outer index committed without moving what it consumed, the epoch follows it, as it does for the reader of a query
+        long transaction = outerSnapshot.Transaction.LowLevelTransaction.Id;
+        resident.Follow(resident.ReadOf(outerSnapshot.EnvironmentId, transaction, joinSnapshot.Seed, 0, outerSnapshot.Consumed), outer.Searcher.LastEntryId);
+        epoch = cache.Epoch;
+        if (epoch.EnvironmentId != JoinResident.ScopeOf(outerSnapshot.EnvironmentId, joinSnapshot.Seed) || epoch.TransactionId != transaction)
+        {
+            result.ResidentNote = $"epoch is another snapshot ({epoch.TransactionId}, this {transaction})";
+            return;
+        }
+
+        CompactTree tree = outer.TermsOf(plan.OuterKeyField);
+        FieldMetadata metadata = outer.Searcher.FieldMetadataBuilder(plan.Definition.OuterField);
+        var rows = new ContextBoundNativeList<long>(outer.Searcher.Allocator);
+        try
+        {
+            int checks = 0;
+            foreach (long keyRef in cache.GetResidentKeys())
+            {
+                rows.Count = 0;
+                if (tree != null)
+                    JoinOuterKeyLists.ReadRowsOfKey(outer.Searcher, metadata, joinSnapshot, tree, keyRef, ref rows);
+
+                long[] expected = rows.ToSpan().ToArray();
+                if (cache.TryGetList(keyRef, out long[] actual) == false)
+                    continue;
+
+                if (expected.SequenceEqual(actual) == false)
+                    result.Mismatches.Add($"resident list of key {keyRef} [{string.Join(",", actual.Take(12))}] is not the posting list [{string.Join(",", expected.Take(12))}] of the snapshot {transaction}");
+
+                checks++;
+            }
+
+            result.ResidentChecked = checks;
+            result.ResidentNote = "compared";
+        }
+        finally
+        {
+            rows.Dispose();
         }
     }
 

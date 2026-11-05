@@ -26,12 +26,15 @@ public class JoinIndexFieldJoinMultiKeyRefreshTests(ITestOutputHelper output) : 
         }
     }
 
-    /// <summary>The number of keys with a group of two or more inner entries, and of the outer entries with two or more keys that have an inner entry in their group.</summary>
+    /// <summary>
+    /// The number of keys with a group of two or more inner entries, and of the outer entries with two or more keys that have an inner entry in their group. An Indirect file counts the rows with two or more
+    /// keys whether the keys have a group or not: the second number is not compared (-1), the invariant check compares it with the rows.
+    /// </summary>
     private static (long GroupsOfSeveral, long RowsWithSeveralKeys) Counters(JoinIndexHarness h)
     {
         Assert.True(h.Join().TryOpenJoinSnapshot(out JoinIndexSnapshot snapshot));
         using (snapshot)
-            return (snapshot.RowsWithSeveralJoined, snapshot.RowsWithSeveralKeys);
+            return (snapshot.RowsWithSeveralJoined, h.IsIndirect ? -1 : snapshot.RowsWithSeveralKeys);
     }
 
     private static string[] Keys(string prefix, int count) => Enumerable.Range(0, count).Select(i => prefix + i).ToArray();
@@ -75,7 +78,7 @@ public class JoinIndexFieldJoinMultiKeyRefreshTests(ITestOutputHelper output) : 
 
         // k1: contexts 1, 2, 7; k2: 2, 3; k3: 3, 4; "": 7. Conversations 2 (k1, k2) and 3 (k2, k3) have two keys with a group
         Assert.Equal(3, groups);
-        Assert.Equal(2, rows);
+        Assert.Equal(h.IsIndirect ? -1 : 2, rows);
     }
 
     [RavenFact(RavenTestCategory.Indexes)]
@@ -87,7 +90,7 @@ public class JoinIndexFieldJoinMultiKeyRefreshTests(ITestOutputHelper output) : 
         await h.AssertCurrentAsync();
         Assert.Equal(1, h.Stats().Join.Builds);
         Assert.Equal(IndexState.Normal, h.Stats().State);
-        Assert.Equal((3, 2), Counters(h));
+        Assert.Equal(h.IsIndirect ? (3, -1L) : (3, 2L), Counters(h));
     }
 
     [RavenFact(RavenTestCategory.Indexes)]
@@ -145,7 +148,7 @@ public class JoinIndexFieldJoinMultiKeyRefreshTests(ITestOutputHelper output) : 
         await h.AssertCurrentAsync();
 
         // one key each: the group of k1 holds two entries and no conversation has two keys
-        Assert.Equal((1, 0), Counters(h));
+        Assert.Equal(h.IsIndirect ? (1, -1L) : (1, 0L), Counters(h));
     }
 
     [RavenFact(RavenTestCategory.Indexes)]
@@ -156,7 +159,7 @@ public class JoinIndexFieldJoinMultiKeyRefreshTests(ITestOutputHelper output) : 
         h.PutCodedContextKeys(2, ["b"], "nl", "x2", 2, true, "t");
         h.PutConversationKeys(1, ["a", "b"]);
         await h.AssertCurrentAsync();
-        Assert.Equal((0, 1), Counters(h));
+        Assert.Equal(h.IsIndirect ? (0, -1L) : (0, 1L), Counters(h));
 
         // the group of a has no other entry with the atom Country = nl: the row stays in the list through b
         h.PutCodedContextKeys(1, ["a"], "de", "x1", 1, true, "t");
@@ -174,7 +177,7 @@ public class JoinIndexFieldJoinMultiKeyRefreshTests(ITestOutputHelper output) : 
         h.PutCodedContextKeys(1, ["a"], "de", "x1", 1, true, "t");
         h.PutCodedContextKeys(2, ["b"], "nl", "x2", 2, true, "t");
         await h.AssertCurrentAsync();
-        Assert.Equal((0, 1), Counters(h));
+        Assert.Equal(h.IsIndirect ? (0, -1L) : (0, 1L), Counters(h));
     }
 
     [RavenFact(RavenTestCategory.Indexes)]
@@ -185,38 +188,38 @@ public class JoinIndexFieldJoinMultiKeyRefreshTests(ITestOutputHelper output) : 
         h.PutConversationKeys(2, ["k1", "k2", "k3"]);
         h.PutConversationKeys(3, ["k3"]);
         await h.AssertCurrentAsync();
-        Assert.Equal((0, 0), Counters(h));
+        Assert.Equal(h.IsIndirect ? (0, -1L) : (0, 0L), Counters(h));
 
         h.PutCodedContextKeys(1, ["k1"]);
         await h.AssertCurrentAsync();
-        Assert.Equal((0, 0), Counters(h));
+        Assert.Equal(h.IsIndirect ? (0, -1L) : (0, 0L), Counters(h));
 
         h.PutCodedContextKeys(2, ["k2"]);
         await h.AssertCurrentAsync();
-        Assert.Equal((0, 2), Counters(h));
+        Assert.Equal(h.IsIndirect ? (0, -1L) : (0, 2L), Counters(h));
 
         h.PutCodedContextKeys(3, ["k3"]);
         await h.AssertCurrentAsync();
-        Assert.Equal((0, 2), Counters(h));
+        Assert.Equal(h.IsIndirect ? (0, -1L) : (0, 2L), Counters(h));
 
         // one entry holds two keys: it joins the groups of both and makes conversation 1 and 2 hold two keys with a group through one entry
         h.PutCodedContextKeys(2, ["k2", "k1"]);
         await h.AssertCurrentAsync();
-        Assert.Equal((1, 2), Counters(h));
+        Assert.Equal(h.IsIndirect ? (1, -1L) : (1, 2L), Counters(h));
 
         h.Delete("contexts/1");
         h.Delete("contexts/2");
         await h.AssertCurrentAsync();
-        Assert.Equal((0, 0), Counters(h));
+        Assert.Equal(h.IsIndirect ? (0, -1L) : (0, 0L), Counters(h));
 
         h.PutCodedContextKeys(1, ["k1", "k2", "k3"]);
         await h.AssertCurrentAsync();
-        Assert.Equal((1, 2), Counters(h));
+        Assert.Equal(h.IsIndirect ? (1, -1L) : (1, 2L), Counters(h));
 
         h.PutConversationKeys(1, ["k1"]);
         h.PutConversationKeys(2, []);
         await h.AssertCurrentAsync();
-        Assert.Equal((1, 0), Counters(h));
+        Assert.Equal(h.IsIndirect ? (1, -1L) : (1, 0L), Counters(h));
     }
 
     [RavenFact(RavenTestCategory.Indexes)]
@@ -236,7 +239,7 @@ public class JoinIndexFieldJoinMultiKeyRefreshTests(ITestOutputHelper output) : 
             h.Delete($"contexts/{i}");
 
         await h.AssertCurrentAsync();
-        Assert.Equal((0, 0), Counters(h));
+        Assert.Equal(h.IsIndirect ? (0, -1L) : (0, 0L), Counters(h));
 
         for (int i = 0; i < 12; i++)
             h.PutCodedContextKeys(i, i % 2 == 0 ? ["hub", "k" + i % 5] : ["hub"], i % 3 == 0 ? "nl" : "de", "n" + i % 4, i, true, "t");
@@ -335,3 +338,6 @@ public class JoinIndexFieldJoinMultiKeyRefreshTests(ITestOutputHelper output) : 
         await built.AssertCurrentAsync();
     }
 }
+
+/// <summary>The tests of the class with the join indexes on a field in the storage mode Indirect.</summary>
+public class JoinIndexFieldJoinMultiKeyRefreshTestsIndirect(ITestOutputHelper output) : JoinIndexFieldJoinMultiKeyRefreshTests(output), IIndirectModeTest;

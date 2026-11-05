@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 using FastTests;
@@ -9,13 +10,40 @@ using Raven.Client.Documents.Indexes;
 using Raven.Client.Documents.Operations.Indexes;
 using Raven.Client.Documents.Session;
 using Raven.Client.ServerWide;
+using Raven.Server.Config;
 using Raven.Server.Documents;
 using Raven.Server.Documents.Indexes.Joins;
+using Raven.Server.Documents.Indexes.Joins.Serving.Resident;
 using Raven.Server.ServerWide.Context;
+using Sparrow.LowMemory;
 using Tests.Infrastructure;
 using Xunit;
 
 namespace FastTests.Server.Documents.Indexing.Joins.Refresh;
+
+/// <summary>A test class that runs its tests with the join indexes on a field in the storage mode Indirect: the harness it is created from turns the mode on in the settings and in the definition.</summary>
+public interface IIndirectModeTest
+{
+}
+
+/// <summary>
+/// The cache of the key lists of an Indirect join index in a test: <see cref="Default"/> is what the server makes (the budget of the configuration, fill-hold), <see cref="Off"/> has none, <see cref="On"/> keeps every list
+/// that is read (a budget no test reaches, no admission rule), <see cref="Tiny"/> a few hundred bytes (eviction and rejection in the middle of a workload). The restart and the read every third step of the oracle are
+/// drivers in the tests that use them.
+/// </summary>
+public enum ResidentMode
+{
+    Default,
+    Off,
+    On,
+    Tiny
+}
+
+/// <summary>A test class that runs its join indexes with the cache in this mode (the join indexes are Indirect as well when it is an <see cref="IIndirectModeTest"/>).</summary>
+public interface IResidentModeTest
+{
+    ResidentMode ResidentMode { get; }
+}
 
 /// <summary>A database with the two indexes and a join index, and operations that write documents the way an application does.</summary>
 public sealed class JoinIndexHarness : IDisposable
@@ -55,11 +83,20 @@ public sealed class JoinIndexHarness : IDisposable
 
     private readonly RavenTestBase _test;
 
+    /// <summary>The test that made the harness runs the join indexes on a field in the storage mode Indirect.</summary>
+    public bool IsIndirect => _test is IIndirectModeTest;
+
     public DocumentStore Store { get; }
 
     public DocumentDatabase Database { get; private set; }
 
     public JoinIndexInvariantChecker.SeenTerms Seen { get; private set; }
+
+    /// <summary>
+    /// The registry of the caches of the join indexes of this harness: the one of the process is charged by the caches of the tests that run at the same time and drops every list on a low memory notification, of the machine or simulated, so a test that
+    /// expects lists in its cache must not depend on it.
+    /// </summary>
+    public ResidentCacheRegistry ResidentRegistry { get; } = new(ResidentCacheRegistry.DefaultBudgetBytes, registerWithLowMemoryNotification: false);
 
     private JoinIndexHarness(RavenTestBase test, DocumentStore store)
     {
@@ -138,6 +175,12 @@ public sealed class JoinIndexHarness : IDisposable
     {
         var options = RavenTestBase.Options.ForSearchEngine(RavenSearchEngineMode.Corax);
         options.RunInMemory = runInMemory;
+        if (test is IIndirectModeTest)
+        {
+            databaseSettings = databaseSettings == null ? new Dictionary<string, string>() : new Dictionary<string, string>(databaseSettings);
+            databaseSettings[RavenConfiguration.GetKey(x => x.Join.IndirectEnabled)] = "true";
+        }
+
         if (databaseSettings != null)
         {
             Action<DatabaseRecord> previous = options.ModifyDatabaseRecord;
@@ -175,14 +218,52 @@ public sealed class JoinIndexHarness : IDisposable
 
     public async Task PutJoinAsync(IndexDefinition definition)
     {
+        if (_test is IIndirectModeTest && definition.Join is { StorageMode: JoinStorageMode.Auto } && definition.Join.JoinsOnOuterId == false)
+            definition.Join.StorageMode = JoinStorageMode.Indirect;
+
         await Store.Maintenance.SendAsync(new PutIndexesOperation(definition));
         Seen = new JoinIndexInvariantChecker.SeenTerms(definition.Join.Fields.Count);
     }
 
-    /// <summary>Takes a join index that was created after the harness: the invariant checker needs the number of its declared fields.</summary>
+    public static ResidentCacheOptions OptionsOf(ResidentMode mode) => mode switch
+    {
+        ResidentMode.Default => new ResidentCacheOptions { BudgetBytes = ResidentCacheRegistry.DefaultBudgetBytes, Admission = ResidentAdmission.FillHold },
+        ResidentMode.Off => null,
+        ResidentMode.On => new ResidentCacheOptions { BudgetBytes = long.MaxValue / 4, Admission = ResidentAdmission.Always },
+        ResidentMode.Tiny => new ResidentCacheOptions { BudgetBytes = 600, Admission = ResidentAdmission.Always },
+        _ => throw new ArgumentOutOfRangeException(nameof(mode))
+    };
+
+    /// <summary>Replaces the cache of the join index with an empty one of the mode (no epoch): the next refresh run establishes it and warms it up.</summary>
+    public static void UseResident(JoinIndex joinIndex, ResidentMode mode, ResidentCacheRegistry registry = null)
+    {
+        s_configured.AddOrUpdate(joinIndex, null);
+        s_modes.GetOrCreateValue(joinIndex.DocumentDatabase).Value = mode;
+        joinIndex.UseResidentCache(OptionsOf(mode), registry);
+    }
+
+    /// <summary>Takes a join index that a query created: the invariant checker needs the number of its declared fields.</summary>
     public void TrackJoin(string name) => Seen = new JoinIndexInvariantChecker.SeenTerms(Join(name).Join.Fields.Count);
 
-    public JoinIndex Join(string name = JoinName) => (JoinIndex)Database.IndexStore.GetIndex(name);
+    /// <summary>
+    /// The join index of the node. The index store replaces the instance of a join index while the first build runs, and the cache of the new instance is the default one: the first time the harness hands out an instance its cache is the one that the test last
+    /// asked for (<see cref="UseResident"/>, else the mode of the class, else the default one), on the registry of the harness.
+    /// </summary>
+    public JoinIndex Join(string name = JoinName)
+    {
+        var joinIndex = (JoinIndex)Database.IndexStore.GetIndex(name);
+        if (joinIndex != null && (_test is IIndirectModeTest || _test is IResidentModeTest) && s_configured.TryGetValue(joinIndex, out _) == false)
+        {
+            ResidentMode mode = s_modes.TryGetValue(Database, out StrongBox<ResidentMode> asked) ? asked.Value : (_test as IResidentModeTest)?.ResidentMode ?? ResidentMode.Default;
+            UseResident(joinIndex, mode, ResidentRegistry);
+        }
+
+        return joinIndex;
+    }
+
+    private static readonly ConditionalWeakTable<JoinIndex, object> s_configured = new();
+
+    private static readonly ConditionalWeakTable<DocumentDatabase, StrongBox<ResidentMode>> s_modes = new();
 
     public IndexStats Stats(string name = JoinName) => Store.Maintenance.Send(new GetIndexStatisticsOperation(name));
 
@@ -263,6 +344,38 @@ public sealed class JoinIndexHarness : IDisposable
 
             Thread.Sleep(10);
         }
+    }
+
+    /// <summary>Waits until the resident lists were compared with the outer snapshot (the epoch is that snapshot) and returns the number of lists that were; fails when they differ. At least <paramref name="atLeast"/> lists were compared.</summary>
+    public async Task<int> AssertResidentAsync(int atLeast = 0, string name = JoinName, TimeSpan? timeout = null)
+    {
+        DateTime until = DateTime.UtcNow + (timeout ?? TimeSpan.FromSeconds(20));
+        JoinIndexInvariantChecker.Result result;
+        while (true)
+        {
+            result = await CheckAsync(TimeSpan.FromSeconds(5), name);
+            Assert.True(result.Ok, result.ToString());
+            if (result.ResidentChecked >= atLeast && result.ResidentChecked >= 0 || DateTime.UtcNow > until)
+                break;
+
+            await Task.Delay(50);
+        }
+
+        Assert.True(result.ResidentChecked >= atLeast, $"{result.ResidentChecked} resident lists were compared ({result.ResidentNote}), expected at least {atLeast}; {ResidentState(name)}");
+        return result.ResidentChecked;
+    }
+
+    /// <summary>The state that decides whether a list is kept: the registry that charges the cache, the memory state of the process, and the counters of the cache.</summary>
+    public string ResidentState(string name = JoinName)
+    {
+        JoinResident resident = Join(name).Resident;
+        if (resident == null)
+            return "no cache";
+
+        ResidentCacheStats stats = resident.Cache.GetStats();
+        ResidentCacheRegistry registry = ResidentCacheRegistry.Instance;
+        return $"harness registry: low memory {ResidentRegistry.IsLowMemory}, charged {ResidentRegistry.ChargedBytes}, caches {ResidentRegistry.CacheCount}; process registry: low memory {registry.IsLowMemory}, charged {registry.ChargedBytes}, budget {registry.BudgetBytes}, caches {registry.CacheCount}; process low memory {LowMemoryNotification.Instance.LowMemoryState}; "
+               + $"cache: keys {stats.ResidentKeys}, bytes {stats.ResidentBytes}, warm-up keys {stats.WarmUpKeys}, inserts {stats.Inserts}, rejected {stats.Rejected}, not admitted {stats.NotAdmitted}, low memory drops {stats.LowMemoryDrops}, invalidations {stats.Invalidations}";
     }
 
     public async Task AssertCurrentAsync(string name = JoinName)

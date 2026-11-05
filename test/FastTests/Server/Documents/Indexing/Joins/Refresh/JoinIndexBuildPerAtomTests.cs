@@ -26,8 +26,8 @@ namespace FastTests.Server.Documents.Indexing.Joins.Refresh;
 /// </summary>
 public class JoinIndexBuildPerAtomTests(ITestOutputHelper output) : RavenTestBase(output)
 {
-    private const int Conversations = 700;
-    private const int Contexts = 160;
+    internal const int Conversations = 700;
+    internal const int Contexts = 160;
 
     public enum Shape
     {
@@ -38,7 +38,7 @@ public class JoinIndexBuildPerAtomTests(ITestOutputHelper output) : RavenTestBas
         FieldIdOfOuter
     }
 
-    private static async Task<JoinIndexHarness> CreateAsync(RavenTestBase test, Shape shape, Dictionary<string, string> settings = null)
+    internal static async Task<JoinIndexHarness> CreateAsync(RavenTestBase test, Shape shape, Dictionary<string, string> settings = null)
     {
         switch (shape)
         {
@@ -55,7 +55,7 @@ public class JoinIndexBuildPerAtomTests(ITestOutputHelper output) : RavenTestBas
         }
     }
 
-    private static Raven.Client.Documents.Indexes.IndexDefinition JoinDefinition(Shape shape)
+    internal static Raven.Client.Documents.Indexes.IndexDefinition JoinDefinition(Shape shape)
     {
         return shape is Shape.IdJoin or Shape.IdJoinSeveralKeys
             ? JoinIndexHarness.JoinIndexDefinition()
@@ -63,7 +63,7 @@ public class JoinIndexBuildPerAtomTests(ITestOutputHelper output) : RavenTestBas
     }
 
     /// <summary>Contexts with a few countries (large atoms) and some names of their own (atoms of one entry), conversations that name them, name nothing, name documents that do not exist or name several.</summary>
-    private static void Populate(JoinIndexHarness h, Shape shape, int seed)
+    internal static void Populate(JoinIndexHarness h, Shape shape, int seed)
     {
         var random = new Random(seed);
         bool field = shape is Shape.Field or Shape.FieldSeveralKeys or Shape.FieldIdOfOuter;
@@ -99,7 +99,7 @@ public class JoinIndexBuildPerAtomTests(ITestOutputHelper output) : RavenTestBas
         });
     }
 
-    private static JoinIndexHarness.Context NewContext(Random random, Shape shape, int i)
+    internal static JoinIndexHarness.Context NewContext(Random random, Shape shape, int i)
     {
         var context = new JoinIndexHarness.Context
         {
@@ -121,7 +121,7 @@ public class JoinIndexBuildPerAtomTests(ITestOutputHelper output) : RavenTestBas
     }
 
     /// <summary>Half of the contexts get other values and keys, some are deleted and some are new: the changes of the inner side only.</summary>
-    private static void ChangeContexts(JoinIndexHarness h, Shape shape, int seed)
+    internal static void ChangeContexts(JoinIndexHarness h, Shape shape, int seed)
     {
         var random = new Random(seed);
         h.Save(s =>
@@ -236,7 +236,7 @@ public class JoinIndexBuildPerAtomTests(ITestOutputHelper output) : RavenTestBas
         return lines;
     }
 
-    private static async Task<(JoinIndexHarness H, Index Outer, Index Inner)> PrepareAsync(RavenTestBase test, Shape shape, int seed, Dictionary<string, string> settings = null)
+    internal static async Task<(JoinIndexHarness H, Index Outer, Index Inner)> PrepareAsync(RavenTestBase test, Shape shape, int seed, Dictionary<string, string> settings = null)
     {
         JoinIndexHarness h = await CreateAsync(test, shape, settings);
         Populate(h, shape, seed);

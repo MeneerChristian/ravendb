@@ -27,6 +27,7 @@ internal static class FieldJoinInvariantChecker
 
     public static void Compare(JoinIndexSnapshot joinIndex, JoinPlan plan, IndexView outer, IndexView inner, JoinIndexInvariantChecker.SeenTerms seen, JoinIndexInvariantChecker.Result result)
     {
+        bool indirect = joinIndex.Schema.IsIndirect;
         using var allocator = new ByteStringContext(SharedMultipleUseFlag.None);
         using var projector = new InnerProjector(plan, allocator);
         using var keyReader = new OuterKeyReader(plan, allocator);
@@ -136,7 +137,8 @@ internal static class FieldJoinInvariantChecker
                     }
                 }
 
-                if (withGroup >= 2)
+                // an Indirect file counts the rows with two or more keys whether the keys have a group or not
+                if (indirect ? keys.Length >= 2 : withGroup >= 2)
                     severalKeys++;
 
                 if (withGroup == 0)
@@ -172,20 +174,25 @@ internal static class FieldJoinInvariantChecker
         for (int g = 0; g < members.Length; g++)
             Same($"members of grouping {g}", members[g].OrderBy(x => x).ToArray(), JoinIndexInvariantChecker.ReadList(joinIndex, joinIndex.SlotHandle(joinIndex.GroupingMembersSlot(g))), result);
 
-        for (int field = 0; field < plan.Fields.Length; field++)
+        if (indirect)
+            CompareKeyLists(joinIndex, plan, groups, outerKeyOf, seen, result);
+        else
         {
-            foreach (string term in seen.ByField[field])
+            for (int field = 0; field < plan.Fields.Length; field++)
             {
-                long[] expected = termLists.TryGetValue((field, term), out List<long> list) ? list.OrderBy(x => x).ToArray() : [];
-                long[] actual = JoinIndexInvariantChecker.ReadTerm(joinIndex, field, term) ?? [];
-                Same($"field {plan.Definition.Fields[field].Field} term '{term}'", expected, actual, result);
+                foreach (string term in seen.ByField[field])
+                {
+                    long[] expected = termLists.TryGetValue((field, term), out List<long> list) ? list.OrderBy(x => x).ToArray() : [];
+                    long[] actual = JoinIndexInvariantChecker.ReadTerm(joinIndex, field, term) ?? [];
+                    Same($"field {plan.Definition.Fields[field].Field} term '{term}'", expected, actual, result);
+                }
             }
-        }
 
-        Same("any", any.OrderBy(x => x).ToArray(), JoinIndexInvariantChecker.ReadList(joinIndex, joinIndex.SlotHandle(JoinReader.AnySlot)), result);
-        Same("outer entries joined with several inner entries", severalInner.OrderBy(x => x).ToArray(), JoinIndexInvariantChecker.ReadList(joinIndex, joinIndex.SlotHandle(joinIndex.SeveralInnerSlot)), result);
-        for (int g = 0; g < groupings.Length; g++)
-            Same($"grouping {g}", groupings[g].OrderBy(x => x).ToArray(), JoinIndexInvariantChecker.ReadList(joinIndex, joinIndex.SlotHandle(JoinReader.GroupingListSlot(g))), result);
+            Same("any", any.OrderBy(x => x).ToArray(), JoinIndexInvariantChecker.ReadList(joinIndex, joinIndex.SlotHandle(JoinReader.AnySlot)), result);
+            Same("outer entries joined with several inner entries", severalInner.OrderBy(x => x).ToArray(), JoinIndexInvariantChecker.ReadList(joinIndex, joinIndex.SlotHandle(joinIndex.SeveralInnerSlot)), result);
+            for (int g = 0; g < groupings.Length; g++)
+                Same($"grouping {g}", groupings[g].OrderBy(x => x).ToArray(), JoinIndexInvariantChecker.ReadList(joinIndex, joinIndex.SlotHandle(JoinReader.GroupingListSlot(g))), result);
+        }
 
         // the keys of every outer entry that has some, and no row for the others
         var stored = new ContextBoundNativeList<long>(allocator, 4);
@@ -197,13 +204,29 @@ internal static class FieldJoinInvariantChecker
             long[] refs = KeyRefs(joinIndex, keys);
             if (has == false || refs == null || stored.ToSpan().ToArray().SequenceEqual(refs) == false)
                 result.Mismatches.Add($"outer entry {entry} has the keys '{string.Join("','", keys)}': the join index holds {actual}, key references {(refs == null ? "unknown" : string.Join(",", refs))}");
+
+            // a fingerprint that the file has is the one of the keys of the entry (a row that the build wrote in two parts has none)
+            if (joinIndex.Schema.HasOuterFingerprints && joinIndex.TryGetOuterKeysFingerprint(entry, out long fingerprint))
+            {
+                long[] hashes = keys.Select(x => OuterKeyFingerprint.HashOf(Encoding.UTF8.GetBytes(x))).ToArray();
+                OuterKeyFingerprint.Of(hashes, out long expectedFingerprint);
+                if (fingerprint != expectedFingerprint)
+                    result.Mismatches.Add($"outer entry {entry} has the keys '{string.Join("','", keys)}': the fingerprint of the file is {fingerprint}, the keys give {expectedFingerprint}");
+            }
         }
+
+        // no fingerprint of an entry that has no keys
+        if (joinIndex.NumberOfOuterFingerprints > outerKeyOf.Count)
+            result.Mismatches.Add($"fingerprints of outer entries: {joinIndex.NumberOfOuterFingerprints} for {outerKeyOf.Count} entries with a key");
 
         if (joinIndex.NumberOfJoined != outerKeyOf.Count)
             result.Mismatches.Add($"outer entries with a key: expected {outerKeyOf.Count}, join index has {joinIndex.NumberOfJoined}");
 
         // the entries with two or more keys, whether the keys have an inner entry or not
-        Same("entries with several keys", outerKeyOf.Where(x => x.Value.Length >= 2).Select(x => x.Key).OrderBy(x => x).ToArray(), JoinIndexInvariantChecker.ReadList(joinIndex, joinIndex.SlotHandle(joinIndex.MultiKeySlot)), result);
+        if (indirect)
+            Same("list of the entries with several keys (not written)", [], JoinIndexInvariantChecker.ReadList(joinIndex, joinIndex.SlotHandle(joinIndex.MultiKeySlot)), result);
+        else
+            Same("entries with several keys", outerKeyOf.Where(x => x.Value.Length >= 2).Select(x => x.Key).OrderBy(x => x).ToArray(), JoinIndexInvariantChecker.ReadList(joinIndex, joinIndex.SlotHandle(joinIndex.MultiKeySlot)), result);
 
         // the keys of every inner document that has some
         foreach ((long documentKey, string[] keys) in innerKeyOf)
@@ -273,6 +296,15 @@ internal static class FieldJoinInvariantChecker
             codes.Count = 0;
             joinIndex.ReadKeyAtoms(keyRef, ref codes);
             Same($"atoms of the key '{key}'", expectedAtoms.ToArray(), codes.ToSpan().ToArray(), result);
+            // a file whose keys are the ids of its inner documents keeps no counts: a group is one document and the atoms of the key are its atoms
+            if (joinIndex.Schema.KeysAreInnerIds)
+            {
+                if (group is { Size: > 1 })
+                    result.Mismatches.Add($"key '{key}': {group.Size} inner entries in the group of a key that is the id of a document");
+
+                continue;
+            }
+
             foreach ((long code, int count) in expected)
             {
                 int actual = joinIndex.GetPairCount(keyRef, code);
@@ -281,8 +313,9 @@ internal static class FieldJoinInvariantChecker
             }
         }
 
-        if (joinIndex.NumberOfPairCounts != pairs)
-            result.Mismatches.Add($"counted pairs of a key and an atom: expected {pairs}, join index has {joinIndex.NumberOfPairCounts}");
+        long expectedPairs = joinIndex.Schema.KeysAreInnerIds ? 0 : pairs;
+        if (joinIndex.NumberOfPairCounts != expectedPairs)
+            result.Mismatches.Add($"counted pairs of a key and an atom: expected {expectedPairs}, join index has {joinIndex.NumberOfPairCounts}");
 
         long several = groups.Values.Count(x => x.Size >= 2);
         if (joinIndex.RowsWithSeveralJoined != several)
@@ -299,6 +332,68 @@ internal static class FieldJoinInvariantChecker
 
         stored.Dispose();
         codes.Dispose();
+    }
+
+    /// <summary>
+    /// The lists of an Indirect file against the groups: the list of an atom holds the references of the keys whose group has an inner entry with the atom, the several list the keys with two or more
+    /// inner entries, and every key of both sides is in the dictionary of the keys (an outer key without a group, too).
+    /// </summary>
+    private static void CompareKeyLists(JoinIndexSnapshot joinIndex, JoinPlan plan, Dictionary<string, Group> groups, Dictionary<long, string[]> outerKeyOf, JoinIndexInvariantChecker.SeenTerms seen, JoinIndexInvariantChecker.Result result)
+    {
+        var termKeys = new Dictionary<(int, string), List<long>>();
+        var anyKeys = new List<long>();
+        var severalKeys = new List<long>();
+        var groupingKeys = Enumerable.Range(0, plan.GroupingFields.Length).Select(_ => new List<long>()).ToArray();
+
+        foreach (string key in outerKeyOf.Values.SelectMany(x => x).Concat(groups.Keys).Distinct(StringComparer.Ordinal))
+        {
+            if (joinIndex.TryGetKey(Encoding.UTF8.GetBytes(key), out long keyRef) == false)
+                result.Mismatches.Add($"key '{key}' is not in the dictionary of the keys");
+        }
+
+        foreach ((string key, Group group) in groups)
+        {
+            if (joinIndex.TryGetKey(Encoding.UTF8.GetBytes(key), out long keyRef) == false)
+                continue;
+
+            anyKeys.Add(keyRef);
+            if (group.Size >= 2)
+                severalKeys.Add(keyRef);
+
+            foreach (((int kind, int field, string text), int count) in group.Atoms)
+            {
+                if (count == 0)
+                    continue;
+
+                if (kind == 1)
+                {
+                    if (termKeys.TryGetValue((field, text), out List<long> list) == false)
+                        termKeys[(field, text)] = list = new List<long>();
+
+                    list.Add(keyRef);
+                    seen.ByField[field].Add(text);
+                }
+                else if (kind == 2)
+                {
+                    groupingKeys[field].Add(keyRef);
+                }
+            }
+        }
+
+        for (int field = 0; field < plan.Fields.Length; field++)
+        {
+            foreach (string term in seen.ByField[field])
+            {
+                long[] expected = termKeys.TryGetValue((field, term), out List<long> list) ? list.OrderBy(x => x).ToArray() : [];
+                long[] actual = joinIndex.TryGetTerm(field, Encoding.UTF8.GetBytes(term), out _, out long handle) ? JoinIndexInvariantChecker.ReadList(joinIndex, handle) : [];
+                Same($"field {plan.Definition.Fields[field].Field} term '{term}' (keys)", expected, actual, result);
+            }
+        }
+
+        Same("any (keys)", anyKeys.OrderBy(x => x).ToArray(), JoinIndexInvariantChecker.ReadList(joinIndex, joinIndex.AtomHandle(JoinReader.AtomOfAny())), result);
+        Same("keys with several inner entries", severalKeys.OrderBy(x => x).ToArray(), JoinIndexInvariantChecker.ReadList(joinIndex, joinIndex.AtomHandle(joinIndex.AtomOfSeveralInner)), result);
+        for (int g = 0; g < groupingKeys.Length; g++)
+            Same($"grouping {g} (keys)", groupingKeys[g].OrderBy(x => x).ToArray(), JoinIndexInvariantChecker.ReadList(joinIndex, joinIndex.AtomHandle(JoinReader.AtomOfGrouping(g))), result);
     }
 
     /// <summary>The references of the keys (sorted ascending, as the file keeps them), null when one is not in the dictionary of the keys.</summary>

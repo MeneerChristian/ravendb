@@ -196,6 +196,8 @@ public static class JoinFileConsistencyChecker
             }
         }
 
+        // an Indirect file lists the keys whose group has an atom; an Expanded file the outer entries of such keys
+        bool indirect = file.Schema.IsIndirect;
         var expectedLists = new Dictionary<long, List<long>>();
         var severalInner = new List<long>();
         long rows = 0;
@@ -230,18 +232,36 @@ public static class JoinFileConsistencyChecker
                 atoms.UnionWith(group.Atoms.Keys);
             }
 
-            if (withGroup >= 2)
+            if (indirect ? keys.Count >= 2 : withGroup >= 2)
                 severalKeys++;
 
             if (withGroup == 0)
                 continue;
 
             joined++;
+            if (indirect)
+                continue;
+
             if (bigGroup || withGroup >= 2)
                 severalInner.Add(entry);
 
             foreach (long code in atoms)
                 expectedLists[code].Add(entry);
+        }
+
+        if (indirect)
+        {
+            foreach ((long keyRef, Group group) in groups)
+            {
+                foreach (long code in group.Atoms.Keys)
+                    expectedLists[code].Add(keyRef);
+
+                if (group.Size >= 2)
+                    severalInner.Add(keyRef);
+            }
+
+            if (file.SlotHandle(file.MultiKeySlot) != ListStore.EmptyHandle)
+                mismatches.Add("the list of the entries with several keys is written in an Indirect file");
         }
 
         foreach ((long code, List<long> expected) in expectedLists)
@@ -262,7 +282,7 @@ public static class JoinFileConsistencyChecker
         if (expectedLists.ContainsKey(JoinReader.CodeOfAny()) == false)
             Compare("any", new List<long>(), Read(file, file.SlotHandle(JoinReader.AnySlot)), mismatches);
 
-        Compare("outer entries joined with several inner entries", severalInner, Read(file, file.SlotHandle(file.SeveralInnerSlot)), mismatches);
+        Compare(indirect ? "keys with several inner entries" : "outer entries joined with several inner entries", severalInner, Read(file, file.SlotHandle(file.SeveralInnerSlot)), mismatches);
 
         // the atoms and the counts of every key a row names
         long pairs = 0;
@@ -279,6 +299,15 @@ public static class JoinFileConsistencyChecker
             if (expectedAtoms.SequenceEqual(actualCodes.ToSpan().ToArray()) == false)
                 mismatches.Add($"atoms of the key {keyRef}: expected {expectedAtoms.Count}, file has {actualCodes.Count}");
 
+            // a file whose keys are the ids of its inner documents keeps no counts: a group is one document, and the atoms of the key are its atoms
+            if (file.Schema.KeysAreInnerIds)
+            {
+                if (group.Size != 1)
+                    mismatches.Add($"key {keyRef}: a file whose keys are the ids of the inner documents has {group.Size} inner entries in the group of a key");
+
+                continue;
+            }
+
             foreach ((long code, int count) in group.Atoms)
             {
                 int actual = file.GetPairCount(keyRef, code);
@@ -287,8 +316,9 @@ public static class JoinFileConsistencyChecker
             }
         }
 
-        if (file.NumberOfPairCounts != pairs)
-            mismatches.Add($"counted pairs of a key and an atom: expected {pairs}, file has {file.NumberOfPairCounts}");
+        long expectedPairs = file.Schema.KeysAreInnerIds ? 0 : pairs;
+        if (file.NumberOfPairCounts != expectedPairs)
+            mismatches.Add($"counted pairs of a key and an atom: expected {expectedPairs}, file has {file.NumberOfPairCounts}");
 
         long several = groups.Values.Count(x => x.Size >= 2);
         if (file.RowsWithSeveralJoined != several)

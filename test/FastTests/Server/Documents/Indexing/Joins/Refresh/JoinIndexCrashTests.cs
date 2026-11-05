@@ -10,6 +10,7 @@ using System.Text;
 using System.Threading.Tasks;
 using FastTests.Server.Documents.Indexing.Joins.Query;
 using Raven.Client.Documents;
+using Raven.Client.Documents.Indexes;
 using Raven.Client.Documents.Operations.Indexes;
 using Raven.Client.ServerWide;
 using Raven.Client.ServerWide.Operations;
@@ -133,18 +134,18 @@ public class JoinIndexCrashTests(ITestOutputHelper output) : RavenTestBase(outpu
         }
     }
 
-    private static void StoreContexts(IDocumentStore store)
+    private static void StoreContexts(IDocumentStore store, bool field)
     {
         using var bulk = store.BulkInsert();
         for (int i = 0; i < Contexts; i++)
-            bulk.Store(new JoinIndexHarness.Context { Country = i % 3 == 0 ? "nl" : "de", Name = "n" + i % 5, Rank = i, IsActive = i % 2 == 0, Title = "red fox " + i % 4 }, $"contexts/{i}");
+            bulk.Store(new JoinIndexHarness.Context { Code = field ? $"k{i}" : null, Country = i % 3 == 0 ? "nl" : "de", Name = "n" + i % 5, Rank = i, IsActive = i % 2 == 0, Title = "red fox " + i % 4 }, $"contexts/{i}");
     }
 
-    private static void StoreConversations(IDocumentStore store, int shift)
+    private static void StoreConversations(IDocumentStore store, int shift, bool field)
     {
         using var bulk = store.BulkInsert();
         for (int i = 0; i < Conversations; i++)
-            bulk.Store(new JoinIndexHarness.Conversation { ContextId = $"contexts/{(i + shift) % Contexts}", Title = "t" + shift }, $"conversations/{i}");
+            bulk.Store(new JoinIndexHarness.Conversation { ContextId = $"{(field ? "k" : "contexts/")}{(i + shift) % Contexts}", Title = "t" + shift }, $"conversations/{i}");
     }
 
     private static async Task WaitUntilNotStaleAsync(IDocumentStore store, int seconds = 120)
@@ -161,7 +162,13 @@ public class JoinIndexCrashTests(ITestOutputHelper output) : RavenTestBase(outpu
     }
 
     [RavenFact(RavenTestCategory.Indexes)]
-    public async Task AServerThatIsKilledBetweenTwoChunksOfARefreshResumesFromTheLastCommitWithoutBuildingAndEndsExact()
+    public Task AServerThatIsKilledBetweenTwoChunksOfARefreshResumesFromTheLastCommitWithoutBuildingAndEndsExact() => RunAsync(indirect: false);
+
+    // the join index is a join on a field in the storage mode Indirect: the same kill, the same resume; the queries are not served from an Indirect file yet, so the lists are checked against the indexes
+    [RavenFact(RavenTestCategory.Indexes)]
+    public Task AnIndirectJoinThatIsKilledBetweenTwoChunksResumesFromTheLastCommitWithoutBuildingAndEndsExact() => RunAsync(indirect: true);
+
+    private async Task RunAsync(bool indirect)
     {
         string dataDirectory = NewDataPath(forceCreateDir: true);
         int port = FreePort();
@@ -182,19 +189,24 @@ public class JoinIndexCrashTests(ITestOutputHelper output) : RavenTestBase(outpu
                 {
                     [RavenConfiguration.GetKey(x => x.Indexing.StaticIndexingEngineType)] = "Corax",
                     [RavenConfiguration.GetKey(x => x.Indexing.CoraxIncludeDocumentScore)] = "true",
-                    [RavenConfiguration.GetKey(x => x.Join.MaxIdsPerCommit)] = Budget.ToString()
+                    [RavenConfiguration.GetKey(x => x.Join.MaxIdsPerCommit)] = Budget.ToString(),
+                    [RavenConfiguration.GetKey(x => x.Join.IndirectEnabled)] = indirect.ToString()
                 }
             };
             await store.Maintenance.Server.SendAsync(new CreateDatabaseOperation(record));
-            await store.Maintenance.SendAsync(new PutIndexesOperation(JoinIndexHarness.OuterIndex(), JoinIndexHarness.InnerIndex()));
-            StoreContexts(store);
-            StoreConversations(store, shift: 0);
-            await store.Maintenance.SendAsync(new PutIndexesOperation(JoinIndexHarness.JoinIndexDefinition()));
+            await store.Maintenance.SendAsync(new PutIndexesOperation(JoinIndexHarness.OuterIndex(), indirect ? JoinIndexHarness.FieldInnerIndex() : JoinIndexHarness.InnerIndex()));
+            StoreContexts(store, indirect);
+            StoreConversations(store, shift: 0, indirect);
+            IndexDefinition joinDefinition = indirect ? JoinIndexHarness.FieldJoinIndexDefinition() : JoinIndexHarness.JoinIndexDefinition();
+            if (indirect)
+                joinDefinition.Join.StorageMode = JoinStorageMode.Indirect;
+
+            await store.Maintenance.SendAsync(new PutIndexesOperation(joinDefinition));
             await WaitUntilNotStaleAsync(store);
 
             // every conversation moves to another context: Conversations changes, Budget of them in each commit of the join index
             long refreshes = store.Maintenance.Send(new GetIndexStatisticsOperation(JoinIndexHarness.JoinName)).Join.Refreshes;
-            StoreConversations(store, shift: 1);
+            StoreConversations(store, shift: 1, indirect);
 
             refreshesBeforeKill = -1;
             for (int i = 0; i < 2000 && refreshesBeforeKill < 0; i++)
@@ -222,7 +234,8 @@ public class JoinIndexCrashTests(ITestOutputHelper output) : RavenTestBase(outpu
             [common[0]] = $"http://127.0.0.1:{port}",
             [common[1]] = serverDirectory,
             [common[2]] = "false",
-            [RavenConfiguration.GetKey(x => x.Indexing.Disabled)] = indexingDisabled.ToString()
+            [RavenConfiguration.GetKey(x => x.Indexing.Disabled)] = indexingDisabled.ToString(),
+            [RavenConfiguration.GetKey(x => x.Join.IndirectEnabled)] = indirect.ToString()
         };
 
         RavenServer frozen = GetNewServer(new ServerCreationOptions { DeletePrevious = false, CustomSettings = Settings(true) });
@@ -242,16 +255,24 @@ public class JoinIndexCrashTests(ITestOutputHelper output) : RavenTestBase(outpu
                 Assert.True(snapshot.Generation.Serial >= 1);
             }
 
-            var oracle = new JoinIndexQueryOracle(h);
-            long served = oracle.Info.Served;
-            foreach (string sub in new[] { "", " where Country = 'nl'", " where IsActive = true" })
+            if (indirect)
             {
-                (QueryAnswer answer, QueryAnswer scan) = oracle.Both(JoinIndexQueryOracle.Join(sub, " order by m.Title limit 0, 50"));
-                JoinIndexQueryOracle.AssertSame(sub, answer, scan);
+                Assert.Equal(JoinStorageMode.Indirect, snapshot.Generation.Mode);
+                Assert.True(snapshot.Generation.InnerPartial || snapshot.Generation.OuterPartial);
             }
+            else
+            {
+                var oracle = new JoinIndexQueryOracle(h);
+                long served = oracle.Info.Served;
+                foreach (string sub in new[] { "", " where Country = 'nl'", " where IsActive = true" })
+                {
+                    (QueryAnswer answer, QueryAnswer scan) = oracle.Both(JoinIndexQueryOracle.Join(sub, " order by m.Title limit 0, 50"));
+                    JoinIndexQueryOracle.AssertSame(sub, answer, scan);
+                }
 
-            Assert.Equal(served, oracle.Info.Served);
-            Assert.True(oracle.Info.FallbackTotal > 0, "the queries did not even ask the join index");
+                Assert.Equal(served, oracle.Info.Served);
+                Assert.True(oracle.Info.FallbackTotal > 0, "the queries did not even ask the join index");
+            }
         }
         finally
         {
@@ -275,9 +296,12 @@ public class JoinIndexCrashTests(ITestOutputHelper output) : RavenTestBase(outpu
             Assert.True(joinIndex.Counters.Refreshes > 0, "the join index did not refresh after the restart");
             Assert.True(JoinFileConsistencyChecker.Check(joinIndex, Conversations, Contexts).Ok);
 
-            var oracle = new JoinIndexQueryOracle(h);
-            foreach (string sub in new[] { "", " where Country = 'nl'", " where IsActive = true", " where Rank > 3" })
-                oracle.Check(JoinIndexQueryOracle.Join(sub, " order by m.Title limit 0, 50"));
+            if (indirect == false)
+            {
+                var oracle = new JoinIndexQueryOracle(h);
+                foreach (string sub in new[] { "", " where Country = 'nl'", " where IsActive = true", " where Rank > 3" })
+                    oracle.Check(JoinIndexQueryOracle.Join(sub, " order by m.Title limit 0, 50"));
+            }
         }
         finally
         {

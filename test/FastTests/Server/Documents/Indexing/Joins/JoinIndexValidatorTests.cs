@@ -59,12 +59,12 @@ public class JoinIndexValidatorTests(ITestOutputHelper output) : NoDisposalNeede
             .AddGrouping("IsActive", "true");
     }
 
-    private static List<JoinValidationError> Validate(JoinDefinition definition, JoinIndexFacts outer = null, JoinIndexFacts inner = null, bool sharded = false)
+    private static List<JoinValidationError> Validate(JoinDefinition definition, JoinIndexFacts outer = null, JoinIndexFacts inner = null, bool sharded = false, bool indirectEnabled = false)
     {
         outer ??= Outer();
         inner ??= Inner();
         var indexes = new Dictionary<string, JoinIndexFacts>(StringComparer.OrdinalIgnoreCase) { [outer.Name] = outer, [inner.Name] = inner };
-        return new JoinIndexValidator(name => indexes.GetValueOrDefault(name), sharded).Validate(definition);
+        return new JoinIndexValidator(name => indexes.GetValueOrDefault(name), sharded, indirectEnabled).Validate(definition);
     }
 
     private static void AssertSingle(List<JoinValidationError> errors, JoinValidationCode code, string contains = null)
@@ -234,6 +234,23 @@ public class JoinIndexValidatorTests(ITestOutputHelper output) : NoDisposalNeede
     private static JoinIndexFacts InnerWithCode(FieldIndexing indexing = FieldIndexing.Default, string analyzer = null)
     {
         return Inner(x => x.Fields["Code"] = new JoinIndexFieldFacts { Indexing = indexing, HasCustomAnalyzer = analyzer != null, Analyzer = analyzer });
+    }
+
+    [RavenFact(RavenTestCategory.Indexes)]
+    public void TheStorageModeIndirectIsRefusedWhileTheServerDoesNotAllowIt()
+    {
+        JoinDefinition definition = FieldDefinition();
+        definition.StorageMode = JoinStorageMode.Indirect;
+
+        AssertSingle(Validate(definition, inner: InnerWithCode()), JoinValidationCode.InvalidDefinition, "Join.IndirectEnabled");
+        Assert.Empty(Validate(definition, inner: InnerWithCode(), indirectEnabled: true));
+
+        // the other modes do not depend on the setting
+        foreach (JoinStorageMode mode in new[] { JoinStorageMode.Auto, JoinStorageMode.Expanded })
+        {
+            definition.StorageMode = mode;
+            Assert.Empty(Validate(definition, inner: InnerWithCode()));
+        }
     }
 
     [RavenFact(RavenTestCategory.Indexes)]

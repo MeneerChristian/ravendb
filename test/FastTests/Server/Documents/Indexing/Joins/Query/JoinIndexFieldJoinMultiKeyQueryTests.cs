@@ -92,6 +92,15 @@ public class JoinIndexFieldJoinMultiKeyQueryTests(ITestOutputHelper output) : Ra
         return h;
     }
 
+    /// <summary>An Indirect file counts the rows with two or more keys whether the keys have a group or not: the invariant check compares that number with the rows, here only the groups are compared.</summary>
+    private static void AssertCounters(JoinIndexHarness h, long groups, long rowsWithGroups)
+    {
+        (long actualGroups, long actualRows) = Counters(h);
+        Assert.Equal(groups, actualGroups);
+        if (h.IsIndirect == false)
+            Assert.Equal(rowsWithGroups, actualRows);
+    }
+
     private static (long GroupsOfSeveral, long RowsWithSeveralKeys) Counters(JoinIndexHarness h)
     {
         Assert.True(h.Join().TryOpenJoinSnapshot(out JoinIndexSnapshot snapshot));
@@ -190,7 +199,7 @@ public class JoinIndexFieldJoinMultiKeyQueryTests(ITestOutputHelper output) : Ra
         h.PutConversationKeys(4, ["k5"], "b");
         h.PutConversationKeys(5, ["k9"], "a");
         await h.AssertCurrentAsync();
-        Assert.Equal((0, 0), Counters(h));
+        AssertCounters(h, 0, 0);
         var oracle = new JoinIndexQueryOracle(h);
 
         string order = " order by m.Title limit 0, 10";
@@ -206,7 +215,7 @@ public class JoinIndexFieldJoinMultiKeyQueryTests(ITestOutputHelper output) : Ra
         // the entry 3 joins the group of k1: now a row is joined with two entries and an AND is checked against the inner index
         h.PutCodedContextKeys(3, ["k4", "k1"], "nl", "n2", 3, true, "z");
         await h.AssertCurrentAsync();
-        Assert.Equal((1, 0), Counters(h));
+        AssertCounters(h, 1, 0);
         foreach (string sub in subs.Take(4))
             oracle.Check(FieldJoin(sub, order));
 
@@ -225,7 +234,7 @@ public class JoinIndexFieldJoinMultiKeyQueryTests(ITestOutputHelper output) : Ra
         h.PutConversationKeys(3, ["k3", "k1", "k2"], "three");
         h.PutConversationKeys(4, ["k9", "k2"], "other");
         await h.AssertCurrentAsync();
-        Assert.Equal((1, 2), Counters(h));
+        AssertCounters(h, 1, 2);
         var oracle = new JoinIndexQueryOracle(h);
 
         string order = " order by m.Title limit 0, 10";
@@ -262,7 +271,7 @@ public class JoinIndexFieldJoinMultiKeyQueryTests(ITestOutputHelper output) : Ra
         h.PutConversationKeys(2, ["k1"], "one");
         h.PutConversationKeys(3, ["k2"], "two");
         await h.AssertCurrentAsync();
-        Assert.Equal((0, 1), Counters(h));
+        AssertCounters(h, 0, 1);
         var oracle = new JoinIndexQueryOracle(h);
 
         string order = " order by m.Title limit 0, 10";
@@ -274,7 +283,7 @@ public class JoinIndexFieldJoinMultiKeyQueryTests(ITestOutputHelper output) : Ra
         // the row loses its second key: every row has one inner entry and the algebra is exact
         h.PutConversationKeys(1, ["k1"], "both");
         await h.AssertCurrentAsync();
-        Assert.Equal((0, 0), Counters(h));
+        AssertCounters(h, 0, 0);
         foreach (string sub in new[] { " where Country = 'nl' and Name = 'n2'", " where Country != 'nl'", " where Country = 'nl' and IsActive != true", " where IsActive = true and Name != 'n1'" })
             oracle.Check(FieldJoin(sub, order));
     }
@@ -290,7 +299,7 @@ public class JoinIndexFieldJoinMultiKeyQueryTests(ITestOutputHelper output) : Ra
             h.PutConversationKeys(i, [$"k{1 + i % 5}"], i % 2 == 0 ? "a" : "b");
 
         await h.AssertCurrentAsync();
-        Assert.Equal((2, 0), Counters(h));
+        AssertCounters(h, 2, 0);
         var oracle = new JoinIndexQueryOracle(h);
 
         foreach (string tail in ScoredTails.Concat(UnscoredTails))
@@ -441,3 +450,6 @@ public class JoinIndexFieldJoinMultiKeyQueryTests(ITestOutputHelper output) : Ra
         Assert.Equal(subs.Length * 25, oracle.Info.Served);
     }
 }
+
+/// <summary>The tests of the class with the join indexes on a field in the storage mode Indirect.</summary>
+public class JoinIndexFieldJoinMultiKeyQueryTestsIndirect(ITestOutputHelper output) : JoinIndexFieldJoinMultiKeyQueryTests(output), IIndirectModeTest;

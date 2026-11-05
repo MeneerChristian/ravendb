@@ -61,7 +61,7 @@ public class JoinIndexAutoQueryTests(ITestOutputHelper output) : RavenTestBase(o
             await Task.Delay(25);
 
         AutoJoinCounters counters = h.Database.IndexStore.AutoJoins.Counters;
-        Assert.True(h.Join(name) != null, $"no auto join index: requested {counters.Requested}, created {counters.Created}, failed {counters.Failed}, skipped for memory {counters.SkippedForMemory}");
+        Assert.True(h.Join(name) != null, $"no auto join index: requested {counters.Requested}, created {counters.Created}, failed {counters.Failed}, skipped for memory {counters.SkippedForMemory} (resident {counters.SkippedForResidentMemory})");
         h.TrackJoin(name);
         await h.AssertCurrentAsync(name);
     }

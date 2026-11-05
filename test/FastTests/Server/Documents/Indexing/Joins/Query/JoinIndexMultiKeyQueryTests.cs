@@ -63,6 +63,10 @@ public class JoinIndexMultiKeyQueryTests(ITestOutputHelper output) : RavenTestBa
 
     private const string ScoresMultiKey = "KindNotServed:ScoresMultiKey";
     private const string GroupResidual = "KindNotServed:GroupResidual";
+    private const string OrderByIndirect = "KindNotServed:OrderByIndirect";
+
+    // an Indirect file holds one key per joined document: an AND or a NOT is exact per key, a row with two joined documents is a row with two keys, and no list of outer entries orders the page
+    private bool KeysAreTheDomain => this is IIndirectModeTest;
 
     private static Dictionary<string, string> ScoreSettings() => new() { [RavenConfiguration.GetKey(x => x.Indexing.CoraxIncludeDocumentScore)] = true.ToString() };
 
@@ -98,7 +102,7 @@ public class JoinIndexMultiKeyQueryTests(ITestOutputHelper output) : RavenTestBa
             foreach (string tail in UnscoredTails)
             {
                 // an AND or a NOT over the lists is not the join of the server when a row has two joined documents
-                bool residual = HasAndOrNot(sub);
+                bool residual = HasAndOrNot(sub) && KeysAreTheDomain == false;
                 oracle.Check(Join(sub, tail), expectServed: residual == false);
                 if (residual)
                     expectedResidual++;
@@ -170,6 +174,14 @@ public class JoinIndexMultiKeyQueryTests(ITestOutputHelper output) : RavenTestBa
         long residual = oracle.FallbacksOf(GroupResidual);
         foreach (string sub in new[] { " where Country = 'nl' and Name = 'n2'", " where Country != 'nl'", " where Country = 'nl' and IsActive != true", " where IsActive = true and Name != 'n1'" })
         {
+            if (KeysAreTheDomain)
+            {
+                // the lists hold the keys of the contexts, so the AND and the NOT are evaluated per context and the answer is the join of the server
+                oracle.Check(Join(sub, order), expectServed: true);
+                Assert.Equal(residual, oracle.FallbacksOf(GroupResidual));
+                continue;
+            }
+
             oracle.Check(Join(sub, order), expectServed: false);
             Assert.True(oracle.FallbacksOf(GroupResidual) > residual, $"GroupResidual was not counted for{sub}: {string.Join(", ", oracle.Info.Fallbacks)}");
             residual = oracle.FallbacksOf(GroupResidual);
@@ -228,9 +240,11 @@ public class JoinIndexMultiKeyQueryTests(ITestOutputHelper output) : RavenTestBa
                 oracle.Check(Join(sub, tail), expectServed: true);
         }
 
-        oracle.Check(Join("", " order by c.Name limit 0, 10"), expectServed: true);
+        // the page of an order by a joined field is read from the lists of outer entries, which an Indirect file does not have
+        oracle.Check(Join("", " order by c.Name limit 0, 10"), expectServed: KeysAreTheDomain == false);
 
-        Assert.Equal(0, oracle.Info.FallbackTotal);
+        Assert.Equal(KeysAreTheDomain ? 1 : 0, oracle.Info.FallbackTotal);
+        Assert.Equal(KeysAreTheDomain ? 1 : 0, oracle.FallbacksOf(OrderByIndirect));
     }
 
     [RavenFact(RavenTestCategory.Querying | RavenTestCategory.Indexes)]
@@ -240,7 +254,7 @@ public class JoinIndexMultiKeyQueryTests(ITestOutputHelper output) : RavenTestBa
         var oracle = new JoinIndexQueryOracle(h);
 
         oracle.Check(Join("", " order by c.Name limit 0, 10"), expectServed: false);
-        Assert.True(oracle.FallbacksOf("KindNotServed:OrderByMultiKey") > 0, string.Join(", ", oracle.Info.Fallbacks));
+        Assert.True(oracle.FallbacksOf(KeysAreTheDomain ? OrderByIndirect : "KindNotServed:OrderByMultiKey") > 0, string.Join(", ", oracle.Info.Fallbacks));
     }
 
     [RavenTheory(RavenTestCategory.Querying | RavenTestCategory.Indexes)]
@@ -254,7 +268,7 @@ public class JoinIndexMultiKeyQueryTests(ITestOutputHelper output) : RavenTestBa
         var oracle = new JoinIndexQueryOracle(h);
         var random = new Random(seed);
         // what the join of the server reads because of the several keys, and what it reads for the kind of the condition whenever the score is used
-        var allowed = new HashSet<string> { ScoresMultiKey, GroupResidual, "KindNotServed:OrderByMultiKey", "KindNotServed:Or", "KindNotServed:Range", "KindNotServed:Between", "KindNotServed:In", "KindNotServed:Method:startsWith" };
+        var allowed = new HashSet<string> { ScoresMultiKey, GroupResidual, "KindNotServed:OrderByMultiKey", OrderByIndirect, "KindNotServed:Or", "KindNotServed:Range", "KindNotServed:Between", "KindNotServed:In", "KindNotServed:Method:startsWith" };
 
         for (int round = 0; round < 8; round++)
         {

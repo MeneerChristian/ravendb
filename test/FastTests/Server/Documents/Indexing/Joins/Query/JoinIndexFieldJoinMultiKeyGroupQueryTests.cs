@@ -21,7 +21,8 @@ namespace FastTests.Server.Documents.Indexing.Joins.Query;
 public class JoinIndexFieldJoinMultiKeyGroupQueryTests(ITestOutputHelper output) : RavenTestBase(output)
 {
     private const string GroupResidual = "KindNotServed:GroupResidual";
-    private const string VerifiedRows = "Join/c/JoinVerifiedRows";
+    // the outer entries that were checked against the inner index, and for an Indirect file the keys with several inner entries that were
+    private static long Verified(QueryAnswer answer) => answer.Counters.GetValueOrDefault("Join/c/JoinVerifiedRows") + answer.Counters.GetValueOrDefault("Join/c/JoinVerifiedKeys");
     private const string Order = " order by m.Title limit 0, 50";
 
     private static readonly string[] AndNotSubs =
@@ -55,7 +56,10 @@ public class JoinIndexFieldJoinMultiKeyGroupQueryTests(ITestOutputHelper output)
     {
         var settings = new Dictionary<string, string> { [RavenConfiguration.GetKey(x => x.Indexing.CoraxIncludeDocumentScore)] = true.ToString() };
         if (maxResidualRows != null)
+        {
             settings[RavenConfiguration.GetKey(x => x.Join.MaxResidualRows)] = maxResidualRows.Value.ToString();
+            settings[RavenConfiguration.GetKey(x => x.Join.MaxResidualKeys)] = maxResidualRows.Value.ToString();
+        }
 
         return settings;
     }
@@ -65,6 +69,15 @@ public class JoinIndexFieldJoinMultiKeyGroupQueryTests(ITestOutputHelper output)
     private static string FieldLeftJoin(string sub, string tail = Order) => $"{JoinIndexQueryOracle.Outer} left join (from index 'Contexts/Search'{sub}) as c on m.ContextId = c.Code{tail}";
 
     private static Task<JoinIndexHarness> CreateAsync(RavenTestBase test, int? maxResidualRows = null) => JoinIndexHarness.CreateFieldJoinAsync(test, Settings(maxResidualRows), arrays: true);
+
+    /// <summary>An Indirect file counts the rows with two or more keys whether the keys have a group or not: only the groups are compared for it, the invariant check compares the rows.</summary>
+    private static void AssertCounters(JoinIndexHarness h, long groups, long rowsWithGroups)
+    {
+        (long actualGroups, long actualRows) = Counters(h);
+        Assert.Equal(groups, actualGroups);
+        if (h.IsIndirect == false)
+            Assert.Equal(rowsWithGroups, actualRows);
+    }
 
     private static (long GroupsOfSeveral, long RowsWithSeveralKeys) Counters(JoinIndexHarness h)
     {
@@ -83,7 +96,7 @@ public class JoinIndexFieldJoinMultiKeyGroupQueryTests(ITestOutputHelper output)
         Assert.True(ids.SequenceEqual(Ids(scan)), $"the join of the server returned {string.Join(",", Ids(scan))} instead of {string.Join(",", ids)}: {rql}");
         Assert.True(ids.SequenceEqual(Ids(served)), $"the join index returned {string.Join(",", Ids(served))} instead of {string.Join(",", ids)}: {rql}");
         Assert.True(served.Counters.GetValueOrDefault("Join/c/JoinIndexServed") > 0, $"not served by the join index: {rql}. Fallbacks: {string.Join(", ", oracle.Info.Fallbacks)}");
-        return served.Counters.GetValueOrDefault(VerifiedRows);
+        return Verified(served);
     }
 
     private static string[] Conversations(params int[] ids) => ids.Select(x => $"conversations/{x}").OrderBy(x => x, StringComparer.Ordinal).ToArray();
@@ -113,7 +126,7 @@ public class JoinIndexFieldJoinMultiKeyGroupQueryTests(ITestOutputHelper output)
         h.PutConversationKeys(6, ["k9"], "b");
         h.PutConversationKeys(7, ["k1", "k2"], "a");
         await h.AssertCurrentAsync();
-        Assert.Equal((1, 2), Counters(h));
+        AssertCounters(h, 1, 2);
         var oracle = new JoinIndexQueryOracle(h);
 
         // k1 holds an entry in nl (named n1) and an entry named n2 (in de): no entry has both; k3 has one that has both
@@ -150,12 +163,16 @@ public class JoinIndexFieldJoinMultiKeyGroupQueryTests(ITestOutputHelper output)
         h.PutConversationKeys(3, ["k2"], "two");
         h.PutConversationKeys(4, ["k9", "k2"], "orphan and two");
         await h.AssertCurrentAsync();
-        Assert.Equal((0, 1), Counters(h));
+        AssertCounters(h, 0, 1);
         var oracle = new JoinIndexQueryOracle(h);
 
         // the row 1 has nl through k1 and n2 through k2 and no entry has both
         long verified = Expect(oracle, FieldJoin(" where Country = 'nl' and Name = 'n2'"), []);
-        Assert.True(verified > 0, "the row with two keys was not checked");
+        if (h.IsIndirect)
+            Assert.Equal(0, verified); // a row with several keys is exact in the key domain: no key has two inner entries, so nothing is checked
+        else
+            Assert.True(verified > 0, "the row with two keys was not checked");
+
         Expect(oracle, FieldJoin(" where Country != 'nl'"), Conversations(1, 3, 4));
         Expect(oracle, FieldJoin(" where Country != 'nl' and Name = 'n1'"), []);
         Expect(oracle, FieldJoin(" where Country = 'nl' and IsActive != true"), []);
@@ -167,15 +184,16 @@ public class JoinIndexFieldJoinMultiKeyGroupQueryTests(ITestOutputHelper output)
         // the second key goes: every row is joined with one inner entry and the lists are exact without a check
         h.PutConversationKeys(1, ["k1"], "both");
         await h.AssertCurrentAsync();
-        Assert.Equal((0, 0), Counters(h));
+        AssertCounters(h, 0, 0);
         Assert.Equal(0, Expect(oracle, FieldJoin(" where Country = 'nl' and Name = 'n2'"), []));
         Assert.Equal(0, Expect(oracle, FieldJoin(" where Country != 'nl'"), Conversations(3, 4)));
 
         // the key comes back, and so does the check
         h.PutConversationKeys(1, ["k2", "k1"], "both");
         await h.AssertCurrentAsync();
-        Assert.Equal((0, 1), Counters(h));
-        Assert.True(Expect(oracle, FieldJoin(" where Country = 'nl' and Name = 'n2'"), []) > 0);
+        AssertCounters(h, 0, 1);
+        long again = Expect(oracle, FieldJoin(" where Country = 'nl' and Name = 'n2'"), []);
+        Assert.True(h.IsIndirect ? again == 0 : again > 0);
         Expect(oracle, FieldJoin(" where Country != 'nl'"), Conversations(1, 3, 4));
     }
 
@@ -190,7 +208,7 @@ public class JoinIndexFieldJoinMultiKeyGroupQueryTests(ITestOutputHelper output)
         await h.AssertCurrentAsync();
 
         // the row 1 has two keys that have a group, but they name the same entry: it is checked (the lists cannot tell), and the answer is the one of the entry
-        Assert.Equal((0, 1), Counters(h));
+        AssertCounters(h, 0, 1);
         var oracle = new JoinIndexQueryOracle(h);
         Expect(oracle, FieldJoin(" where Country = 'nl' and Name = 'n1'"), Conversations(1, 2, 3));
         Expect(oracle, FieldJoin(" where Country != 'nl'"), []);
@@ -265,6 +283,10 @@ public class JoinIndexFieldJoinMultiKeyGroupQueryTests(ITestOutputHelper output)
     [RavenFact(RavenTestCategory.Querying | RavenTestCategory.Indexes)]
     public async Task BothReasonsForACheckCountAgainstTheBudgetAndAreServedWithinIt()
     {
+        // an Indirect file counts keys against the budget (JoinIndexIndirectQueryTests)
+        if (this is IIndirectModeTest)
+            return;
+
         using JoinIndexHarness h = await CreateAsync(this, maxResidualRows: 1);
 
         // the group of big has two entries; the rows 1 and 2 have the key big; the row 3 has two keys of one entry each
@@ -277,7 +299,7 @@ public class JoinIndexFieldJoinMultiKeyGroupQueryTests(ITestOutputHelper output)
         h.PutConversationKeys(3, ["k1", "k2"], "a");
         h.PutConversationKeys(4, ["k1"], "a");
         await h.AssertCurrentAsync();
-        Assert.Equal((1, 1), Counters(h));
+        AssertCounters(h, 1, 1);
         var oracle = new JoinIndexQueryOracle(h);
 
         // a NOT can match any row, and three of them have to be checked: more than the budget of one
@@ -298,7 +320,7 @@ public class JoinIndexFieldJoinMultiKeyGroupQueryTests(ITestOutputHelper output)
         h.PutConversationKeys(2, ["k2"], "a");
         h.PutConversationKeys(5, ["k2", "k1"], "a");
         await h.AssertCurrentAsync();
-        Assert.Equal((1, 2), Counters(h));
+        AssertCounters(h, 1, 2);
         oracle.Check(FieldJoin(" where Rank = 4 and Country = 'de'"), expectServed: false);
         oracle.Check(FieldJoin(" where Country != 'nobody'"), expectServed: false);
         oracle.Check(FieldJoin(" where Rank = 9 and Country = 'nl'"));
@@ -336,7 +358,7 @@ public class JoinIndexFieldJoinMultiKeyGroupQueryTests(ITestOutputHelper output)
                 string rql = random.Next(4) == 0 ? FieldLeftJoin(sub, tail) : FieldJoin(sub, tail);
                 (QueryAnswer served, QueryAnswer scan) = oracle.Both(rql);
                 AssertSame(rql, served, scan);
-                verified += served.Counters.GetValueOrDefault(VerifiedRows);
+                verified += Verified(served);
             }
         }
 
@@ -348,3 +370,6 @@ public class JoinIndexFieldJoinMultiKeyGroupQueryTests(ITestOutputHelper output)
         Assert.True(verified > 0, "no outer entry was checked against its keys");
     }
 }
+
+/// <summary>The tests of the class with the join indexes on a field in the storage mode Indirect.</summary>
+public class JoinIndexFieldJoinMultiKeyGroupQueryTestsIndirect(ITestOutputHelper output) : JoinIndexFieldJoinMultiKeyGroupQueryTests(output), IIndirectModeTest;

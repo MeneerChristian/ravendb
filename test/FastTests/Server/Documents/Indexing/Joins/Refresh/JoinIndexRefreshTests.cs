@@ -218,7 +218,7 @@ public class JoinIndexRefreshTests(ITestOutputHelper output) : RavenTestBase(out
         Seed(h);
         await h.AssertCurrentAsync();
 
-        // negative control: take an entry out of the any list in a commit of the index environment
+        // negative control: take an entry (an Indirect file: a key) out of the any list in a commit of the index environment
         JoinIndex joinIndex = h.Join();
         long entry;
         using (joinIndex.TryOpenJoinSnapshot(out JoinIndexSnapshot snapshot) ? snapshot : throw new InvalidOperationException("no snapshot"))
@@ -232,7 +232,11 @@ public class JoinIndexRefreshTests(ITestOutputHelper output) : RavenTestBase(out
             var file = new JoinIndexFile(tx.InnerTransaction, joinIndex.Plan.Schema);
             using (JoinWriter writer = file.BeginWrite())
             {
-                writer.RemoveFromAny(entry);
+                if (joinIndex.Plan.Schema.IsIndirect)
+                    writer.RemoveKeyFromAtom(JoinReader.AtomOfAny(), entry);
+                else
+                    writer.RemoveFromAny(entry);
+
                 writer.Commit(file.Published);
             }
 

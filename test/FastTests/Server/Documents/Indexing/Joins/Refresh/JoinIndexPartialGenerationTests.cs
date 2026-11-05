@@ -131,11 +131,15 @@ public class JoinIndexPartialGenerationTests(ITestOutputHelper output) : RavenTe
                     Assert.True(outerView.TryFindEntry(Encoding.UTF8.GetBytes("conversations/900"), out _, out _));
                     Assert.False(file.TryGetOuterDocument(JoinFileRows.HashDocumentId(Encoding.UTF8.GetBytes("conversations/900"), file.Seed), out _));
 
-                    Assert.Equal(JoinServing.Outcome.Behind, JoinServing.Compare(generation, oldOuter.EnvironmentId, oldOuter.Consumed, oldInner.EnvironmentId, oldInner.Consumed));
+                    // the cursors of an Indirect file do not compare the outer side (its lists are exact for any outer snapshot), but a query that may use the score reads the file only for the outer snapshot it reflects
+                    bool indirect = this is IIndirectModeTest;
+                    Assert.Equal(indirect ? JoinServing.Outcome.Equal : JoinServing.Outcome.Behind, JoinServing.Compare(generation, oldOuter.EnvironmentId, oldOuter.Consumed, oldInner.EnvironmentId, oldInner.Consumed));
 
                     long served = oracle.Info.Served;
                     (QueryAnswer answer, QueryAnswer scan) = oracle.Both(rql);
                     Assert.Equal(served, oracle.Info.Served);
+                    if (indirect)
+                        Assert.Equal(1, oracle.FallbacksOf(JoinFallbacks.BehindTimeout));
                     JoinIndexQueryOracle.AssertSame(rql, answer, scan);
                     checkedPartial = true;
                 }
@@ -323,7 +327,9 @@ public class JoinIndexPartialGenerationTests(ITestOutputHelper output) : RavenTe
             JoinIndexInvariantChecker.Result result = null;
             for (int i = 0; i < 500; i++)
             {
-                result = JoinIndexInvariantChecker.Check(database, (JoinIndex)database.IndexStore.GetIndex(JoinIndexHarness.JoinName), seen);
+                result = database.IndexStore.GetIndex(JoinIndexHarness.JoinName) is JoinIndex restoredJoin
+                    ? JoinIndexInvariantChecker.Check(database, restoredJoin, seen)
+                    : new JoinIndexInvariantChecker.Result { NotComparedReason = "the restored database has not created the join index yet" };
                 if (result.Compared)
                     break;
 
@@ -334,3 +340,6 @@ public class JoinIndexPartialGenerationTests(ITestOutputHelper output) : RavenTe
         }
     }
 }
+
+/// <summary>The tests of the class with the join indexes on a field in the storage mode Indirect.</summary>
+public class JoinIndexPartialGenerationTestsIndirect(ITestOutputHelper output) : JoinIndexPartialGenerationTests(output), IIndirectModeTest;

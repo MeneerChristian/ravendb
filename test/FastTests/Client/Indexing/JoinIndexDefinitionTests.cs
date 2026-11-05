@@ -463,6 +463,113 @@ public class JoinIndexDefinitionTests(ITestOutputHelper output) : NoDisposalNeed
         Assert.Empty(field.ValidateShape());
     }
 
+    private static JoinDefinition FieldJoin(JoinStorageMode mode)
+    {
+        JoinDefinition definition = Valid();
+        definition.InnerField = "Code";
+        definition.StorageMode = mode;
+        return definition;
+    }
+
+    [RavenTheory(RavenTestCategory.Indexes)]
+    [InlineData(JoinStorageMode.Expanded)]
+    [InlineData(JoinStorageMode.Indirect)]
+    public void TheStorageModeSurvivesTheJsonRoundTripAndIsPartOfTheJoin(JoinStorageMode mode)
+    {
+        JoinDefinition definition = FieldJoin(mode);
+
+        using JsonOperationContext context = JsonOperationContext.ShortTermSingleUse();
+        using BlittableJsonReaderObject json = context.ReadObject(definition.ToJson(), "join");
+        JoinDefinition read = JoinDefinition.FromJson(json);
+
+        Assert.Equal(mode, read.StorageMode);
+        Assert.Equal(mode, definition.Clone().StorageMode);
+        Assert.True(JoinDefinition.IsSameJoin(definition, read));
+        Assert.Equal(definition.GetJoinHashCode(), read.GetJoinHashCode());
+
+        // the mode is part of the join: another mode is a changed definition, which is replaced side by side
+        JoinDefinition auto = FieldJoin(JoinStorageMode.Auto);
+        Assert.False(JoinDefinition.IsSameJoin(definition, auto));
+        Assert.NotEqual(definition.GetJoinHashCode(), auto.GetJoinHashCode());
+        Assert.Empty(definition.ValidateShape());
+
+        var left = new IndexDefinition { Name = "A", Join = definition };
+        var right = new IndexDefinition { Name = "A", Join = auto };
+        Assert.True(left.Compare(right).HasFlag(IndexDefinitionCompareDifferences.Join));
+        Assert.NotEqual(left.GetHashCode(), right.GetHashCode());
+    }
+
+    [RavenFact(RavenTestCategory.Indexes)]
+    public void AutoWritesNoStorageModeSoTheJsonAndTheHashAreTheOnesOfBefore()
+    {
+        JoinDefinition definition = FieldJoin(JoinStorageMode.Auto);
+
+        using JsonOperationContext context = JsonOperationContext.ShortTermSingleUse();
+        using BlittableJsonReaderObject json = context.ReadObject(definition.ToJson(), "join");
+
+        Assert.False(json.TryGet("StorageMode", out string _));
+        Assert.Equal(JoinStorageMode.Auto, JoinDefinition.FromJson(json).StorageMode);
+        Assert.Equal(JoinStorageMode.Auto, new JoinDefinition().StorageMode);
+
+        // a definition of a node before the modes has no such property and reads as Auto
+        var old = new DynamicJsonValue { ["OuterIndex"] = "A", ["OuterField"] = "F", ["InnerIndex"] = "B", ["Fields"] = new DynamicJsonArray(), ["Groupings"] = new DynamicJsonArray() };
+        using BlittableJsonReaderObject oldJson = context.ReadObject(old, "join");
+        Assert.Equal(JoinStorageMode.Auto, JoinDefinition.FromJson(oldJson).StorageMode);
+    }
+
+    [RavenTheory(RavenTestCategory.Indexes)]
+    [InlineData("Dense")]
+    [InlineData("7")]
+    [InlineData("indirect")]
+    public void AStorageModeThatIsNotKnownIsRefused(string mode)
+    {
+        using JsonOperationContext context = JsonOperationContext.ShortTermSingleUse();
+        var json = new DynamicJsonValue { ["StorageMode"] = mode };
+
+        using BlittableJsonReaderObject blittable = context.ReadObject(json, "join");
+        JoinValidationException exception = Assert.Throws<JoinValidationException>(() => JoinDefinition.FromJson(blittable));
+        Assert.Equal(JoinValidationCode.InvalidDefinition, Assert.Single(exception.Errors).Code);
+        Assert.Contains(mode, exception.Message);
+    }
+
+    [RavenFact(RavenTestCategory.Indexes)]
+    public void IndirectIsForAJoinOnAFieldOrOnTheIdOfTheInnerDocumentsNotOnTheIdOfTheOuterDocument()
+    {
+        // a join on the id of the inner documents may be Indirect
+        JoinDefinition byId = Valid();
+        byId.StorageMode = JoinStorageMode.Indirect;
+        Assert.Empty(byId.ValidateShape());
+
+        JoinDefinition outerId = FieldJoin(JoinStorageMode.Indirect);
+        outerId.OuterField = "id()";
+        Assert.Contains("Indirect", Assert.Single(outerId.ValidateShape()).Message);
+
+        // Expanded is always possible, Auto leaves the choice to the server
+        byId.StorageMode = JoinStorageMode.Expanded;
+        Assert.Empty(byId.ValidateShape());
+        byId.StorageMode = JoinStorageMode.Auto;
+        Assert.Empty(byId.ValidateShape());
+
+        JoinDefinition unknown = FieldJoin((JoinStorageMode)9);
+        Assert.Contains("9", Assert.Single(unknown.ValidateShape()).Message);
+    }
+
+    [RavenFact(RavenTestCategory.Indexes)]
+    public void TheStorageModeSurvivesTheClientSerializationAndTheServerDeserialization()
+    {
+        using JsonOperationContext context = JsonOperationContext.ShortTermSingleUse();
+        var sent = new IndexDefinition { Name = "SearchPairs", Join = FieldJoin(JoinStorageMode.Indirect) };
+
+        using BlittableJsonReaderObject json = DocumentConventions.Default.Serialization.DefaultConverter.ToBlittable(sent, context);
+        IndexDefinition received = JsonDeserializationServer.IndexDefinition(json);
+
+        Assert.Equal(JoinStorageMode.Indirect, received.Join.StorageMode);
+        Assert.Equal(IndexDefinitionCompareDifferences.None, sent.Compare(received));
+
+        using BlittableJsonReaderObject stored = context.ReadObject(sent.ToJson(), "index/def");
+        Assert.Equal(JoinStorageMode.Indirect, JsonDeserializationServer.IndexDefinition(stored).Join.StorageMode);
+    }
+
     [RavenFact(RavenTestCategory.Indexes)]
     public void AJoinOnTheIdWritesNoInnerFieldSoItsJsonIsTheOneOfBefore()
     {
