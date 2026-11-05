@@ -75,6 +75,13 @@ export default {
         ready: "Ready",
         pending: "Pending: {{reason}}",
         refused: "The join index is in the error state: {{reason}}",
+        generation: "Generation",
+        partial: "Partial",
+        partialHelp:
+            "A refresh was cut at the budget of a commit, so the lists have not caught up with the indexes yet; the next refresh continues",
+        notBuilt: "Not built yet",
+        notBuiltHelp: "The lists are built from scratch before the first generation is published",
+        partialRefreshes: "Partial refreshes",
         outerIndex: "Outer index",
         innerIndex: "Inner index",
         size: "Size on disk",

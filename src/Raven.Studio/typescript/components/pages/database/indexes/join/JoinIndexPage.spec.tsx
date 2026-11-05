@@ -5,7 +5,7 @@ import { waitFor } from "@testing-library/react";
 import { mockServices } from "test/mocks/services/MockServices";
 import * as stories from "./JoinIndexPage.stories";
 
-const { StaticJoin, IndirectJoin, AutoJoin, NewJoin, MissingJoin, ShardedDatabase } = composeStories(stories);
+const { StaticJoin, IndirectJoin, AutoJoin, NewJoin, PartialJoin, NotBuiltJoin, MissingJoin, ShardedDatabase } = composeStories(stories);
 
 describe("JoinIndexPage", () => {
     it("shows the definition of a static join index", async () => {
@@ -35,6 +35,33 @@ describe("JoinIndexPage", () => {
         expect(screen.getByTestId("join-fallbacks")).toHaveTextContent("OR");
         expect(screen.getByTestId("join-fallbacks")).toHaveTextContent("The join index is being built");
         expect(screen.getByTestId("join-rebuilds")).toHaveTextContent("OuterIndexReset");
+    });
+
+    it("shows the generation and no partial marker for a join index that is up to date", async () => {
+        const { screen } = rtlRender(<StaticJoin />);
+
+        await screen.findByTestId("join-stats");
+        expect(screen.getByTestId("join-generation")).toHaveTextContent("#9");
+        expect(screen.queryByTestId("join-is-partial")).not.toBeInTheDocument();
+        expect(screen.getByTestId("join-partial-refreshes")).toHaveTextContent("0");
+    });
+
+    it("shows the partial refreshes and that the published generation is partial", async () => {
+        const { screen } = rtlRender(<PartialJoin />);
+
+        await screen.findByTestId("join-stats");
+        expect(screen.getByTestId("join-generation")).toHaveTextContent("#17");
+        expect(screen.getByTestId("join-is-partial")).toHaveTextContent("Partial");
+        expect(screen.getByTestId("join-partial-refreshes")).toHaveTextContent("4");
+    });
+
+    it("says that the lists are not built yet instead of showing generation 0", async () => {
+        const { screen } = rtlRender(<NotBuiltJoin />);
+
+        await screen.findByTestId("join-stats");
+        expect(screen.getByTestId("join-generation")).toHaveTextContent("Not built yet");
+        expect(screen.getByTestId("join-generation")).not.toHaveTextContent("#0");
+        expect(screen.getByTestId("join-state")).toHaveTextContent("Pending");
     });
 
     it("shows no resident cache and no refusal for a join index that has none", async () => {

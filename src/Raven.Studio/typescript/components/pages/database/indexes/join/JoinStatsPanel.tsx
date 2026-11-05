@@ -50,6 +50,28 @@ export function JoinStatsPanel({ stats }: JoinStatsPanelProps) {
                             <Badge bg="success">{t("stats.ready")}</Badge>
                         )}
                     </StatItem>
+                    <StatItem label={t("stats.generation")} testId="join-generation">
+                        {joinIndex.Generation > 0 ? (
+                            <>
+                                #{format(joinIndex.Generation)}
+                                {joinIndex.IsPartial && (
+                                    <Badge
+                                        bg="warning"
+                                        text="dark"
+                                        className="ms-2"
+                                        title={t("stats.partialHelp")}
+                                        data-testid="join-is-partial"
+                                    >
+                                        {t("stats.partial")}
+                                    </Badge>
+                                )}
+                            </>
+                        ) : (
+                            <span className="text-muted" title={t("stats.notBuiltHelp")}>
+                                {t("stats.notBuilt")}
+                            </span>
+                        )}
+                    </StatItem>
                     <StatItem label={t("stats.size")}>{stats.Memory?.DiskSize?.HumaneSize ?? "-"}</StatItem>
                     <StatItem label={t("stats.served")} testId="join-served">
                         {format(joinIndex.Served)}
@@ -59,6 +81,9 @@ export function JoinStatsPanel({ stats }: JoinStatsPanelProps) {
                     </StatItem>
                     <StatItem label={t("stats.builds")}>{format(joinIndex.Builds)}</StatItem>
                     <StatItem label={t("stats.refreshes")}>{format(joinIndex.Refreshes)}</StatItem>
+                    <StatItem label={t("stats.partialRefreshes")} testId="join-partial-refreshes">
+                        {format(joinIndex.PartialRefreshes)}
+                    </StatItem>
                     <StatItem label={t("stats.noOpRefreshes")}>{format(joinIndex.NoOpRefreshes)}</StatItem>
                 </div>
 

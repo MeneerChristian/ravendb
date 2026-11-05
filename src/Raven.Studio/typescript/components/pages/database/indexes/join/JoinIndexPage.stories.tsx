@@ -11,7 +11,7 @@ export default {
     decorators: [withStorybookContexts, withBootstrap5],
 } satisfies Meta;
 
-function init(options: { auto?: boolean; sharded?: boolean; indirect?: boolean } = {}) {
+function init(options: { auto?: boolean; sharded?: boolean; indirect?: boolean; partial?: boolean; notBuilt?: boolean } = {}) {
     const { databases } = mockStore;
     const { indexesService } = mockServices;
 
@@ -26,6 +26,17 @@ function init(options: { auto?: boolean; sharded?: boolean; indirect?: boolean }
     if (options.auto) {
         definition.Name = stats.Name;
         definition.Type = "AutoJoin";
+    }
+
+    if (options.partial) {
+        stats.Join.PartialRefreshes = 4;
+        stats.Join.Generation = 17;
+        stats.Join.IsPartial = true;
+    }
+
+    if (options.notBuilt) {
+        stats.Join.Generation = 0;
+        stats.Join.PendingReason = "The inner index 'Companies/ByName' is disabled";
     }
 
     if (options.indirect) {
@@ -53,6 +64,16 @@ export const StaticJoin: StoryFn = () => {
 
 export const IndirectJoin: StoryFn = () => {
     const name = init({ indirect: true });
+    return <JoinIndexPage pathParams={[name]} />;
+};
+
+export const PartialJoin: StoryFn = () => {
+    const name = init({ partial: true });
+    return <JoinIndexPage pathParams={[name]} />;
+};
+
+export const NotBuiltJoin: StoryFn = () => {
+    const name = init({ notBuilt: true });
     return <JoinIndexPage pathParams={[name]} />;
 };
 
