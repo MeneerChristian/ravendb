@@ -3,7 +3,9 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
+using Raven.Client.Documents.Indexes;
 using Raven.Server.Config.Categories;
+using Raven.Server.Documents.Indexes.Joins.Serving.Resident;
 using Raven.Server.Documents.Indexes.Joins.Storage;
 using Raven.Server.ServerWide.Context;
 using Sparrow.Server;
@@ -60,6 +62,11 @@ internal sealed partial class JoinIncrementalRefresh : IDisposable
     private ContextBoundNativeList<long> _dirtyRows;
     private ContextBoundNativeList<long> _multiRows;
     private ContextBoundNativeList<long> _rowKeys;
+    private ContextBoundNativeList<long> _patchOldKeys;
+    private ContextBoundNativeList<int> _pairsBefore;
+    private bool _pairsBeforeKnown;
+    private long _pairCountLookups;
+    private ContextBoundNativeList<KeySpan> _patchOld;
     private ContextBoundNativeList<int> _newMasks;
     private ContextBoundNativeList<Pending> _pending;
     private bool _multiRowsLoaded;
@@ -75,6 +82,15 @@ internal sealed partial class JoinIncrementalRefresh : IDisposable
     private readonly ContextBoundNativeList<long>[] _oldMembers;
     private readonly bool[] _oldMembersLoaded;
     private IJoinFile _file;
+
+    /// <summary>
+    /// Where an Indirect refresh records what it does to the lists of the keys of its outer rows (the old keys come from the file, the new ones from the outer index). The caller applies it to the resident cache
+    /// after the transaction committed; the engine only fills it. Null when there is no cache.
+    /// </summary>
+    public ResidentPatch Patch { get; set; }
+
+    /// <summary>Where the old keys of a document that changed are kept between its removal and its addition.</summary>
+    private readonly record struct KeySpan(int Start, int Length);
 
     /// <summary>Called at named points of a refresh; an exception that it throws ends the refresh like one of the engine.</summary>
     public Action<string> OnPhase { get; set; }
@@ -99,6 +115,12 @@ internal sealed partial class JoinIncrementalRefresh : IDisposable
         _dirtyRows = new ContextBoundNativeList<long>(_workAllocator, 256);
         _multiRows = new ContextBoundNativeList<long>(_workAllocator, 64);
         _rowKeys = new ContextBoundNativeList<long>(_workAllocator, 32);
+        _patchOldKeys = new ContextBoundNativeList<long>(_workAllocator, 32);
+        _pairsBefore = new ContextBoundNativeList<int>(_workAllocator, 64);
+        _classifiedKeyRefs = new ContextBoundNativeList<long>(_workAllocator, 32);
+        _classifiedKeys = new ContextBoundNativeList<KeySpan>(_workAllocator, 32);
+        _classifiedFingerprints = new ContextBoundNativeList<long>(_workAllocator, 32);
+        _patchOld = new ContextBoundNativeList<KeySpan>(_workAllocator, 32);
         _newMasks = new ContextBoundNativeList<int>(_workAllocator, 64);
         _pending = new ContextBoundNativeList<Pending>(_workAllocator, 64);
         _deltas = new ContextBoundNativeList<PairDelta>(_workAllocator, 64);
@@ -108,6 +130,9 @@ internal sealed partial class JoinIncrementalRefresh : IDisposable
         _newKeyRefs = new ContextBoundNativeList<long>(_workAllocator, 8);
         _recheck = new ContextBoundNativeList<SeveralKeysCheck>(_workAllocator, 16);
         _cachedCodes = new ContextBoundNativeList<long>(_workAllocator, 32);
+        _keyAtomAdds = new ContextBoundNativeList<long>(_workAllocator, 8);
+        _termHashes = new ContextBoundNativeList<long>(_workAllocator, 8);
+        _keyAtomRemovals = new ContextBoundNativeList<long>(_workAllocator, 8);
         _cleanRows = new ContextBoundNativeList<long>(_workAllocator, 64);
         _moves = new ContextBoundNativeList<Move>(_workAllocator, 64);
         _moveAdds = new ContextBoundNativeList<long>(_workAllocator, 64);
@@ -151,6 +176,12 @@ internal sealed partial class JoinIncrementalRefresh : IDisposable
         _dirtyRows.Dispose();
         _multiRows.Dispose();
         _rowKeys.Dispose();
+        _patchOldKeys.Dispose();
+        _pairsBefore.Dispose();
+        _classifiedKeyRefs.Dispose();
+        _classifiedKeys.Dispose();
+        _classifiedFingerprints.Dispose();
+        _patchOld.Dispose();
         _newMasks.Dispose();
         _pending.Dispose();
         _deltas.Dispose();
@@ -160,6 +191,9 @@ internal sealed partial class JoinIncrementalRefresh : IDisposable
         _newKeyRefs.Dispose();
         _recheck.Dispose();
         _cachedCodes.Dispose();
+        _keyAtomAdds.Dispose();
+        _termHashes.Dispose();
+        _keyAtomRemovals.Dispose();
         _cleanRows.Dispose();
         _moves.Dispose();
         _moveAdds.Dispose();
@@ -205,13 +239,29 @@ internal sealed partial class JoinIncrementalRefresh : IDisposable
         {
             int budget = _options.MaxIdsPerCommit;
             int unindexedBudget = _options.MaxUnindexedIdsPerCommit;
-            if (Discover(context, file, outer.Snapshot, published.Outer, _dirtyOuter, innerSide: false, ref budget, ref unindexedBudget, out outerReached, out outerCut) == false)
-                throw new JoinRebuildRequiredException(JoinRebuildReason.TooManyUnindexedChanges);
+            if (file.Schema.IsIndirect)
+            {
+                // the inner side decides what is served and reads no outer entry: it goes first, the outer side gets what is left of the budget
+                if (Discover(context, file, inner.Snapshot, published.Inner, _dirtyInner, innerSide: true, ref budget, ref unindexedBudget, out innerReached, out innerCut) == false)
+                    throw new JoinRebuildRequiredException(JoinRebuildReason.TooManyUnindexedChanges);
 
-            // the changes of the inner side find the outer entries through the outer snapshot, which is the file only when the outer side is complete
-            if (outerCut == false &&
-                Discover(context, file, inner.Snapshot, published.Inner, _dirtyInner, innerSide: true, ref budget, ref unindexedBudget, out innerReached, out innerCut) == false)
-                throw new JoinRebuildRequiredException(JoinRebuildReason.TooManyUnindexedChanges);
+                // a cut on the inner side used the budget up: the outer side waits for the next commit
+                outerReached = published.Outer;
+                outerCut = false;
+                if (innerCut == false &&
+                    Discover(context, file, outer.Snapshot, published.Outer, _dirtyOuter, innerSide: false, ref budget, ref unindexedBudget, out outerReached, out outerCut) == false)
+                    throw new JoinRebuildRequiredException(JoinRebuildReason.TooManyUnindexedChanges);
+            }
+            else
+            {
+                if (Discover(context, file, outer.Snapshot, published.Outer, _dirtyOuter, innerSide: false, ref budget, ref unindexedBudget, out outerReached, out outerCut) == false)
+                    throw new JoinRebuildRequiredException(JoinRebuildReason.TooManyUnindexedChanges);
+
+                // the changes of the inner side find the outer entries through the outer snapshot, which is the file only when the outer side is complete
+                if (outerCut == false &&
+                    Discover(context, file, inner.Snapshot, published.Inner, _dirtyInner, innerSide: true, ref budget, ref unindexedBudget, out innerReached, out innerCut) == false)
+                    throw new JoinRebuildRequiredException(JoinRebuildReason.TooManyUnindexedChanges);
+            }
         }
 
         bool partial = outerCut || innerCut;
@@ -241,6 +291,13 @@ internal sealed partial class JoinIncrementalRefresh : IDisposable
             Array.Clear(_oldMembersLoaded);
             _multiRowsLoaded = false;
             _pending.Count = 0;
+            _patchOldKeys.Count = 0;
+            _patchOld.Count = 0;
+            if (Patch != null)
+            {
+                for (int k = 0; k < _dirtyOuter.Count; k++)
+                    _patchOld.Add(default);
+            }
 
             ClassifyOuter(writer, outer, inner);
             ClassifyInner(writer, inner);
@@ -255,7 +312,7 @@ internal sealed partial class JoinIncrementalRefresh : IDisposable
                 if (change.Old != 0 && change.Skip == 0)
                 {
                     if (plan.IsFieldJoin)
-                        RemoveOuterFieldRow(writer, change.Old, _dirtyOuter.HashAt(k));
+                        RemoveOuterFieldRow(writer, change.Old, _dirtyOuter.HashAt(k), change.New != 0, k);
                     else
                         RemoveOuterPair(writer, change.Old, _dirtyOuter.HashAt(k));
                 }
@@ -292,7 +349,7 @@ internal sealed partial class JoinIncrementalRefresh : IDisposable
                     continue;
 
                 if (plan.IsFieldJoin)
-                    AddOuterFieldRow(writer, outer, _dirtyOuter.HashAt(k), change.New);
+                    AddOuterFieldRow(writer, outer, _dirtyOuter.HashAt(k), change.New, change.Old, k);
                 else
                     AddOuter(writer, outer, inner, _dirtyOuter.HashAt(k), change.New);
             }
@@ -308,7 +365,9 @@ internal sealed partial class JoinIncrementalRefresh : IDisposable
                     emptyTerms = true;
             }
 
-            var generation = new JoinIndexGeneration(0, outer.Snapshot.EnvironmentId, outerReached, inner.Snapshot.EnvironmentId, innerReached, inner.Searcher.LastEntryId, 0, partial);
+            JoinIndexGeneration generation = file.Schema.IsIndirect
+                ? new(0, outer.Snapshot.EnvironmentId, outerReached, inner.Snapshot.EnvironmentId, innerReached, inner.Searcher.LastEntryId, 0, JoinStorageMode.Indirect, innerCut, outerCut)
+                : new(0, outer.Snapshot.EnvironmentId, outerReached, inner.Snapshot.EnvironmentId, innerReached, inner.Searcher.LastEntryId, 0, partial);
 
             OnPhase?.Invoke("BeforeCommit");
             long commitCpuStart = ThreadCpuClock.Now();
@@ -317,6 +376,11 @@ internal sealed partial class JoinIncrementalRefresh : IDisposable
             commitTicks = Lap(ref mark);
             _counters.Add(ref _counters.ListUpdates, writer.ListUpdates);
             _counters.Add(ref _counters.ListFlushes, writer.Flushes);
+            _counters.Add(ref _counters.Flushes, writer.Flushes);
+            _counters.Add(ref _counters.QueuedOps, writer.OpsQueued);
+            _counters.Add(ref _counters.ThresholdFlushes, writer.ThresholdFlushes);
+            _counters.Add(ref _counters.PairCountLookups, _pairCountLookups);
+            _pairCountLookups = 0;
             listStats = $"{writer.ListChangesQueued} list changes queued, {writer.ListUpdates} lists, {pagesBeforeFlush} pages before the flush, store {Ms(writer.ListStoreTicks):0.0} ms";
         }
 
@@ -555,6 +619,9 @@ internal sealed partial class JoinIncrementalRefresh : IDisposable
     {
         _outerChanges.Count = 0;
         _dirtyRows.Count = 0;
+        _classifiedKeys.Count = 0;
+        _classifiedFingerprints.Count = 0;
+        _classifiedKeyRefs.Count = 0;
         for (int k = 0; k < _dirtyOuter.Count; k++)
         {
             ReadOnlySpan<byte> id = _dirtyOuter.IdAt(k);
@@ -570,7 +637,9 @@ internal sealed partial class JoinIncrementalRefresh : IDisposable
                 throw new JoinRebuildRequiredException(JoinRebuildReason.HashCollision);
 
             // an index keeps the entry id when it updates the entry of a document: the same entry can have other keys
-            bool skip = old != 0 && old == current && (_plan.IsFieldJoin ? HasTheSameFieldKey(writer, outer, current) : HasTheSameKeys(writer, outer, current));
+            _classifiedKeys.Add(new KeySpan(-1, 0));
+            _classifiedFingerprints.Add(0);
+            bool skip = old != 0 && old == current && (_plan.IsFieldJoin ? HasTheSameFieldKey(writer, outer, current, k) : HasTheSameKeys(writer, outer, current));
             _outerChanges.Add(new Change { Old = old, New = current, Skip = skip ? 1 : 0 });
 
             // the entries that are taken out and put in again are not touched by the changes of the inner documents in between

@@ -169,7 +169,7 @@ internal sealed class InnerProjector : IDisposable
     private void ReadKey(ReadOnlySpan<byte> term)
     {
         if (term.Length > JoinLimits.MaxTermLength)
-            throw new JoinUnsupportedException($"The field '{_plan.Definition.InnerField}' of the inner index has a key longer than {JoinLimits.MaxTermLength} bytes.");
+            throw new JoinUnsupportedException($"The field '{_plan.Definition.InnerField ?? "id()"}' of the inner index has a key longer than {JoinLimits.MaxTermLength} bytes.");
 
         _keys.Add(new TermRef { Offset = _arena.Count, Length = term.Length });
         _arena.AddRange(term);

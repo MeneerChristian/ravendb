@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Threading;
 using Raven.Client.Documents.Indexes;
 using Raven.Server.Documents.Indexes.Joins.Refresh;
+using Raven.Server.Documents.Indexes.Joins.Serving.Resident;
 using Raven.Server.Documents.Indexes.Joins.Storage;
 using Raven.Server.Documents.Indexes.Persistence;
 using Raven.Server.Documents.Indexes.Workers;
@@ -28,7 +29,8 @@ internal sealed class JoinRefreshWork(JoinIndex index) : IIndexingWork
         Lazy<IndexWriteOperationBase> writeOperation, IndexingStatsScope stats, CancellationToken token)
     {
         (long Outer, long Inner, long Lifecycle) wake = index.ReadWakeState();
-        if (index.IsHandled(wake))
+        // a cache that has no epoch is established by a run that looks at the indexes, although they did not change
+        if (index.IsHandled(wake) && index.ResidentWarmUpRequested == false)
         {
             index.Counters.Add(ref index.Counters.NoOps, 1);
             return (false, Index.CanContinueBatchResult.True);
@@ -67,7 +69,10 @@ internal sealed class JoinRefreshWork(JoinIndex index) : IIndexingWork
     {
 
         JoinPlan plan = index.Plan;
-        var file = new JoinIndexFile(indexContext.Transaction.InnerTransaction, plan.Schema);
+        if (JoinFileRows.Exists(indexContext.Transaction.InnerTransaction) == false)
+            index.ChooseBuildMode(outer, plan);
+
+        var file = new JoinIndexFile(indexContext.Transaction.InnerTransaction, plan.SchemaOfFile(indexContext.Transaction.InnerTransaction));
         JoinIndexGeneration published = file.Published;
 
         if (index.TryOpenViews(outer, inner, plan, out IndexView outerView, out IndexView innerView) == false)
@@ -82,6 +87,9 @@ internal sealed class JoinRefreshWork(JoinIndex index) : IIndexingWork
             {
                 index.ClearPending();
                 current = Build(file, plan, outerView, innerView, token);
+                if (file.Schema.IsIndirect)
+                    DropResidentAfterBuild(indexContext);
+
                 counters.Add(ref counters.Builds, 1);
                 counters.Rebuild(JoinRebuildReason.Initial);
                 Record(counters, startedAt, allocated, 0, ref counters.LastBuildTicks, ref counters.LastBuildDurationTicks, ref counters.LastBuildAllocatedBytes);
@@ -100,25 +108,40 @@ internal sealed class JoinRefreshWork(JoinIndex index) : IIndexingWork
                 }
 
                 index.ClearPending();
+                JoinResident.Run residentRun = BeginResidentRun(indexContext, file, plan, outerView, published, token);
                 if (advanced == false)
                 {
                     counters.Add(ref counters.NoOps, 1);
+
+                    // the indexes are the generation of the file: the outer index may have committed without a change of its entries, so the lists are the entries of the newer snapshot
+                    ApplyResidentAfterCommit(indexContext, residentRun, published.Serial, outerApplied: true, outerPartial: false);
                     index.MarkHandledAfterCommit(indexContext, wake);
                     return (false, Index.CanContinueBatchResult.True);
                 }
 
-                JoinRefreshOutcome outcome = RunEngine(file, outerView, innerView, published, startedAt, token);
+                JoinRefreshOutcome outcome = RunEngine(file, outerView, innerView, published, startedAt, residentRun?.Patch, token);
                 current = outcome.Generation;
+                if (residentRun != null)
+                {
+                    bool outerPartial = current.Mode == JoinStorageMode.Indirect && current.OuterPartial;
+                    bool innerPartial = current.Mode == JoinStorageMode.Indirect && current.InnerPartial;
+                    ApplyResidentAfterCommit(indexContext, residentRun, current.Serial, outerApplied: outerPartial == false && innerPartial == false, outerPartial);
+                }
+
                 counters.Add(ref counters.Refreshes, 1);
                 Record(counters, startedAt, allocated, outcome.Ids, ref counters.LastRefreshTicks, ref counters.LastRefreshDurationTicks, ref counters.LastRefreshAllocatedBytes);
                 counters.LastRefreshIds = outcome.Ids;
                 counters.Add(ref counters.TotalRefreshTicks, Stopwatch.GetTimestamp() - startedAt);
+                counters.Add(ref counters.RefreshAllocatedBytes, counters.LastRefreshAllocatedBytes);
 
                 if (outcome.EmptyTerms)
                     index.RequestReset(JoinRebuildReason.EmptyTerms);
             }
 
             WriteEtags(indexContext, index, current);
+
+            // the changes are all in the transaction of the index and it is not committed yet
+            index.ForTestingPurposes?.Invoke("BeforeIndexCommit");
             if (current.IsPartial)
             {
                 // the changes were cut at the budget of a commit: this transaction commits them and the next batch goes on at once
@@ -136,11 +159,60 @@ internal sealed class JoinRefreshWork(JoinIndex index) : IIndexingWork
         }
     }
 
-    private JoinRefreshOutcome RunEngine(JoinIndexFile file, IndexView outer, IndexView inner, JoinIndexGeneration published, long startedAt, CancellationToken token)
+    private JoinRefreshOutcome RunEngine(JoinIndexFile file, IndexView outer, IndexView inner, JoinIndexGeneration published, long startedAt, ResidentPatch patch, CancellationToken token)
     {
         JoinIncrementalRefresh engine = index.Engine;
         engine.OnPhase = index.ForTestingPurposes;
-        return engine.Run(file, outer, inner, published, startedAt, token);
+        engine.Patch = patch;
+        try
+        {
+            return engine.Run(file, outer, inner, published, startedAt, token);
+        }
+        finally
+        {
+            engine.Patch = null;
+        }
+    }
+
+    /// <summary>
+    /// The resident cache of an Indirect file is brought to the epoch the file's generation says before the changes are made: a cold or dropped cache is established at the outer snapshot of this refresh and
+    /// warmed up from it. Null when the file is Expanded or the cache is switched off.
+    /// </summary>
+    private JoinResident.Run BeginResidentRun(TransactionOperationContext indexContext, JoinIndexFile file, JoinPlan plan, IndexView outer, JoinIndexGeneration published, CancellationToken token)
+    {
+        JoinResident resident = file.Schema.IsIndirect ? index.EnsureResident() : null;
+        if (resident == null)
+            return null;
+
+        index.ClearResidentWarmUpRequest();
+        JoinResident.Run run = resident.BeginRun(outer.Snapshot.EnvironmentId, outer.Snapshot.Transaction.LowLevelTransaction.Id, outer.Searcher.LastEntryId, file.Seed, published.Serial, outer.Snapshot.Consumed,
+            outerPartial: published.Mode == JoinStorageMode.Indirect && published.OuterPartial);
+
+        // the run is dropped with the transaction whether it commits or not: a rolled back refresh leaves the cache as it was
+        indexContext.Transaction.InnerTransaction.LowLevelTransaction.OnDispose += _ => run.Dispose();
+        if (run.NeedsWarmUp)
+        {
+            using JoinReader reader = file.OpenReader();
+            resident.WarmUp(run, reader, outer.Searcher, plan.OuterKeyField, plan.Definition.OuterField, token);
+        }
+
+        return run;
+    }
+
+    // the changes are applied to the cache only once the transaction that holds them committed: before that a rollback would leave them in lists that the retry never removes them from
+    private static void ApplyResidentAfterCommit(TransactionOperationContext indexContext, JoinResident.Run run, long serial, bool outerApplied, bool outerPartial)
+    {
+        if (run == null)
+            return;
+
+        indexContext.Transaction.InnerTransaction.LowLevelTransaction.AfterCommitWhenNewTransactionsPrevented += _ => run.Apply(serial, outerApplied, outerPartial);
+    }
+
+    private void DropResidentAfterBuild(TransactionOperationContext indexContext)
+    {
+        JoinResident resident = index.EnsureResident();
+        if (resident != null)
+            indexContext.Transaction.InnerTransaction.LowLevelTransaction.AfterCommitWhenNewTransactionsPrevented += _ => resident.DropAfterBuild();
     }
 
     private JoinIndexGeneration Build(JoinIndexFile file, JoinPlan plan, IndexView outer, IndexView inner, CancellationToken token)
@@ -208,7 +280,7 @@ internal sealed class JoinRefreshWork(JoinIndex index) : IIndexingWork
         if (joinIndex.IsValidatedAgainst(outer, inner))
             return null;
 
-        var validator = new JoinIndexValidator(name => JoinIndexFactsReader.Read(joinIndex.DocumentDatabase.IndexStore.GetIndex(name)), isShardedDatabase: false);
+        var validator = new JoinIndexValidator(name => JoinIndexFactsReader.Read(joinIndex.DocumentDatabase.IndexStore.GetIndex(name)), isShardedDatabase: false, indirectEnabled: joinIndex.DocumentDatabase.Configuration.Join.IndirectEnabled);
         var errors = validator.Validate(joinIndex.Join);
         if (errors.Count > 0)
             return JoinValidationException.BuildMessage(errors);

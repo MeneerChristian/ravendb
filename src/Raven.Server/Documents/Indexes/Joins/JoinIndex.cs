@@ -15,6 +15,7 @@ using Raven.Server.Documents.Indexes.Configuration;
 using Raven.Server.Documents.Indexes.Debugging;
 using Raven.Server.Documents.Indexes.Joins.Refresh;
 using Raven.Server.Documents.Indexes.Joins.Serving;
+using Raven.Server.Documents.Indexes.Joins.Serving.Resident;
 using Raven.Server.Documents.Indexes.Persistence;
 using Raven.Server.Documents.Indexes.Workers;
 using Raven.Server.Documents.Queries;
@@ -60,6 +61,12 @@ public sealed class JoinIndex : Index<JoinIndexDefinition, JoinIndexField>
     private JoinIncrementalRefresh _engine;
     private JoinOptions _options;
     private JoinQueryOptions _queryOptions;
+    private JoinResident _resident;
+    private int _residentColdRequested;
+    private ResidentCacheOptions _residentOptions;
+    private ResidentCacheRegistry _residentRegistry;
+    private bool _residentOptionsSet;
+    private readonly object _residentLock = new();
     internal readonly JoinCounters Counters = new();
 
     /// <summary>Called at named points of a refresh, for tests; an exception that it throws ends the refresh.</summary>
@@ -83,7 +90,36 @@ public sealed class JoinIndex : Index<JoinIndexDefinition, JoinIndexField>
 
     internal JoinDefinition Join => Definition.IndexDefinition.Join;
 
-    internal JoinPlan Plan => _plan ??= new JoinPlan(Join);
+    internal JoinPlan Plan => _plan ??= new JoinPlan(Join, Options.ResolveMode(Join));
+
+    /// <summary>
+    /// For a join index whose mode is left to the build: looks at the outer index (the entries and the distinct keys of its key field) and the memory now, and sets the mode of the file that is built. Does nothing
+    /// when the definition or the settings name the mode.
+    /// </summary>
+    internal void ChooseBuildMode(Index outer, JoinPlan plan)
+    {
+        JoinOptions options = Options;
+        if (options.ChoosesModeAtBuild(plan.Definition) == false)
+            return;
+
+        if (outer.TryOpenSnapshot(out IndexSnapshot snapshot) == false)
+            return;
+
+        long entries, keys;
+        using (var view = new IndexView(snapshot, plan.IdField))
+        {
+            entries = view.Searcher.NumberOfEntries;
+            keys = view.TermsOf(plan.OuterKeyField)?.NumberOfEntries ?? 0;
+        }
+
+        ResidentCacheRegistry registry = ResidentCacheRegistry.Instance;
+        long available = Engine.AvailableMemoryBytes();
+        var facts = new JoinOptions.ModeFacts(entries, keys, available, Math.Min(options.ResidentCacheMaxBytes, registry.FreeBytes), registry.IsLowMemory || LowMemoryNotification.Instance.LowMemoryState);
+        JoinStorageMode mode = options.ResolveBuildMode(plan.Definition, facts, out string reason);
+        plan.ChooseBuildMode(mode);
+        Counters.Add(ref mode == JoinStorageMode.Indirect ? ref Counters.AutoModeIndirect : ref Counters.AutoModeExpanded, 1);
+        Counters.LastAutoModeReason = reason;
+    }
 
     internal JoinOptions Options => _options ??= JoinOptions.From(DocumentDatabase.Configuration);
 
@@ -120,7 +156,66 @@ public sealed class JoinIndex : Index<JoinIndexDefinition, JoinIndexField>
         _engine = null;
         _plan?.Dispose();
         _plan = null;
+        lock (_residentLock)
+        {
+            Interlocked.Exchange(ref _resident, null)?.Dispose();
+        }
     }
+
+    /// <summary>The resident cache of the lists of the keys of an Indirect file, null while there is none (the file is Expanded, the cache is switched off, the first refresh did not run yet).</summary>
+    internal JoinResident Resident => Volatile.Read(ref _resident);
+
+    /// <summary>The cache of the Indirect file of this join index: made when the first refresh sees the file, null when the budget of the cache is 0.</summary>
+    internal JoinResident EnsureResident()
+    {
+        JoinResident resident = Volatile.Read(ref _resident);
+        if (resident != null)
+            return resident;
+
+        lock (_residentLock)
+        {
+            if (_resident != null)
+                return _resident;
+
+            ResidentCacheOptions options = _residentOptionsSet ? _residentOptions : new ResidentCacheOptions { BudgetBytes = Options.ResidentCacheMaxBytes, Admission = ResidentAdmission.FillHold };
+            if (options == null || options.BudgetBytes <= 0)
+                return null;
+
+            ResidentCacheRegistry registry = _residentOptionsSet ? _residentRegistry : ResidentCacheRegistry.Instance;
+            if (_residentOptionsSet == false)
+                registry.SetBudget(Options.ResidentCacheMaxBytes);
+
+            resident = new JoinResident(options, registry) { ColdRequested = RequestResidentWarmUp };
+            Volatile.Write(ref _resident, resident);
+            RequestResidentWarmUp();
+            return resident;
+        }
+    }
+
+    /// <summary>For tests: replaces the cache with one of these options (null: none), which is empty and has no epoch, and wakes the join index to establish one. The registry is the process one when null.</summary>
+    internal void UseResidentCache(ResidentCacheOptions options, ResidentCacheRegistry registry = null)
+    {
+        lock (_residentLock)
+        {
+            _residentOptions = options;
+            _residentRegistry = registry;
+            _residentOptionsSet = true;
+            Interlocked.Exchange(ref _resident, null)?.Dispose();
+        }
+
+        RequestResidentWarmUp();
+    }
+
+    /// <summary>The cache has no epoch (cold, or dropped): the next refresh run establishes one at the outer snapshot and warms it up, even when the indexes did not change.</summary>
+    internal void RequestResidentWarmUp()
+    {
+        Interlocked.Exchange(ref _residentColdRequested, 1);
+        _mre?.Set(ignoreThrottling: true);
+    }
+
+    internal bool ResidentWarmUpRequested => Volatile.Read(ref _residentColdRequested) != 0;
+
+    internal void ClearResidentWarmUpRequest() => Interlocked.Exchange(ref _residentColdRequested, 0);
 
     internal string OuterName => Definition.IndexDefinition.Join.OuterIndex;
 
@@ -236,7 +331,7 @@ public sealed class JoinIndex : Index<JoinIndexDefinition, JoinIndexField>
                 context.Dispose();
                 queryLock.Dispose();
             });
-            snapshot = new JoinIndexSnapshot(indexTx.InnerTransaction, Plan.Schema, owned);
+            snapshot = new JoinIndexSnapshot(indexTx.InnerTransaction, Plan.SchemaOfFile(indexTx.InnerTransaction), owned);
             return true;
         }
         finally
@@ -457,6 +552,26 @@ public sealed class JoinIndex : Index<JoinIndexDefinition, JoinIndexField>
         stats.Join.FallbackTotal = QueryCounters.FallbackTotal;
         foreach ((string reason, long count) in QueryCounters.Fallbacks)
             stats.Join.Fallbacks[reason] = count;
+
+        JoinResident resident = Resident;
+        if (resident != null)
+        {
+            ResidentCacheStats cache = resident.Cache.GetStats();
+            stats.Join.ResidentBytes = cache.ResidentBytes;
+            stats.Join.ResidentKeys = cache.ResidentKeys;
+            stats.Join.ResidentHits = cache.Hits;
+            stats.Join.ResidentMisses = cache.Misses;
+            stats.Join.ResidentEpochMisses = cache.EpochMisses;
+            stats.Join.ResidentEvictions = cache.Evictions;
+            stats.Join.ResidentWarmUpKeys = cache.WarmUpKeys;
+            stats.Join.ResidentInvalidations = cache.Invalidations;
+            stats.Join.ResidentLowMemoryDrops = cache.LowMemoryDrops;
+            stats.Join.ResidentPatchesApplied = resident.PatchesApplied;
+            stats.Join.ResidentPatchEpochMismatches = resident.PatchEpochMismatches;
+            stats.Join.ResidentPatchesTooLarge = resident.PatchTooLarge;
+            stats.Join.ResidentPatchesIdTooLarge = resident.PatchIdTooLarge;
+            stats.Join.ResidentPartialDrops = resident.PartialDrops;
+        }
 
         stats.Join.QueryWaits = QueryCounters.WaitCount;
         stats.Join.QueryWaitTotalInMs = QueryCounters.WaitTotalInMs;

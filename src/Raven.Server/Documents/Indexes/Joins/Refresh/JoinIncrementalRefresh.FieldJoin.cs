@@ -2,6 +2,7 @@ using System;
 using System.Runtime.InteropServices;
 using Raven.Client.Documents.Indexes;
 using Raven.Server.Documents.Indexes.Joins.Storage;
+using Sparrow;
 using Voron.Data.CompactTrees;
 using Voron.Util;
 
@@ -66,7 +67,13 @@ internal sealed partial class JoinIncrementalRefresh
     private ContextBoundNativeList<long> _newKeyRefs;
     private ContextBoundNativeList<SeveralKeysCheck> _recheck;
     private ContextBoundNativeList<long> _cachedCodes;
+    private ContextBoundNativeList<long> _keyAtomAdds;
+    private ContextBoundNativeList<long> _termHashes;
+    private ContextBoundNativeList<long> _keyAtomRemovals;
     private ContextBoundNativeList<long> _cleanRows;
+    private ContextBoundNativeList<long> _classifiedKeyRefs;
+    private ContextBoundNativeList<KeySpan> _classifiedKeys;
+    private ContextBoundNativeList<long> _classifiedFingerprints;
     private long _cachedKeyRef;
 
     private static void SortDistinct(ref ContextBoundNativeList<long> list)
@@ -89,13 +96,18 @@ internal sealed partial class JoinIncrementalRefresh
     /// Reads the keys of an outer entry into <see cref="_newKeyRefs"/> (ascending, without repeats). A key that is too long to equal a key of the file is none. When keys are not added, a key the file does not know
     /// sets <paramref name="unknown"/> and is left out. True when the entry has a key.
     /// </summary>
-    private bool ReadOuterKeyRefs(JoinWriter writer, IndexView outer, long entry, bool add, out bool unknown)
+    private bool ReadOuterKeyRefs(JoinWriter writer, IndexView outer, long entry, bool add, out bool unknown, bool entryIsRead = false)
     {
         unknown = false;
         _newKeyRefs.Count = 0;
-        if (_keyReader.Read(outer, entry, _file) == false)
-            return false;
+        if (entryIsRead == false)
+        {
+            _counters.Add(ref _counters.OuterKeyReads, 1);
+            if (_keyReader.Read(outer, entry, _file) == false)
+                return false;
+        }
 
+        int lookups = 0;
         for (int i = 0; i < _keyReader.TermCount; i++)
         {
             ReadOnlySpan<byte> term = _keyReader.TermAt(i);
@@ -103,6 +115,7 @@ internal sealed partial class JoinIncrementalRefresh
                 continue;
 
             long keyRef;
+            lookups++;
             if (add)
             {
                 keyRef = writer.GetOrAddKey(term);
@@ -116,14 +129,49 @@ internal sealed partial class JoinIncrementalRefresh
             _newKeyRefs.Add(keyRef);
         }
 
+        _counters.Add(ref _counters.KeyLookups, lookups);
         SortDistinct(ref _newKeyRefs);
         return _newKeyRefs.Count > 0 || unknown;
     }
 
-    /// <summary>Whether the outer entry names now the keys that the file has for it (none for none).</summary>
-    private bool HasTheSameFieldKey(JoinWriter writer, IndexView outer, long entry)
+    /// <summary>
+    /// The fingerprint of the distinct keys that the outer entry the reader holds names (the terms that a file can have as a key): the hash of the sorted hashes of the terms, never 0. The number of those keys is
+    /// the result. An Indirect file keeps the fingerprint with the keys of a row of two or more keys, so that a row whose keys did not change is known without looking up its keys in the dictionary of the file.
+    /// </summary>
+    private int FingerprintOfOuterKeys(out long fingerprint)
     {
-        ReadOuterKeyRefs(writer, outer, entry, add: false, out bool unknown);
+        _termHashes.Count = 0;
+        for (int i = 0; i < _keyReader.TermCount; i++)
+        {
+            ReadOnlySpan<byte> term = _keyReader.TermAt(i);
+            if (term.Length <= JoinLimits.MaxTermLength)
+                _termHashes.Add(OuterKeyFingerprint.HashOf(term));
+        }
+
+        return OuterKeyFingerprint.Of(_termHashes.ToSpan(), out fingerprint);
+    }
+
+    /// <summary>Whether the outer entry names now the keys that the file has for it (none for none).</summary>
+    private bool HasTheSameFieldKey(JoinWriter writer, IndexView outer, long entry, int index)
+    {
+        _counters.Add(ref _counters.OuterKeyReads, 1);
+        bool read = _keyReader.Read(outer, entry, _file);
+        long fingerprint = 0;
+        if (read && writer.Schema.HasOuterFingerprints)
+        {
+            int distinct = FingerprintOfOuterKeys(out fingerprint);
+            if (distinct >= 1 && writer.TryGetOuterKeysFingerprint(entry, out long storedFingerprint))
+            {
+                if (storedFingerprint == fingerprint)
+                    return true;
+
+                // the keys are not the ones of the file; a row of one key is classified below, a row of several is read again when it is added
+                if (distinct >= 2)
+                    return false;
+            }
+        }
+
+        ReadOuterKeyRefs(writer, outer, entry, add: false, out bool unknown, entryIsRead: read);
         _rowKeys.Count = 0;
         bool stored = writer.TryGetOuterKeys(entry, ref _rowKeys);
 
@@ -131,10 +179,16 @@ internal sealed partial class JoinIncrementalRefresh
         if (unknown)
             return false;
 
-        if (_newKeyRefs.Count == 0)
-            return stored == false;
+        bool same = _newKeyRefs.Count == 0 ? stored == false : stored && _rowKeys.ToSpan().SequenceEqual(_newKeyRefs.ToSpan());
+        if (same == false && (writer.Schema.IsIndirect == false || _newKeyRefs.Count < 2))
+        {
+            // the row is added again with these keys: the entry is not read a second time (the fingerprint of a row of several keys is made from the entry the reader holds, so such a row is read again)
+            _classifiedKeys[index] = new KeySpan(_classifiedKeyRefs.Count, _newKeyRefs.Count);
+            _classifiedKeyRefs.AddRange(_newKeyRefs.ToSpan());
+            _classifiedFingerprints[index] = fingerprint;
+        }
 
-        return stored && _rowKeys.ToSpan().SequenceEqual(_newKeyRefs.ToSpan());
+        return same;
     }
 
     /// <summary>The codes of the atoms that the group of the key has, as the file has them now. The answer is kept for the next call with the same key until the atoms change.</summary>
@@ -151,8 +205,19 @@ internal sealed partial class JoinIncrementalRefresh
     }
 
     /// <summary>Takes an outer entry out of the lists of the atoms that the groups of its keys have.</summary>
-    private void RemoveOuterFieldRow(JoinWriter writer, long entry, long hash)
+    private void RemoveOuterFieldRow(JoinWriter writer, long entry, long hash, bool entryIsReplaced, int index)
     {
+        if (writer.Schema.IsIndirect)
+        {
+            // the outer entries are in no list of the file: the row of the entry and the row of the document are all there is. The cache of the lists of the keys is told which keys the entry leaves
+            if (Patch != null)
+                RecordRemovedOuterRow(writer, entry, entryIsReplaced, index);
+
+            writer.SetOuterKeys(entry, default);
+            writer.RemoveOuterDocument(hash);
+            return;
+        }
+
         _rowKeys.Count = 0;
         if (writer.TryGetOuterKeys(entry, ref _rowKeys) && _rowKeys.Count > 0)
         {
@@ -179,16 +244,83 @@ internal sealed partial class JoinIncrementalRefresh
         writer.RemoveOuterDocument(hash);
     }
 
+    /// <summary>
+    /// A row that leaves the outer index leaves the list of each of its keys: the old keys are the ones of the file. A row whose document gets another entry keeps them until the entry is added
+    /// (<see cref="RecordAddedOuterRow"/>), where the change of the document is recorded as one.
+    /// </summary>
+    private void RecordRemovedOuterRow(JoinWriter writer, long entry, bool entryIsReplaced, int index)
+    {
+        _rowKeys.Count = 0;
+        writer.TryGetOuterKeys(entry, ref _rowKeys);
+        if (entryIsReplaced)
+        {
+            _patchOld[index] = new KeySpan(_patchOldKeys.Count, _rowKeys.Count);
+            _patchOldKeys.AddRange(_rowKeys.ToSpan());
+        }
+        else
+        {
+            Patch.RemoveRow(entry, _rowKeys.ToSpan());
+        }
+    }
+
+    private void RecordAddedOuterRow(long entry, long oldEntry, int index, ReadOnlySpan<long> newKeys)
+    {
+        if (oldEntry == 0)
+        {
+            if (newKeys.Length > 0)
+                Patch.AddRow(entry, newKeys);
+
+            return;
+        }
+
+        KeySpan old = _patchOld[index];
+        Patch.ChangeRow(oldEntry, _patchOldKeys.ToSpan().Slice(old.Start, old.Length), entry, newKeys);
+    }
+
     /// <summary>Remembers the new entry of an outer document and puts it in the lists of the atoms that the groups of its keys have.</summary>
-    private void AddOuterFieldRow(JoinWriter writer, IndexView outer, long hash, long entry)
+    private void AddOuterFieldRow(JoinWriter writer, IndexView outer, long hash, long entry, long oldEntry, int index)
     {
         if (writer.SetOuterDocument(hash, entry) != 0)
             throw new JoinRebuildRequiredException(JoinRebuildReason.HashCollision);
 
-        if (ReadOuterKeyRefs(writer, outer, entry, add: true, out _) == false)
+        bool hasKeys;
+        KeySpan classified = _classifiedKeys[index];
+        if (classified.Start >= 0)
+        {
+            _newKeyRefs.Count = 0;
+            _newKeyRefs.AddRange(_classifiedKeyRefs.ToSpan().Slice(classified.Start, classified.Length));
+            hasKeys = _newKeyRefs.Count > 0;
+        }
+        else
+        {
+            hasKeys = ReadOuterKeyRefs(writer, outer, entry, add: true, out _);
+        }
+
+        if (hasKeys)
+        {
+            long fingerprint = 0;
+            if (writer.Schema.HasOuterFingerprints)
+            {
+                if (classified.Start >= 0)
+                    fingerprint = _classifiedFingerprints[index];
+                else
+                    FingerprintOfOuterKeys(out fingerprint);
+            }
+
+            writer.SetOuterKeys(entry, _newKeyRefs.ToSpan(), fingerprint);
+        }
+
+        if (writer.Schema.IsIndirect)
+        {
+            if (Patch != null)
+                RecordAddedOuterRow(entry, oldEntry, index, hasKeys ? _newKeyRefs.ToSpan() : default);
+
+            return;
+        }
+
+        if (hasKeys == false)
             return;
 
-        writer.SetOuterKeys(entry, _newKeyRefs.ToSpan());
         int withGroup = 0;
         foreach (long keyRef in _newKeyRefs.ToSpan())
         {
@@ -247,12 +379,22 @@ internal sealed partial class JoinIncrementalRefresh
             }
 
             newMask = _projector.Membership;
-            for (int k = 0; k < _projector.KeyCount; k++)
-                _newKeyRefs.Add(writer.GetOrAddKey(_projector.KeyAt(k)));
+            if (writer.Schema.KeysAreInnerIds && _oldKeyRefs.Count == 1 && _projector.KeyCount == 1)
+            {
+                // the key of a document is its id, which a document keeps: the key the file has for it is the key it has now
+                _newKeyRefs.Add(_oldKeyRefs[0]);
+            }
+            else
+            {
+                for (int k = 0; k < _projector.KeyCount; k++)
+                    _newKeyRefs.Add(writer.GetOrAddKey(_projector.KeyAt(k)));
+
+                _counters.Add(ref _counters.KeyLookups, _projector.KeyCount);
+            }
 
             SortDistinct(ref _newKeyRefs);
             if (_newKeyRefs.Count > JoinLimits.MaxKeysPerEntry)
-                throw new JoinUnsupportedException($"The field '{plan.Definition.InnerField}' of the inner index holds {_newKeyRefs.Count} keys in one document, a join index holds at most {JoinLimits.MaxKeysPerEntry}.");
+                throw new JoinUnsupportedException($"The field '{plan.Definition.InnerField ?? "id()"}' of the inner index holds {_newKeyRefs.Count} keys in one document, a join index holds at most {JoinLimits.MaxKeysPerEntry}.");
         }
 
         _newMasks[index] = newMask;
@@ -399,6 +541,13 @@ internal sealed partial class JoinIncrementalRefresh
         deltas.Sort();
 
         CheckCostOfListChanges(writer, outerLists, keyTree, deltas);
+        if (writer.Schema.IsIndirect)
+        {
+            ApplyPairDeltasToKeyLists(writer, deltas);
+            _deltas.Count = 0;
+            return;
+        }
+
         LoadMultiRows(writer);
         bool anyMulti = _multiRows.Count > 0;
         if (anyMulti)
@@ -406,6 +555,7 @@ internal sealed partial class JoinIncrementalRefresh
 
         _moves.Count = 0;
         int index = 0;
+        int pairIndex = 0;
         while (index < deltas.Length)
         {
             long keyRef = deltas[index].KeyRef;
@@ -417,7 +567,7 @@ internal sealed partial class JoinIncrementalRefresh
             if (sum == 0)
                 continue;
 
-            int now = writer.AddPairCount(keyRef, code, sum);
+            int now = CountAfter(writer, keyRef, code, sum, ref pairIndex);
             int before = now - sum;
 
             if (code == JoinReader.CodeOfAny() && (before >= 2) != (now >= 2))
@@ -438,6 +588,124 @@ internal sealed partial class JoinIncrementalRefresh
     }
 
     /// <summary>
+    /// The counts of an Indirect file: a count that goes from or to zero puts the key into the list of the atom or takes it out, one list change for the transition, whatever the number of outer entries of
+    /// the key. The count of the any atom crossing two moves the key in the list of the keys with several inner entries. The outer entries are not touched.
+    /// </summary>
+    /// <summary>
+    /// The count of a pair after the batch changed it by <paramref name="sum"/>. A file whose keys are the ids of its inner documents keeps no counts: the group of a key is its one document, so the pair is
+    /// there (1) or not (0), and the batch moves it by one from the other state.
+    /// </summary>
+    private int CountAfter(JoinWriter writer, long keyRef, long code, int sum, ref int pairIndex)
+    {
+        if (writer.Schema.KeysAreInnerIds)
+        {
+            CheckOneDocument(sum);
+            return sum > 0 ? 1 : 0;
+        }
+
+        // the estimate of the cost read the count of every pair already, and nothing changed it since
+        if (_pairsBeforeKnown == false)
+        {
+            _pairCountLookups++;
+            return writer.AddPairCount(keyRef, code, sum);
+        }
+
+        return writer.SetPairCount(keyRef, code, _pairsBefore[pairIndex++], sum);
+    }
+
+    /// <summary>The count of a pair before the batch changed it by <paramref name="sum"/>, see <see cref="CountAfter"/>.</summary>
+    private static int CountBefore(JoinWriter writer, long keyRef, long code, int sum)
+    {
+        if (writer.Schema.KeysAreInnerIds == false)
+            return writer.GetPairCount(keyRef, code);
+
+        CheckOneDocument(sum);
+        return sum < 0 ? 1 : 0;
+    }
+
+    private static void CheckOneDocument(int sum)
+    {
+        if (sum is not (1 or -1))
+            throw new JoinRebuildRequiredException(JoinRebuildReason.Unsupported, "a group of a key that is the id of a document changed by more than one document");
+    }
+
+    private void ApplyPairDeltasToKeyLists(JoinWriter writer, Span<PairDelta> deltas)
+    {
+        long several = JoinReader.AtomOfCode(writer.CodeOfSeveralInner);
+        long gathered = -1;
+        int index = 0;
+        int pairIndex = 0;
+        while (index < deltas.Length)
+        {
+            long keyRef = deltas[index].KeyRef;
+            long code = deltas[index].Code;
+            int sum = 0;
+            while (index < deltas.Length && deltas[index].KeyRef == keyRef && deltas[index].Code == code)
+                sum += deltas[index++].Delta;
+
+            if (sum == 0)
+                continue;
+
+            if (keyRef != gathered)
+            {
+                UpdateAtomsOfKey(writer, gathered);
+                gathered = keyRef;
+            }
+
+            int now = CountAfter(writer, keyRef, code, sum, ref pairIndex);
+            int before = now - sum;
+
+            if (code == JoinReader.CodeOfAny() && (before >= 2) != (now >= 2))
+            {
+                writer.AddRowsWithSeveralJoined(now >= 2 ? 1 : -1);
+                if (now >= 2)
+                {
+                    _keyAtomAdds.Add(writer.CodeOfSeveralInner);
+                    writer.AddKeyToAtom(several, keyRef);
+                }
+                else
+                {
+                    _keyAtomRemovals.Add(writer.CodeOfSeveralInner);
+                    writer.RemoveKeyFromAtom(several, keyRef);
+                }
+            }
+
+            if ((before == 0) == (now == 0))
+                continue;
+
+            long atom = JoinReader.AtomOfCode(code);
+            if (now > 0)
+            {
+                _keyAtomAdds.Add(code);
+                writer.AddKeyToAtom(atom, keyRef);
+            }
+            else
+            {
+                _keyAtomRemovals.Add(code);
+                writer.RemoveKeyFromAtom(atom, keyRef);
+            }
+
+            _counters.Add(ref _counters.KeyListChanges, 1);
+        }
+
+        UpdateAtomsOfKey(writer, gathered);
+    }
+
+    /// <summary>Changes the atoms of a key by everything that this refresh did to its pairs: one update of its list, not one for each atom.</summary>
+    private void UpdateAtomsOfKey(JoinWriter writer, long keyRef)
+    {
+        if (_keyAtomAdds.Count == 0 && _keyAtomRemovals.Count == 0)
+            return;
+
+        _keyAtomAdds.ToSpan().Sort();
+        _keyAtomRemovals.ToSpan().Sort();
+        writer.ChangeKeyAtoms(keyRef, _keyAtomAdds.ToSpan(), _keyAtomRemovals.ToSpan());
+        _keyAtomAdds.Count = 0;
+        _keyAtomRemovals.Count = 0;
+        _counters.Add(ref _counters.KeyAtomUpdates, 1);
+    }
+
+    /// <summary>
     /// The list changes that the counts of this refresh make: for every pair of a key and an atom whose count goes from or to zero, one change of the list of the atom for each outer entry of the key.
     /// A change that is cut at the budget of a commit has the same changes per document in the commits that follow, so the whole of what is left is estimated. When that is more changes than building
     /// the lists again costs the lists are built again, before any of them is made.
@@ -445,7 +713,10 @@ internal sealed partial class JoinIncrementalRefresh
     private void CheckCostOfListChanges(JoinWriter writer, ListStore outerLists, CompactTree keyTree, Span<PairDelta> deltas)
     {
         int limit = _options.MaxInnerListChangesPerOuterEntry;
-        if (limit <= 0 || keyTree == null || _dirtyInner.Count == 0)
+        bool indirect = writer.Schema.IsIndirect;
+        _pairsBefore.Count = 0;
+        _pairsBeforeKnown = false;
+        if (limit <= 0 || (keyTree == null && indirect == false) || _dirtyInner.Count == 0)
             return;
 
         long changes = 0;
@@ -464,13 +735,23 @@ internal sealed partial class JoinIncrementalRefresh
             if (sum == 0)
                 continue;
 
-            int before = writer.GetPairCount(keyRef, code);
+            int before = CountBefore(writer, keyRef, code, sum);
+            if (writer.Schema.KeysAreInnerIds == false)
+            {
+                _pairCountLookups++;
+                _pairsBefore.Add(before);
+            }
             int now = before + sum;
             bool several = code == JoinReader.CodeOfAny() && (before >= 2) != (now >= 2);
             if (several == false && (before == 0) == (now == 0))
                 continue;
 
-            if (cachedKey != keyRef)
+            if (indirect)
+            {
+                // a transition is one change of one list, whatever the number of outer entries of the key
+                rowsOfKey = 1;
+            }
+            else if (cachedKey != keyRef)
             {
                 int length = writer.CopyKey(keyRef, term);
                 rowsOfKey = keyTree.TryGetValue(term.Slice(0, length), out long handle) ? outerLists.Count(handle) : 0;
@@ -483,6 +764,8 @@ internal sealed partial class JoinIncrementalRefresh
             if ((before == 0) != (now == 0))
                 changes += rowsOfKey;
         }
+
+        _pairsBeforeKnown = true;
 
         // what is left of the change has about the same cost for each document
         long documents = _dirtyInner.Count;

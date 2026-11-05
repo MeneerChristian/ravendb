@@ -274,5 +274,47 @@ namespace Raven.Client.Documents.Indexes
         public double QueryWaitTotalInMs { get; set; }
 
         public double QueryWaitMaxInMs { get; set; }
+
+        /// <summary>The bytes of native memory that the resident cache of the key lists of an Indirect join index holds (0 when it has none).</summary>
+        public long ResidentBytes { get; set; }
+
+        /// <summary>The number of key lists that are resident.</summary>
+        public int ResidentKeys { get; set; }
+
+        /// <summary>The key lists that a join read from the resident cache.</summary>
+        public long ResidentHits { get; set; }
+
+        /// <summary>The key lists that a join read from the outer index although its snapshot was the epoch of the cache.</summary>
+        public long ResidentMisses { get; set; }
+
+        /// <summary>The reads of a join whose outer snapshot was not the epoch of the cache: all its lists came from the outer index.</summary>
+        public long ResidentEpochMisses { get; set; }
+
+        /// <summary>The lists that were evicted to make room for others.</summary>
+        public long ResidentEvictions { get; set; }
+
+        /// <summary>The lists that the warm-up loaded.</summary>
+        public long ResidentWarmUpKeys { get; set; }
+
+        /// <summary>How many times the cache was cleared and lost its epoch.</summary>
+        public long ResidentInvalidations { get; set; }
+
+        /// <summary>How many times a low memory notification dropped the lists.</summary>
+        public long ResidentLowMemoryDrops { get; set; }
+
+        /// <summary>The refreshes whose changes were applied to the resident lists after their commit.</summary>
+        public long ResidentPatchesApplied { get; set; }
+
+        /// <summary>The patches that did not start from the epoch of the cache, so the cache was cleared.</summary>
+        public long ResidentPatchEpochMismatches { get; set; }
+
+        /// <summary>The patches of more documents than one lock hold takes, so the cache was cleared.</summary>
+        public long ResidentPatchesTooLarge { get; set; }
+
+        /// <summary>The refreshes whose outer index has entry ids that the 32 bit lists cannot hold, so the cache was cleared.</summary>
+        public long ResidentPatchesIdTooLarge { get; set; }
+
+        /// <summary>The partial refreshes that dropped the epoch of the cache.</summary>
+        public long ResidentPartialDrops { get; set; }
     }
 }

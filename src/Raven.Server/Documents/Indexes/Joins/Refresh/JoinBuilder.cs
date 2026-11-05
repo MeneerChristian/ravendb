@@ -73,6 +73,9 @@ internal sealed partial class JoinBuilder : IDisposable
 
     public int ListUpdates { get; private set; }
 
+    /// <summary>How many rows of keys (of an outer entry, of an inner document) the build wrote: one for every row, when the queue holds the pairs of all of them.</summary>
+    public int KeyRowWrites { get; private set; }
+
     /// <param name="flushThreshold">The number of queued list changes at which they are applied, which is also the most pairs of an atom and a key that are noted.</param>
     /// <param name="minAtomEntries">The atoms with at least this many outer entries get their list written at once; zero queues every entry of every atom.</param>
     public JoinBuilder(IJoinFile file, JoinPlan plan, IndexView outer, IndexView inner, CancellationToken token, int flushThreshold = JoinWriter.DefaultFlushThreshold, int minAtomEntries = 0)
@@ -95,6 +98,8 @@ internal sealed partial class JoinBuilder : IDisposable
             _members[g] = new ContextBoundNativeList<long>(_allocator, 1024);
 
         InitializeAtoms();
+        InitializeIndirect();
+        InitializeRowKeys();
         _atoms = new ContextBoundNativeList<long>(_allocator, 64);
         _codes = new ContextBoundNativeList<long>(_allocator, 64);
         _fieldRefs = new ContextBoundNativeList<long>[plan.Fields.Length];
@@ -116,19 +121,31 @@ internal sealed partial class JoinBuilder : IDisposable
             if (_plan.IsFieldJoin)
             {
                 BuildKeyGroups();
-                BuildOuterKeys();
+                if (IsIndirect)
+                {
+                    WriteKeyLists();
+                    BuildOuterKeysIndirect();
+                }
+                else
+                {
+                    BuildOuterKeys();
+                }
             }
             else
             {
                 BuildJoinedEntries();
             }
 
-            JoinIndexGeneration generation = new(0, _outer.Snapshot.EnvironmentId, JoinCursors.From(_outer.Snapshot.Consumed),
-                _inner.Snapshot.EnvironmentId, JoinCursors.From(_inner.Snapshot.Consumed), _inner.Searcher.LastEntryId, 0);
+            JoinIndexGeneration generation = IsIndirect
+                ? new(0, _outer.Snapshot.EnvironmentId, JoinCursors.From(_outer.Snapshot.Consumed), _inner.Snapshot.EnvironmentId, JoinCursors.From(_inner.Snapshot.Consumed),
+                    _inner.Searcher.LastEntryId, 0, JoinStorageMode.Indirect, innerPartial: false, outerPartial: false)
+                : new(0, _outer.Snapshot.EnvironmentId, JoinCursors.From(_outer.Snapshot.Consumed), _inner.Snapshot.EnvironmentId, JoinCursors.From(_inner.Snapshot.Consumed),
+                    _inner.Searcher.LastEntryId, 0);
 
             JoinIndexGeneration committed = _writer.Commit(generation);
             ListFlushes = _writer.Flushes;
             ListUpdates = _writer.ListUpdates;
+            KeyRowWrites = _writer.KeyRowWrites;
             return committed;
         }
         finally
@@ -410,6 +427,8 @@ internal sealed partial class JoinBuilder : IDisposable
         _atoms.Dispose();
         _codes.Dispose();
         DisposeAtoms();
+        DisposeIndirect();
+        DisposeRowKeys();
         foreach (ContextBoundNativeList<long> list in _members)
             list.Dispose();
         foreach (ContextBoundNativeList<long> list in _fieldRefs)

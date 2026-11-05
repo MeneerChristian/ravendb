@@ -24,6 +24,7 @@ internal sealed partial class JoinBuilder
         if (keys == null)
             return;
 
+        _collectingKeys = IsIndirect;
         using var scope = new CompactKeyCacheScope(_inner.Snapshot.Transaction.LowLevelTransaction);
         var iterator = keys.Iterate();
         iterator.Reset();
@@ -36,7 +37,7 @@ internal sealed partial class JoinBuilder
                 continue;
 
             if (term.Length > JoinLimits.MaxTermLength)
-                throw new JoinUnsupportedException($"The field '{_plan.Definition.InnerField}' of the inner index has a key longer than {JoinLimits.MaxTermLength} bytes.");
+                throw new JoinUnsupportedException($"The field '{_plan.Definition.InnerField ?? "id()"}' of the inner index has a key longer than {JoinLimits.MaxTermLength} bytes.");
 
             long keyRef = _writer.GetOrAddKey(term);
             _entries.Count = 0;
@@ -48,7 +49,7 @@ internal sealed partial class JoinBuilder
                 long inner = KeyOf(entry);
 
                 // an inner entry that holds several keys is in the group of each of them
-                _writer.AddInnerKey(inner, keyRef);
+                NoteRowKey(inner, keyRef, ofInnerDocument: true);
                 LoadInner(inner, out int membership);
 
                 _atoms.Add(JoinReader.CodeOfAny());
@@ -68,6 +69,8 @@ internal sealed partial class JoinBuilder
             WriteGroup(keyRef, _entries.Count);
             ThrowIfCancelled();
         }
+
+        WriteRowKeys(ofInnerDocument: true);
     }
 
     /// <summary>Counts the atoms collected for a group (sorted here), writes the counts and the list of the atoms of the key.</summary>
@@ -85,12 +88,14 @@ internal sealed partial class JoinBuilder
             while (end < atoms.Length && atoms[end] == code)
                 end++;
 
-            _writer.AddPairCount(keyRef, code, end - index);
+            if (_writer.Schema.KeysAreInnerIds == false)
+                _writer.AddPairCount(keyRef, code, end - index);
+
             _codes.Add(code);
             index = end;
         }
 
-        // the groups of two or more entries are the ones an AND or a NOT over the lists is not exact for: their outer entries are in a list of their own
+        // the groups of two or more entries are the ones an AND or a NOT over the lists is not exact for: their outer entries (an Indirect file: the key) are in a list of their own
         if (size >= 2)
         {
             _codes.Add(_writer.CodeOfSeveralInner);
@@ -98,6 +103,8 @@ internal sealed partial class JoinBuilder
         }
 
         _writer.SetKeyAtoms(keyRef, _codes.ToSpan());
+        if (IsIndirect)
+            NoteKeyAtoms(keyRef, _codes.ToSpan());
     }
 
     /// <summary>Walks the terms of the key field of the outer index: the posting list of a term holds the outer entries with that key, which join the group of the key. An entry with several keys joins each group.</summary>

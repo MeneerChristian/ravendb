@@ -79,6 +79,12 @@ public partial class IndexSearcher
             : TermMatch.CreateEmpty(this, Allocator);
     }
 
+    /// <summary>
+    /// The entries of a term by the value that the tree of the terms of its field holds under the term (what <see cref="CompactTree.TryGetValue(System.ReadOnlySpan{byte}, out long)"/> returns), for a caller that
+    /// looked the term up itself and reads the entry ids only: the match does not score.
+    /// </summary>
+    public TermMatch TermQueryOfTermId(long termId) => TermQuery(termId, 1, false);
+
     public TermMatch TermQuery(in FieldMetadata field, CompactKey term, CompactTree tree)
     {
         if (TryGetTermId(field, term, tree, out var termId, out var termRatioToWholeCollection) == false)
@@ -263,6 +269,9 @@ public partial class IndexSearcher
         return NumberOfDocumentsUnderSpecificTerm(containerId);
     }
     
+    /// <summary>The number of entries of the posting list that the terms tree holds under <paramref name="termId"/>, read from the header of the list: no reader is created and nothing is allocated from the context.</summary>
+    public long NumberOfEntriesUnderTermId(long termId) => NumberOfDocumentsUnderSpecificTerm(termId);
+
     private long NumberOfDocumentsUnderSpecificTerm(long containerId)
     {
         if (containerId == -1)
