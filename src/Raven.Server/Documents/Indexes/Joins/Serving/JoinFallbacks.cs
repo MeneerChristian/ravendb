@@ -31,4 +31,7 @@ public static class JoinFallbacks
 
     /// <summary>The query is ordered by a field of the joined documents and an outer entry is joined with several of them: no value orders the entry.</summary>
     public static readonly string OrderByMultiKey = KindNotServed("OrderByMultiKey");
+
+    /// <summary>The query is ordered by a field of the joined documents and the join index keeps keys, not outer entries: the page is read from the lists of the outer entries of an Expanded file.</summary>
+    public static readonly string OrderByIndirect = KindNotServed("OrderByIndirect");
 }

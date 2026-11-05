@@ -124,7 +124,9 @@ internal sealed class JoinQueryLease : IDisposable
                 Snapshot = entry.Snapshot,
                 Generation = entry.Snapshot?.Generation ?? JoinIndexGeneration.Initial,
                 Unavailable = entry.Unavailable,
-                MaxResidualRows = index.Options.MaxResidualRows
+                MaxResidualRows = index.Options.MaxResidualRows,
+                MaxResidualKeys = index.Options.MaxResidualKeys,
+                Resident = index.Resident
             };
 
             served = JoinServing.Serve(request, target, _ =>

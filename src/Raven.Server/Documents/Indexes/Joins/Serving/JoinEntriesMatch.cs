@@ -25,6 +25,14 @@ internal unsafe struct JoinEntriesMatch : IQueryMatch
 
     public long Count => _count;
 
+    /// <summary>The same entries from the first one, over the same memory (which the match only reads).</summary>
+    public JoinEntriesMatch Restarted()
+    {
+        JoinEntriesMatch copy = this;
+        copy._position = 0;
+        return copy;
+    }
+
     public SkipSortingResult AttemptToSkipSorting() => SkipSortingResult.ResultsNativelySorted;
 
     public QueryCountConfidence Confidence => QueryCountConfidence.High;

@@ -34,6 +34,34 @@ internal static class JoinTermUnion
         }
     }
 
+    /// <summary>The keys of the lists of the terms in the range or with the prefix of an Indirect file (the lists hold keys), sorted and without repeats.</summary>
+    public static void CollectKeys(JoinReader snapshot, JoinPredicate predicate, ref ContextBoundNativeList<long> keys)
+    {
+        var handles = new ContextBoundNativeList<long>(snapshot.Transaction.Allocator);
+        try
+        {
+            Walk(snapshot, predicate, ref handles);
+            int start = keys.Count;
+            foreach (long handle in handles.ToSpan())
+                snapshot.ReadList(handle, ref keys);
+
+            Span<long> added = keys.ToSpan().Slice(start);
+            added.Sort();
+            int unique = 0;
+            for (int i = 0; i < added.Length; i++)
+            {
+                if (unique == 0 || added[unique - 1] != added[i])
+                    added[unique++] = added[i];
+            }
+
+            keys.Count = start + unique;
+        }
+        finally
+        {
+            handles.Dispose();
+        }
+    }
+
     private static IQueryMatch CreateBitmap(IndexSearcher outer, JoinReader snapshot, ReadOnlySpan<long> handles)
     {
         var bitmap = new JoinBitmapSink(outer.Allocator, outer.LastEntryId);
