@@ -593,6 +593,7 @@ namespace Raven.Server.Documents.PeriodicBackup.Restore
                             break;
                         case IndexType.None:
                         case IndexType.Faulty:
+                        case IndexType.AutoJoin:
                             break;
                         default:
                             throw new ArgumentOutOfRangeException();

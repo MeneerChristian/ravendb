@@ -226,6 +226,7 @@ namespace Raven.Server.ServerWide
             [nameof(EditSchemaValidationConfigurationCommand)] = 72_000,
 
             [nameof(PutJoinIndexCommand)] = 72_002,
+            [nameof(PutAutoJoinIndexCommand)] = 72_002,
         };
 
         public bool CanPutCommand(string command)

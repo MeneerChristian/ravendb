@@ -527,6 +527,12 @@ namespace Raven.Server.Documents.Indexes
                         }
                         else
                         {
+                            if (autoDef.Type == IndexType.AutoJoin)
+                            {
+                                var joinDefinition = IndexStore.CreateAutoJoinDefinition(autoDef);
+                                return JoinIndex.CreateNew(joinDefinition, documentDatabase, documentDatabase.IndexStore.ResolveJoinCollections(joinDefinition));
+                            }
+
                             var definition = IndexStore.CreateAutoDefinition(autoDef, documentDatabase.Configuration.Indexing.AutoIndexDeploymentMode);
 
                             if (definition is AutoMapIndexDefinition autoMapDef)
@@ -571,7 +577,8 @@ namespace Raven.Server.Documents.Indexes
                                 return MapReduceIndex.Open<MapReduceIndex>(environment, documentDatabase);
 
                             case IndexType.Join:
-                                return JoinIndex.Open(environment, documentDatabase);
+                            case IndexType.AutoJoin:
+                                return JoinIndex.Open(environment, documentDatabase, type);
 
                             default:
                                 throw new ArgumentException($"Unknown index type {type} for index {name}");
@@ -3981,6 +3988,9 @@ namespace Raven.Server.Documents.Indexes
 
             MarkQueried(DocumentDatabase.Time.GetUtcNow());
         }
+
+        // a query that reads this join index is its use: it is promoted from idle and marked as queried, the way an auto index is
+        internal void MarkUsedByQuery() => PromoteFromIdleAndMarkQueried();
 
         internal enum JoinSourceHold
         {

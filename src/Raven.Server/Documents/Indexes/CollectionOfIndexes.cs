@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Threading;
+using Raven.Client.Documents.Indexes;
 using Raven.Server.Documents.Indexes.Joins;
 using Sparrow.Collections;
 using AsyncManualResetEvent = Sparrow.Server.AsyncManualResetEvent;
@@ -62,7 +63,7 @@ namespace Raven.Server.Documents.Indexes
         private OrderedJoinSet _orderedJoins;
 
         /// <summary>
-        /// The join indexes in one fixed order: each by name. A query that has several join indexes of the same join tries them in this order.
+        /// The join indexes in one fixed order: the ones that were put first, then the auto join indexes, each by name. A query that has several join indexes of the same join tries them in this order.
         /// The array is shared by all queries and rebuilt after the join indexes changed.
         /// </summary>
         public JoinIndex[] OrderedJoins
@@ -75,7 +76,11 @@ namespace Raven.Server.Documents.Indexes
                     return cached.Joins;
 
                 JoinIndex[] ordered = _joinsByName.Values.ToArray();
-                Array.Sort(ordered, static (x, y) => string.CompareOrdinal(x.Name, y.Name));
+                Array.Sort(ordered, static (x, y) =>
+                {
+                    int byType = (x.Type == IndexType.AutoJoin).CompareTo(y.Type == IndexType.AutoJoin);
+                    return byType != 0 ? byType : string.CompareOrdinal(x.Name, y.Name);
+                });
 
                 // read before the join indexes were listed: a change that happens in between makes the next read build again
                 Volatile.Write(ref _orderedJoins, new OrderedJoinSet(version, ordered));

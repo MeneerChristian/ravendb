@@ -444,6 +444,11 @@ namespace Raven.Server.Web.System
                                 databaseRecord.AutoIndexes.Add(autoIndexDefinition.Name, autoIndexDefinition);
                                 break;
 
+                            case IndexType.AutoJoin:
+                                var autoJoinDefinition = ((JoinIndexDefinition)definition).ToAutoIndexDefinition();
+                                databaseRecord.AutoIndexes.Add(autoJoinDefinition.Name, autoJoinDefinition);
+                                break;
+
                             case IndexType.Map:
                             case IndexType.MapReduce:
                             case IndexType.JavaScriptMap:

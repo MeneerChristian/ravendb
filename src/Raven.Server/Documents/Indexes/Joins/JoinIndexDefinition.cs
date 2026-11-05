@@ -22,12 +22,16 @@ public sealed class JoinIndexDefinition : IndexDefinitionBaseServerSide<JoinInde
     /// <summary>The definition as it is stored in the database record.</summary>
     public readonly IndexDefinition IndexDefinition;
 
-    public JoinIndexDefinition(IndexDefinition definition, IEnumerable<string> collections, long indexVersion)
+    /// <summary><see cref="IndexType.Join"/> for a join index that was put, <see cref="IndexType.AutoJoin"/> for one that a query created.</summary>
+    public readonly IndexType Type;
+
+    public JoinIndexDefinition(IndexDefinition definition, IEnumerable<string> collections, long indexVersion, IndexType type = IndexType.Join)
         : base(definition.Name, collections, definition.LockMode ?? IndexLockMode.Unlock, definition.Priority ?? IndexPriority.Normal,
             definition.State ?? IndexState.Normal, GetFields(definition), indexVersion, definition.DeploymentMode, definition.ClusterState,
             definition.ArchivedDataProcessingBehavior)
     {
         IndexDefinition = definition ?? throw new ArgumentNullException(nameof(definition));
+        Type = type is IndexType.Join or IndexType.AutoJoin ? type : throw new ArgumentOutOfRangeException(nameof(type), type, null);
     }
 
     private static JoinIndexField[] GetFields(IndexDefinition definition)
@@ -68,7 +72,7 @@ public sealed class JoinIndexDefinition : IndexDefinitionBaseServerSide<JoinInde
         IndexDefinition.CopyTo(definition);
 
         definition.Name = Name;
-        definition.Type = IndexType.Join;
+        definition.Type = Type;
         definition.LockMode = LockMode;
         definition.ArchivedDataProcessingBehavior = ArchivedDataProcessingBehavior;
         definition.Priority = Priority;
@@ -91,8 +95,22 @@ public sealed class JoinIndexDefinition : IndexDefinitionBaseServerSide<JoinInde
         return hashCode * 397 ^ IndexDefinition.GetHashCode();
     }
 
+    /// <summary>The definition of an auto join index as it is kept in the database record.</summary>
+    public AutoIndexDefinition ToAutoIndexDefinition()
+    {
+        return new AutoIndexDefinition
+        {
+            Name = Name,
+            Type = IndexType.AutoJoin,
+            Collection = Collections.First(),
+            Join = IndexDefinition.Join.Clone(),
+            Priority = Priority,
+            State = State
+        };
+    }
+
     /// <summary>Reads the definition and the collections that were persisted with the index.</summary>
-    public static JoinIndexDefinition Load(StorageEnvironment environment)
+    public static JoinIndexDefinition Load(StorageEnvironment environment, IndexType type = IndexType.Join)
     {
         using (JsonOperationContext context = JsonOperationContext.ShortTermSingleUse())
         using (Transaction tx = environment.ReadTransaction())
@@ -109,7 +127,7 @@ public sealed class JoinIndexDefinition : IndexDefinitionBaseServerSide<JoinInde
             definition.State = ReadState(reader);
             definition.ArchivedDataProcessingBehavior = ReadArchivedDataProcessingBehavior(reader);
 
-            return new JoinIndexDefinition(definition, ReadCollections(reader), ReadVersion(reader));
+            return new JoinIndexDefinition(definition, ReadCollections(reader), ReadVersion(reader), type);
         }
     }
 }

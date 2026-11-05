@@ -309,7 +309,7 @@ namespace Raven.Server.Documents.Queries.Dynamic
 
         public static DynamicQueryMapping Create(Index index)
         {
-            if (index.Type.IsAuto() == false)
+            if (index.Type is not (IndexType.AutoMap or IndexType.AutoMapReduce))
                 throw new InvalidOperationException();
 
             var mapping = new DynamicQueryMapping

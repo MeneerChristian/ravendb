@@ -128,7 +128,7 @@ public class IndexInformationHolder
 
         if (definition is JoinIndexDefinition joinIndex)
         {
-            type = IndexType.Join;
+            type = joinIndex.Type;
             sourceType = joinIndex.IndexDefinition.SourceType;
             return;
         }

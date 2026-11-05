@@ -223,6 +223,53 @@ public abstract class AbstractIndexCreateController
         return index;
     }
 
+    /// <summary>
+    /// Puts an auto join index that a query asked for: the same rules as an auto index (the name is an auto name, the node waits until the record is applied), and the rules of every join index for its join.
+    /// </summary>
+    public async ValueTask<long> CreateAutoJoinAsync(AutoIndexDefinition definition, string raftRequestId)
+    {
+        if (definition == null)
+            throw new ArgumentNullException(nameof(definition));
+
+        if (definition.Type != IndexType.AutoJoin || definition.Join == null)
+            throw new ArgumentException($"The auto index '{definition.Name}' is not an auto join index.", nameof(definition));
+
+        if (IndexStore.IsValidIndexName(definition.Name, false, out var errorMessage) == false)
+            throw new ArgumentException(errorMessage);
+
+        List<JoinValidationError> errors = new JoinIndexValidator(GetJoinIndexFacts, IsShardedDatabase).Validate(definition.Join);
+        if (errors.Count > 0)
+            throw new IndexInvalidException($"Could not create the auto join index '{definition.Name}'.{Environment.NewLine}{JoinValidationException.BuildMessage(errors)}");
+
+        var configuration = GetDatabaseConfiguration();
+        var command = new PutAutoJoinIndexCommand(definition, GetDatabaseName(), raftRequestId, configuration.Indexing.AutoIndexDeploymentMode, GetDatabaseTime().GetUtcNow());
+
+        long index = 0;
+        try
+        {
+            index = (await ServerStore.SendToLeaderAsync(command).ConfigureAwait(false)).Index;
+        }
+        catch (LicenseLimitException e)
+        {
+            IndexStore.ThrowIndexCreationExceptionDueToLicenseLimitations("auto", definition.Name, e);
+        }
+        catch (Exception e)
+        {
+            IndexStore.ThrowIndexCreationException("auto", definition.Name, e, "the cluster is probably down", ServerStore);
+        }
+
+        try
+        {
+            await WaitForIndexNotificationAsync(index).ConfigureAwait(false);
+        }
+        catch (TimeoutException toe)
+        {
+            IndexStore.ThrowIndexCreationException("auto", definition.Name, toe, $"the operation timed out after: {ServerStore.Engine.OperationTimeout}.", ServerStore);
+        }
+
+        return index;
+    }
+
     public bool CanUseIndexBatch()
     {
         return ServerStore.Engine.CommandsVersionManager.CanPutCommand(nameof(PutIndexesCommand));

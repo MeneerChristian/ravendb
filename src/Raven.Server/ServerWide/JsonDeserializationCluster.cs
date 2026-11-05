@@ -222,6 +222,7 @@ namespace Raven.Server.ServerWide
             [nameof(PutIndexCommand)] = GenerateJsonDeserializationRoutine<PutIndexCommand>(),
             [nameof(PutIndexesCommand)] = GenerateJsonDeserializationRoutine<PutIndexesCommand>(),
             [nameof(PutJoinIndexCommand)] = GenerateJsonDeserializationRoutine<PutJoinIndexCommand>(),
+            [nameof(PutAutoJoinIndexCommand)] = GenerateJsonDeserializationRoutine<PutAutoJoinIndexCommand>(),
             [nameof(PutAutoIndexCommand)] = GenerateJsonDeserializationRoutine<PutAutoIndexCommand>(),
             [nameof(PutRollingIndexCommand)] = GenerateJsonDeserializationRoutine<PutRollingIndexCommand>(),
             [nameof(DeleteIndexCommand)] = GenerateJsonDeserializationRoutine<DeleteIndexCommand>(),

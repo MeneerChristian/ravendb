@@ -47,6 +47,7 @@ public sealed partial class ClusterStateMachine
         nameof(PutAnalyzersCommand),
         nameof(PutIndexCommand),
         nameof(PutJoinIndexCommand),
+        nameof(PutAutoJoinIndexCommand),
         nameof(EditRevisionsConfigurationCommand),
         nameof(EditExpirationCommand),
         nameof(EditRefreshCommand),
@@ -98,6 +99,7 @@ public sealed partial class ClusterStateMachine
                 break;
 
             case nameof(PutAutoIndexCommand):
+            case nameof(PutAutoJoinIndexCommand):
                 AssertAutoIndexesCount(databaseRecord, serverStore.LicenseManager.LicenseStatus, context, items, type);
                 break;
 

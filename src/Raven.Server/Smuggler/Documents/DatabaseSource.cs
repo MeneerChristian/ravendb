@@ -441,7 +441,7 @@ namespace Raven.Server.Smuggler.Documents
             {
                 allIndexes.Remove(index);
 
-                if (index.Type == IndexType.Faulty)
+                if (index.Type is IndexType.Faulty or IndexType.AutoJoin)
                     continue;
 
                 var indexName = index.Name.Remove(0, Constants.Documents.Indexing.SideBySideIndexNamePrefix.Length);
@@ -461,7 +461,8 @@ namespace Raven.Server.Smuggler.Documents
                 if (originalSideBySideIndexNames.Contains(index.Name))
                     continue;
 
-                if (index.Type == IndexType.Faulty)
+                // an auto join index is made by the queries that need it, like a cache: it is not exported
+                if (index.Type is IndexType.Faulty or IndexType.AutoJoin)
                     continue;
 
                 if (index.Type.IsStatic())

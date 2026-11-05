@@ -66,6 +66,9 @@ internal class IndexHandlerProcessorForConvertAutoIndex<TRequestHandler, TOperat
             if (record.AutoIndexes.TryGetValue(name, out var autoIndex) == false)
                 throw IndexDoesNotExistException.ThrowForAuto(name);
 
+            if (autoIndex.Type == IndexType.AutoJoin)
+                throw new NotSupportedException($"The auto index '{name}' is an auto join index, which has no map to convert to a static index.");
+
             var sanitizedIndexName = AutoToStaticIndexConverter.GetSanitizedIndexName(autoIndex);
 
             switch (type)

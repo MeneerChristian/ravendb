@@ -312,6 +312,15 @@ namespace Raven.Server.Documents.Indexes
                 var name = kvp.Key;
                 try
                 {
+                    if (kvp.Value.Type == IndexType.AutoJoin)
+                    {
+                        var joinToStart = HandleAutoJoinChange(name, kvp.Value);
+                        if (joinToStart != null)
+                            indexesToStart.Add(joinToStart);
+
+                        continue;
+                    }
+
                     var definition = CreateAutoDefinition(kvp.Value, mode);
 
                     var indexToStart = HandleAutoIndexChange(name, definition);
@@ -381,6 +390,49 @@ namespace Raven.Server.Documents.Indexes
 
                 return index;
             }
+        }
+
+        // An auto join index is a join index that a query asked for: it is created, and its priority and state are updated, like the ones of a static join index. Nothing else of it can change
+        private Index HandleAutoJoinChange(string name, AutoIndexDefinition autoDefinition)
+        {
+            using (IndexLock(name))
+            {
+                var definition = CreateAutoJoinDefinition(autoDefinition);
+                var existingIndex = GetIndex(name);
+                if (existingIndex != null)
+                {
+                    var creationOptions = GetIndexCreationOptions(definition, existingIndex.ToIndexInformationHolder(), _documentDatabase.Configuration, out var differences);
+                    if (creationOptions == IndexCreationOptions.Noop)
+                        return null;
+
+                    if (creationOptions == IndexCreationOptions.UpdateWithoutUpdatingCompiledIndex)
+                    {
+                        UpdateIndex(definition, existingIndex, differences);
+                        return null;
+                    }
+
+                    throw new NotSupportedException($"Can not update the auto join index '{name}' (compare result: {differences})");
+                }
+
+                return JoinIndex.CreateNew(definition, _documentDatabase, ResolveJoinCollections(definition));
+            }
+        }
+
+        /// <summary>The definition of an auto join index of the database record as the definition of a join index.</summary>
+        internal static IndexDefinition CreateAutoJoinDefinition(AutoIndexDefinition definition)
+        {
+            if (definition.Type != IndexType.AutoJoin || definition.Join == null)
+                throw new NotSupportedException($"The auto index '{definition.Name}' is not an auto join index.");
+
+            return new IndexDefinition
+            {
+                Name = definition.Name,
+                Join = definition.Join.Clone(),
+                Priority = definition.Priority,
+                State = definition.State,
+                ClusterState = definition.ClusterState == null ? null : new IndexDefinitionClusterState(definition.ClusterState),
+                Type = IndexType.AutoJoin
+            };
         }
 
         internal static AutoIndexDefinitionBaseServerSide CreateAutoDefinition(AutoIndexDefinition definition, IndexDeploymentMode indexDeployment)
@@ -1063,6 +1115,7 @@ namespace Raven.Server.Documents.Indexes
                             break;
 
                         case IndexType.Join:
+                        case IndexType.AutoJoin:
                             JoinIndex.Update(existingIndex, definition, _documentDatabase);
                             break;
 
@@ -1545,6 +1598,7 @@ namespace Raven.Server.Documents.Indexes
                                         break;
 
                                     case IndexType.Join:
+                                    case IndexType.AutoJoin:
                                         index = JoinIndex.CreateNew(staticIndexDefinition, _documentDatabase, ResolveJoinCollections(staticIndexDefinition));
                                         break;
 
@@ -1889,11 +1943,12 @@ namespace Raven.Server.Documents.Indexes
 
                 var configuration = new FaultyInMemoryIndexConfiguration(path, _documentDatabase.Configuration);
 
-                var faultyIndex = (indexDefinition is AutoIndexDefinition)
-                    ? new FaultyInMemoryIndex(e, name, configuration,
-                        CreateAutoDefinition((AutoIndexDefinition)indexDefinition, IndexDeploymentMode.Parallel),
-                        searchEngineType)
-                    : new FaultyInMemoryIndex(e, name, configuration, (IndexDefinition)indexDefinition, searchEngineType);
+                var faultyIndex = indexDefinition switch
+                {
+                    AutoIndexDefinition { Type: IndexType.AutoJoin } autoJoin => new FaultyInMemoryIndex(e, name, configuration, CreateAutoJoinDefinition(autoJoin), searchEngineType),
+                    AutoIndexDefinition auto => new FaultyInMemoryIndex(e, name, configuration, CreateAutoDefinition(auto, IndexDeploymentMode.Parallel), searchEngineType),
+                    _ => new FaultyInMemoryIndex(e, name, configuration, (IndexDefinition)indexDefinition, searchEngineType)
+                };
 
                 var message = $"Could not open index at '{indexPath}'. Created in-memory, fake instance: {faultyIndex.Name}";
 
@@ -2000,7 +2055,7 @@ namespace Raven.Server.Documents.Indexes
 
             foreach (var index in _indexes)
             {
-                if (index.Type.IsAuto() == false)
+                if (index.Type is not (IndexType.AutoMap or IndexType.AutoMapReduce))
                     continue;
 
                 if (indexesToRemove.Contains(index.Name))

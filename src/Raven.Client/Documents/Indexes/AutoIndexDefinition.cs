@@ -23,6 +23,12 @@ namespace Raven.Client.Documents.Indexes
 
         public List<string> GroupByFieldNames { get; set; }
 
+        /// <summary>
+        /// The join that an auto join index (<see cref="IndexType.AutoJoin"/>) keeps up to date; null for every other auto index. A join index has no map fields: its
+        /// <see cref="Collection"/> is the collection of its outer index.
+        /// </summary>
+        public JoinDefinition Join { get; set; }
+
         public IndexDefinitionCompareDifferences Compare(AutoIndexDefinition other)
         {
             if (other == null)
@@ -38,6 +44,9 @@ namespace Raven.Client.Documents.Indexes
 
             if (DictionaryExtensions.ContentEquals(GroupByFields, other.GroupByFields) == false)
                 result |= IndexDefinitionCompareDifferences.Reduce;
+
+            if (JoinDefinition.IsSameJoin(Join, other.Join) == false)
+                result |= IndexDefinitionCompareDifferences.Join;
 
             if (Priority != other.Priority)
                 result |= IndexDefinitionCompareDifferences.Priority;

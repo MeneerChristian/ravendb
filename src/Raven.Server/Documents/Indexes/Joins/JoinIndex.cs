@@ -66,7 +66,7 @@ public sealed class JoinIndex : Index<JoinIndexDefinition, JoinIndexField>
     internal Action<string> ForTestingPurposes { get; set; }
 
     private JoinIndex(JoinIndexDefinition definition)
-        : base(IndexType.Join, IndexSourceType.Documents, definition, compiled: null)
+        : base(definition.Type, IndexSourceType.Documents, definition, compiled: null)
     {
     }
 
@@ -555,15 +555,15 @@ public sealed class JoinIndex : Index<JoinIndexDefinition, JoinIndexField>
     public static JoinIndex CreateNew(IndexDefinition definition, DocumentDatabase documentDatabase, IEnumerable<string> collections, SingleIndexConfiguration forcedConfiguration = null)
     {
         SingleIndexConfiguration configuration = forcedConfiguration ?? new SingleIndexConfiguration(definition.Configuration, documentDatabase.Configuration);
-        var instance = new JoinIndex(new JoinIndexDefinition(definition, collections, IndexDefinitionBaseServerSide.IndexVersion.CurrentVersion));
+        var instance = new JoinIndex(new JoinIndexDefinition(definition, collections, IndexDefinitionBaseServerSide.IndexVersion.CurrentVersion, definition.Type));
         instance.Initialize(documentDatabase, configuration, documentDatabase.Configuration.PerformanceHints);
         return instance;
     }
 
     /// <summary>Opens the join index that was persisted in the environment.</summary>
-    public static JoinIndex Open(StorageEnvironment environment, DocumentDatabase documentDatabase)
+    public static JoinIndex Open(StorageEnvironment environment, DocumentDatabase documentDatabase, IndexType type = IndexType.Join)
     {
-        JoinIndexDefinition definition = JoinIndexDefinition.Load(environment);
+        JoinIndexDefinition definition = JoinIndexDefinition.Load(environment, type);
         var instance = new JoinIndex(definition);
         instance.Initialize(environment, documentDatabase, new SingleIndexConfiguration(definition.IndexDefinition.Configuration, documentDatabase.Configuration),
             documentDatabase.Configuration.PerformanceHints);
@@ -574,7 +574,16 @@ public sealed class JoinIndex : Index<JoinIndexDefinition, JoinIndexField>
     public static void Update(Index index, IndexDefinition definition, DocumentDatabase documentDatabase)
     {
         var joinIndex = (JoinIndex)index;
-        var updated = new JoinIndexDefinition(definition, joinIndex.Definition.Collections, joinIndex.Definition.Version);
+        var updated = new JoinIndexDefinition(definition, joinIndex.Definition.Collections, joinIndex.Definition.Version, joinIndex.Definition.Type);
+        if (joinIndex.Type == IndexType.AutoJoin)
+        {
+            // like an auto index, an auto join index takes only its state from the database record: nothing else of it can change
+            if (joinIndex.UpdateIndexState(updated, autoIndex: true) && joinIndex.Status != IndexRunningStatus.Running)
+                joinIndex.Start();
+
+            return;
+        }
+
         joinIndex.Update(updated, new SingleIndexConfiguration(definition.Configuration, documentDatabase.Configuration));
     }
 }

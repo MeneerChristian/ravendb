@@ -15,6 +15,7 @@
         JavaScriptMap       = 6,
         JavaScriptMapReduce = 7,
         Join              = 8,
+        AutoJoin          = 9,
     }
 
     internal static class IndexTypeExtensions
@@ -41,7 +42,7 @@
 
         public static bool IsAuto(this IndexType self)
         {
-            return self == IndexType.AutoMap || self == IndexType.AutoMapReduce;
+            return self == IndexType.AutoMap || self == IndexType.AutoMapReduce || self == IndexType.AutoJoin;
         }
 
         public static bool IsStatic(this IndexType self)
@@ -51,7 +52,7 @@
 
         public static bool IsJoin(this IndexType self)
         {
-            return self == IndexType.Join;
+            return self == IndexType.Join || self == IndexType.AutoJoin;
         }
 
         public static bool IsJavaScript(this IndexType self)
