@@ -162,4 +162,29 @@ describe("StatisticsPage", function () {
         // details are still visible
         expect(await screen.findByText(selectors.detailedIndexHeader)).toBeInTheDocument();
     });
+
+    it("can render the stats of a join index", async () => {
+        const db = DatabasesStubs.nonShardedSingleNodeDatabase().toDto();
+        const joinIndex = IndexesStubs.getJoinStats("Join");
+
+        const View = boundCopy(stories.StatisticsTemplate, {
+            db,
+            stats: [joinIndex],
+        });
+
+        const Story = composeStory(View, stories.default);
+
+        const { screen, fireClick } = rtlRender(<Story />);
+        await fireClick(await screen.findByText(selectors.showDetails));
+
+        expect(await screen.findByText("Join Indexes")).toBeInTheDocument();
+        expect(screen.queryByText("Map Indexes")).not.toBeInTheDocument();
+        expect(screen.getByText("Joins Served")).toBeInTheDocument();
+        expect(screen.getByText("240")).toBeInTheDocument();
+        expect(screen.getByText("Joins Read As Usual")).toBeInTheDocument();
+        expect(screen.getByText("Refreshes")).toBeInTheDocument();
+
+        expect(screen.queryByText("Map Attempts")).not.toBeInTheDocument();
+        expect(screen.queryByText("Entries Count")).not.toBeInTheDocument();
+    });
 });

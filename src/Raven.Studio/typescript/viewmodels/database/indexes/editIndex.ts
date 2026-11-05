@@ -79,6 +79,7 @@ class editIndex extends shardViewModelBase {
     indexesToDeleteAfterMerge = ko.observableArray<string>([]); // represents index merge mode
     editedIndex = ko.observable<indexDefinition>();
     isAutoIndex = ko.observable<boolean>(false);
+    private isJoinIndex = false;
     
     testIndex: testIndex;
     originalIndexName: string;
@@ -411,7 +412,8 @@ class editIndex extends shardViewModelBase {
                     this.isEditingExistingIndex(true);
                     
                     this.fetchIndexToEdit(indexToEditName)
-                        .done(() => canActivateResult.resolve({ can: true }))
+                        .done(() => canActivateResult.resolve(
+                            this.isJoinIndex ? { redirect: appUrl.forEditJoin(indexToEditName, db) } : { can: true }))
                         .fail(() => {
                             messagePublisher.reportError("Could not find " + indexToEditName + " index");
                             canActivateResult.resolve({ redirect: appUrl.forIndexes(db) });
@@ -996,6 +998,12 @@ class editIndex extends shardViewModelBase {
         return new getIndexDefinitionCommand(indexName, this.db, this.db.getFirstLocation(this.localNodeTag))
             .execute()
             .done(result => {
+                if (IndexUtils.default.isJoinIndex(result)) {
+                    // a join index has no maps: it is edited in its own page
+                    this.isJoinIndex = true;
+                    return;
+                }
+
                 if (result.Type.startsWith("Auto")) {
                     this.editedIndex(new autoIndexDefinition(result));
                 } else {

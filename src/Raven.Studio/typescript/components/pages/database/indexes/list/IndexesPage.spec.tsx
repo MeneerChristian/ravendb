@@ -10,6 +10,7 @@ const {
     FaultyIndexSharded,
     FaultyIndexSingleNode,
     LicenseLimits: CommunityLimits,
+    JoinIndexes,
 } = composeStories(stories);
 
 describe("IndexesPage", function () {
@@ -26,6 +27,33 @@ describe("IndexesPage", function () {
         await screen.findByText("ReplacementOf/Orders/ByCompany");
         const deleteButtons = await screen.findAllByTitle(/Delete the index/i);
         expect(deleteButtons.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it("can show the type and the actions of join indexes", async () => {
+        const { screen } = rtlRender(<JoinIndexes />);
+
+        await screen.findByText("Orders/WithCompany");
+        await screen.findByText("Auto/Orders/ByCompany/Join/Companies/ByName/OnCompanyToId");
+
+        expect(screen.getByText("Join")).toBeInTheDocument();
+        expect(screen.getByText("Auto Join")).toBeInTheDocument();
+
+        // a join index is answered through a JOIN, it is not queried directly
+        expect(screen.queryByText("Query")).not.toBeInTheDocument();
+
+        // the static join index is edited in the join index page, the auto one is only viewed
+        const editButtons = screen.getAllByTitle("Edit index");
+        expect(editButtons).toHaveLength(1);
+        expect(editButtons[0]).toHaveAttribute(
+            "href",
+            expect.stringContaining("#databases/indexes/join/Orders%2FWithCompany")
+        );
+        const viewButtons = screen.getAllByTitle("View index");
+        expect(viewButtons).toHaveLength(1);
+        expect(viewButtons[0]).toHaveAttribute("href", expect.stringContaining("#databases/indexes/join/Auto%2F"));
+
+        // an auto index has no lock mode
+        expect(screen.getAllByText("Locked (Error)")).toHaveLength(1);
     });
 
     it("can show search engine - corax", async () => {

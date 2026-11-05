@@ -119,6 +119,19 @@ export const EmptyView: StoryFn = () => {
     return <IndexesPage />;
 };
 
+export const JoinIndexes: StoryFn = () => {
+    commonInit("singleNode");
+
+    const { indexesService } = mockServices;
+    const [joinStats] = IndexesStubs.getJoinIndex("Join");
+    const [autoJoinStats] = IndexesStubs.getJoinIndex("AutoJoin");
+
+    indexesService.withGetStats([joinStats, autoJoinStats]);
+    indexesService.withGetProgress([]);
+
+    return <IndexesPage />;
+};
+
 export const SampleDataSingleNode: StoryFn = () => {
     commonInit("singleNode");
     configureIndexService();

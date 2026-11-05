@@ -23,6 +23,7 @@ interface computedAppUrls {
     newDoc: KnockoutComputed<string>;
     newCmpXchg: KnockoutComputed<string>;
     editIndex: (indexName?: string) => KnockoutComputed<string>;
+    editJoin: (indexName?: string) => KnockoutComputed<string>;
     editExternalReplication: (taskId?: number) => KnockoutComputed<string>;
     editReplicationHub: (taskId?: number) => KnockoutComputed<string>;
     editReplicationSink: (taskId?: number) => KnockoutComputed<string>;

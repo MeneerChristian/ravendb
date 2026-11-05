@@ -42,6 +42,7 @@ class appUrl {
         newDoc: ko.pureComputed(() => appUrl.forNewDoc(appUrl.currentDatabase())),
         newCmpXchg: ko.pureComputed(() => appUrl.forEditCmpXchg(null, appUrl.currentDatabase())),
         editIndex: (indexName?: string) => ko.pureComputed(() => appUrl.forEditIndex(indexName, appUrl.currentDatabase())),
+        editJoin: (indexName?: string) => ko.pureComputed(() => appUrl.forEditJoin(indexName, appUrl.currentDatabase())),
         editExternalReplication: (taskId?: number) => ko.pureComputed(() => appUrl.forEditExternalReplication(appUrl.currentDatabase(), taskId)),
         editReplicationHub: (taskId?: number) => ko.pureComputed(() => appUrl.forEditReplicationHub(appUrl.currentDatabase(), taskId)),
         editReplicationSink: (taskId?: number) => ko.pureComputed(() => appUrl.forEditReplicationSink(appUrl.currentDatabase(), taskId)),
@@ -604,6 +605,11 @@ class appUrl {
     static forEditIndex(indexName: string, db: database | string): string {
         const databasePart = appUrl.getEncodedDbPart(db);
         return "#databases/indexes/edit/" + encodeURIComponent(indexName) + "?" + databasePart;
+    }
+
+    static forEditJoin(indexName: string, db: database | string): string {
+        const databasePart = appUrl.getEncodedDbPart(db);
+        return "#databases/indexes/join" + (indexName ? "/" + encodeURIComponent(indexName) : "") + "?" + databasePart;
     }
 
     static forQuery(db: database | string, indexNameOrHashToQuery?: string | number, extraParameters = ""): string {

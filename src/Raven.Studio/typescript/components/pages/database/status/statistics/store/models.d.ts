@@ -2,6 +2,7 @@
     sharedInfo: {
         name: string;
         isReduceIndex: boolean;
+        isJoinIndex: boolean;
         type: Raven.Client.Documents.Indexes.IndexType;
         referencedCollections: string[];
     };
@@ -30,4 +31,13 @@ export interface PerLocationIndexStats {
     reduceAttempts: number;
     reduceSuccesses: number;
     reduceErrors: number;
+
+    // only for a join index
+    joinIndex?: {
+        served: number;
+        fallbackTotal: number;
+        builds: number;
+        refreshes: number;
+        pendingReason: string;
+    };
 }

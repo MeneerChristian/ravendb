@@ -165,6 +165,7 @@ export const statisticsViewSlice = createSlice({
                                 indexStat.Type === "AutoMapReduce" ||
                                 indexStat.Type === "MapReduce" ||
                                 indexStat.Type === "JavaScriptMapReduce",
+                            isJoinIndex: indexStat.Type === "Join" || indexStat.Type === "AutoJoin",
                             referencedCollections: indexStat.ReferencedCollections,
                         },
                         details: new Array(locationsCount).fill(null),
@@ -190,6 +191,15 @@ export const statisticsViewSlice = createSlice({
                 targetToSet.mappedPerSecondRate = indexStat.MappedPerSecondRate;
                 targetToSet.reducedPerSecondRate = indexStat.ReducedPerSecondRate;
                 targetToSet.isStale = indexStat.IsStale;
+                targetToSet.joinIndex = indexStat.Join
+                    ? {
+                          served: indexStat.Join.Served,
+                          fallbackTotal: indexStat.Join.FallbackTotal,
+                          builds: indexStat.Join.Builds,
+                          refreshes: indexStat.Join.Refreshes,
+                          pendingReason: indexStat.Join.PendingReason,
+                      }
+                    : undefined;
             });
         });
 
@@ -349,7 +359,14 @@ const selectIndexByName = (indexName: string) => (state: RootState) =>
     state.statistics.indexDetails.entities[indexName];
 const selectMapIndexNames = (state: RootState) => {
     const indexes = indexSelectors.selectAll(state.statistics.indexDetails);
-    return indexes.filter((x) => !x.sharedInfo.isReduceIndex).map((x) => x.sharedInfo.name);
+    return indexes
+        .filter((x) => !x.sharedInfo.isReduceIndex && !x.sharedInfo.isJoinIndex)
+        .map((x) => x.sharedInfo.name);
+};
+
+const selectJoinIndexNames = (state: RootState) => {
+    const indexes = indexSelectors.selectAll(state.statistics.indexDetails);
+    return indexes.filter((x) => x.sharedInfo.isJoinIndex).map((x) => x.sharedInfo.name);
 };
 
 const selectMapReduceIndexNames = (state: RootState) => {
@@ -367,4 +384,5 @@ export const statisticsViewSelectors = {
     indexByName: selectIndexByName,
     mapIndexNames: selectMapIndexNames,
     mapReduceIndexNames: selectMapReduceIndexNames,
+    joinIndexNames: selectJoinIndexNames,
 };

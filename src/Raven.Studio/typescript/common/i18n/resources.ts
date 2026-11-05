@@ -4,6 +4,7 @@ import conflicts from "./locales/en/conflicts";
 import documentRefresh from "./locales/en/documentRefresh";
 import editCustomSorter from "./locales/en/editCustomSorter";
 import featureAvailabilitySummary from "./locales/en/featureAvailabilitySummary";
+import joinIndex from "./locales/en/joinIndex";
 import revisionsBin from "./locales/en/revisionsBin";
 import studioGlobalConfiguration from "./locales/en/studioGlobalConfiguration";
 
@@ -27,6 +28,7 @@ export const en = {
     documentRefresh,
     editCustomSorter,
     featureAvailabilitySummary,
+    joinIndex,
     revisionsBin,
     studioGlobalConfiguration,
 };

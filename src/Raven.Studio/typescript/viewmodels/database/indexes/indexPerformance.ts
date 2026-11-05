@@ -1071,6 +1071,10 @@ class indexPerformance extends shardViewModelBase {
         if (operationName.startsWith("Field_")) {
             return tracks.Field;
         }
+
+        if (operationName === "JoinRefresh") {
+            return tracks.Indexing;
+        }
         
         console.warn(`Operation "${operationName}" is not supported. Using unknown-operation color in performance graph.`);
         return tracks.UnknownOperation;

@@ -37,9 +37,11 @@ export default class IndexUtils {
         switch (type) {
             case "Map":
             case "MapReduce":
+            case "Join":
                 return false;
             case "AutoMap":
             case "AutoMapReduce":
+            case "AutoJoin":
                 return true;
             default:
                 return name.startsWith(IndexUtils.AutoIndexPrefix);
@@ -48,6 +50,12 @@ export default class IndexUtils {
 
     static isStaticIndex(index: IndexSharedInfo | IndexDefinition) {
         return !IndexUtils.isAutoIndex(index);
+    }
+
+    static isJoinIndex(index: IndexSharedInfo | IndexDefinition | IndexType) {
+        const type = IndexUtils.getType(index);
+
+        return type === "Join" || type === "AutoJoin";
     }
 
     static isJavaScriptIndex(index: IndexSharedInfo | IndexDefinition | IndexType) {
@@ -122,6 +130,9 @@ export default class IndexUtils {
             case "JavaScriptMap":
             case "Map":
                 return "map";
+            case "Join":
+            case "AutoJoin":
+                return "link";
             //TODO: handle other types
             default:
                 return null;
@@ -138,6 +149,10 @@ export default class IndexUtils {
                 return "Auto Map";
             case "AutoMapReduce":
                 return "Auto Map-Reduce";
+            case "Join":
+                return "Join";
+            case "AutoJoin":
+                return "Auto Join";
             default:
                 return indexType;
         }

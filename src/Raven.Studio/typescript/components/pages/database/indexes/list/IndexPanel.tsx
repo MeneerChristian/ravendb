@@ -183,7 +183,7 @@ export function IndexPanelInternal(props: IndexPanelProps, ref: ForwardedRef<HTM
     const { forCurrentDatabase: urls } = useAppUrls();
     const queryUrl = urls.query(index.name)();
     const termsUrl = urls.terms(index.name)();
-    const editUrl = urls.editIndex(index.name)();
+    const editUrl = IndexUtils.isJoinIndex(index) ? urls.editJoin(index.name)() : urls.editIndex(index.name)();
 
     const priorityButtonColor = getPriorityColor(index);
     const lockButtonColor = getLockColor(index);
@@ -254,60 +254,58 @@ export function IndexPanelInternal(props: IndexPanelProps, ref: ForwardedRef<HTM
                                     </Dropdown>
                                 )}
 
-                                {index.type !== "AutoMap" &&
-                                    index.type !== "AutoMapReduce" &&
-                                    !IndexUtils.isSideBySide(index) && (
-                                        <Dropdown>
-                                            <Dropdown.Toggle
-                                                as={CustomDropdownToggle}
-                                                isCaretHidden
-                                                variant={lockButtonColor}
-                                                disabled={!hasDatabaseWriteAccess}
-                                            >
-                                                {updatingLockMode && <Spinner size="sm" className="me-2" />}
-                                                {index.lockMode === "Unlock" && (
-                                                    <span>
-                                                        <Icon icon="unlock" />
-                                                        <span>Unlocked</span>
-                                                    </span>
-                                                )}
-                                                {index.lockMode === "LockedIgnore" && (
-                                                    <span>
-                                                        <Icon icon="lock" />
-                                                        <span>Locked</span>
-                                                    </span>
-                                                )}
-                                                {index.lockMode === "LockedError" && (
-                                                    <span>
-                                                        <Icon icon="lock-error" />
-                                                        <span>Locked (Error)</span>
-                                                    </span>
-                                                )}
-                                            </Dropdown.Toggle>
+                                {!IndexUtils.isAutoIndex(index) && !IndexUtils.isSideBySide(index) && (
+                                    <Dropdown>
+                                        <Dropdown.Toggle
+                                            as={CustomDropdownToggle}
+                                            isCaretHidden
+                                            variant={lockButtonColor}
+                                            disabled={!hasDatabaseWriteAccess}
+                                        >
+                                            {updatingLockMode && <Spinner size="sm" className="me-2" />}
+                                            {index.lockMode === "Unlock" && (
+                                                <span>
+                                                    <Icon icon="unlock" />
+                                                    <span>Unlocked</span>
+                                                </span>
+                                            )}
+                                            {index.lockMode === "LockedIgnore" && (
+                                                <span>
+                                                    <Icon icon="lock" />
+                                                    <span>Locked</span>
+                                                </span>
+                                            )}
+                                            {index.lockMode === "LockedError" && (
+                                                <span>
+                                                    <Icon icon="lock-error" />
+                                                    <span>Locked (Error)</span>
+                                                </span>
+                                            )}
+                                        </Dropdown.Toggle>
 
-                                            <Dropdown.Menu>
-                                                <Dropdown.Item
-                                                    onClick={(e) => setLockMode(e, "Unlock")}
-                                                    title="Unlocked: The index is unlocked for changes; apps can modify it, e.g. via IndexCreation.CreateIndexes()."
-                                                >
-                                                    <Icon icon="unlock" /> <span>Unlock</span>
-                                                </Dropdown.Item>
-                                                <Dropdown.Divider />
-                                                <Dropdown.Item
-                                                    onClick={(e) => setLockMode(e, "LockedIgnore")}
-                                                    title="Locked: The index is locked for changes; apps cannot modify it. Programmatic attempts to modify the index will be ignored."
-                                                >
-                                                    <Icon icon="lock" /> <span>Lock</span>
-                                                </Dropdown.Item>
-                                                <Dropdown.Item
-                                                    onClick={(e) => setLockMode(e, "LockedError")}
-                                                    title="Locked + Error: The index is locked for changes; apps cannot modify it. An error will be thrown if an app attempts to modify it."
-                                                >
-                                                    <Icon icon="lock-error" /> <span>Lock (Error)</span>
-                                                </Dropdown.Item>
-                                            </Dropdown.Menu>
-                                        </Dropdown>
-                                    )}
+                                        <Dropdown.Menu>
+                                            <Dropdown.Item
+                                                onClick={(e) => setLockMode(e, "Unlock")}
+                                                title="Unlocked: The index is unlocked for changes; apps can modify it, e.g. via IndexCreation.CreateIndexes()."
+                                            >
+                                                <Icon icon="unlock" /> <span>Unlock</span>
+                                            </Dropdown.Item>
+                                            <Dropdown.Divider />
+                                            <Dropdown.Item
+                                                onClick={(e) => setLockMode(e, "LockedIgnore")}
+                                                title="Locked: The index is locked for changes; apps cannot modify it. Programmatic attempts to modify the index will be ignored."
+                                            >
+                                                <Icon icon="lock" /> <span>Lock</span>
+                                            </Dropdown.Item>
+                                            <Dropdown.Item
+                                                onClick={(e) => setLockMode(e, "LockedError")}
+                                                title="Locked + Error: The index is locked for changes; apps cannot modify it. An error will be thrown if an app attempts to modify it."
+                                            >
+                                                <Icon icon="lock-error" /> <span>Lock (Error)</span>
+                                            </Dropdown.Item>
+                                        </Dropdown.Menu>
+                                    </Dropdown>
+                                )}
                             </>
                         )}
 
@@ -339,7 +337,7 @@ export function IndexPanelInternal(props: IndexPanelProps, ref: ForwardedRef<HTM
                             </Dropdown>
                         )}
 
-                        {!IndexUtils.hasAnyFaultyNode(index) && (
+                        {!IndexUtils.hasAnyFaultyNode(index) && !IndexUtils.isJoinIndex(index) && (
                             <Dropdown as={ButtonGroup}>
                                 <Button variant="secondary" href={queryUrl}>
                                     <Icon icon="search" />
@@ -554,11 +552,13 @@ function InlineDetails(props: InlineDetailsProps) {
 
     return (
         <>
-            <RichPanelDetailItem>
-                <Icon icon="list" />
-                Entries
-                <div className="value">{estimatedEntries}</div>
-            </RichPanelDetailItem>
+            {!IndexUtils.isJoinIndex(index) && (
+                <RichPanelDetailItem>
+                    <Icon icon="list" />
+                    Entries
+                    <div className="value">{estimatedEntries}</div>
+                </RichPanelDetailItem>
+            )}
             {errorsCount > 0 && (
                 <a href={errorsUrl} title="View indexing errors">
                     <RichPanelDetailItem className="index-detail-item text-danger">

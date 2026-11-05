@@ -43,6 +43,7 @@ function IndexStatistics(props: { indexName: string }) {
     const showReduceErrors = index.details.some((x) => x && x.reduceErrors > 0);
 
     const referencedCollections = index.sharedInfo.referencedCollections;
+    const isJoin = index.sharedInfo.isJoinIndex;
 
     const { reportEvent } = useEventsCollector();
 
@@ -96,10 +97,48 @@ function IndexStatistics(props: { indexName: string }) {
                             </DetailsBlock>
                         </tr>
                     )}
-                    <tr>
-                        <td>Entries Count</td>
-                        <DetailsBlock index={index}>{(data) => <>{data.entriesCount.toLocaleString()}</>}</DetailsBlock>
-                    </tr>
+                    {!isJoin && (
+                        <tr>
+                            <td>Entries Count</td>
+                            <DetailsBlock index={index}>
+                                {(data) => <>{data.entriesCount.toLocaleString()}</>}
+                            </DetailsBlock>
+                        </tr>
+                    )}
+                    {isJoin && (
+                        <>
+                            <tr>
+                                <td>Join State</td>
+                                <DetailsBlock index={index}>
+                                    {(data) => <>{data.joinIndex?.pendingReason ?? "Ready"}</>}
+                                </DetailsBlock>
+                            </tr>
+                            <tr>
+                                <td>Joins Served</td>
+                                <DetailsBlock index={index}>
+                                    {(data) => <>{(data.joinIndex?.served ?? 0).toLocaleString()}</>}
+                                </DetailsBlock>
+                            </tr>
+                            <tr>
+                                <td>Joins Read As Usual</td>
+                                <DetailsBlock index={index}>
+                                    {(data) => <>{(data.joinIndex?.fallbackTotal ?? 0).toLocaleString()}</>}
+                                </DetailsBlock>
+                            </tr>
+                            <tr>
+                                <td>Builds</td>
+                                <DetailsBlock index={index}>
+                                    {(data) => <>{(data.joinIndex?.builds ?? 0).toLocaleString()}</>}
+                                </DetailsBlock>
+                            </tr>
+                            <tr>
+                                <td>Refreshes</td>
+                                <DetailsBlock index={index}>
+                                    {(data) => <>{(data.joinIndex?.refreshes ?? 0).toLocaleString()}</>}
+                                </DetailsBlock>
+                            </tr>
+                        </>
+                    )}
                     {showErrorCounts && (
                         <tr>
                             <td>Errors Count</td>
@@ -108,14 +147,22 @@ function IndexStatistics(props: { indexName: string }) {
                             </DetailsBlock>
                         </tr>
                     )}
-                    <tr>
-                        <td>Map Attempts</td>
-                        <DetailsBlock index={index}>{(data) => <>{data.mapAttempts.toLocaleString()}</>}</DetailsBlock>
-                    </tr>
-                    <tr>
-                        <td>Map Successes</td>
-                        <DetailsBlock index={index}>{(data) => <>{data.mapSuccesses.toLocaleString()}</>}</DetailsBlock>
-                    </tr>
+                    {!isJoin && (
+                        <>
+                            <tr>
+                                <td>Map Attempts</td>
+                                <DetailsBlock index={index}>
+                                    {(data) => <>{data.mapAttempts.toLocaleString()}</>}
+                                </DetailsBlock>
+                            </tr>
+                            <tr>
+                                <td>Map Successes</td>
+                                <DetailsBlock index={index}>
+                                    {(data) => <>{data.mapSuccesses.toLocaleString()}</>}
+                                </DetailsBlock>
+                            </tr>
+                        </>
+                    )}
                     {showMapErrors && (
                         <tr>
                             <td>Map Errors</td>
@@ -279,6 +326,7 @@ export function IndexesDatabaseStats() {
     const globalIndexDetailsStatus = useAppSelector(statisticsViewSelectors.globalIndexDetailsStatus);
     const mapIndexNames = useAppSelector(statisticsViewSelectors.mapIndexNames, shallowEqual);
     const mapReduceIndexNames = useAppSelector(statisticsViewSelectors.mapReduceIndexNames, shallowEqual);
+    const joinIndexNames = useAppSelector(statisticsViewSelectors.joinIndexNames, shallowEqual);
 
     if (globalIndexDetailsStatus === "loading") {
         return (
@@ -292,7 +340,7 @@ export function IndexesDatabaseStats() {
         return <LoadError error="Unable to load index statistics" />;
     }
 
-    const noData = mapIndexNames.length === 0 && mapReduceIndexNames.length === 0;
+    const noData = mapIndexNames.length === 0 && mapReduceIndexNames.length === 0 && joinIndexNames.length === 0;
 
     return (
         <section className="mt-6">
@@ -305,6 +353,17 @@ export function IndexesDatabaseStats() {
                     <h3>Map Indexes</h3>
                     <div>
                         {mapIndexNames.map((index) => (
+                            <IndexStatistics key={index} indexName={index} />
+                        ))}
+                    </div>
+                </Card>
+            )}
+
+            {joinIndexNames.length > 0 && (
+                <Card className="p-4" key="joins">
+                    <h3>Join Indexes</h3>
+                    <div>
+                        {joinIndexNames.map((index) => (
                             <IndexStatistics key={index} indexName={index} />
                         ))}
                     </div>

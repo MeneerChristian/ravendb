@@ -2,6 +2,7 @@ import IndexesService from "components/services/IndexesService";
 import { AutoMockService, MockedValue } from "./AutoMockService";
 import { IndexesStubs } from "../../stubs/IndexesStubs";
 import IndexStats = Raven.Client.Documents.Indexes.IndexStats;
+import IndexDefinition = Raven.Client.Documents.Indexes.IndexDefinition;
 import IndexProgress = Raven.Client.Documents.Indexes.IndexProgress;
 import IndexMergeResults = Raven.Server.Documents.Indexes.IndexMerging.IndexMergeResults;
 import IndexErrors = Raven.Client.Documents.Indexes.IndexErrors;
@@ -26,6 +27,14 @@ export default class MockIndexesService extends AutoMockService<IndexesService> 
             customize(dto, location);
             return dto;
         });
+    }
+
+    withGetDefinitions(dto?: MockedValue<IndexDefinition[]>) {
+        return this.mockResolvedValue(this.mocks.getDefinitions, dto, [IndexesStubs.getJoinIndexDefinition()]);
+    }
+
+    withSaveDefinitions() {
+        return this.mocks.saveDefinitions.mockResolvedValue(undefined);
     }
 
     withGetProgress(dto?: MockedValue<IndexProgress[]>) {

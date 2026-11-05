@@ -72,6 +72,7 @@ const docsHashes: Record<string, StringWithAutocomplete<"MISSING_DOCS">> = {
     "admin/settings/serverWideCustomSorters": "XI6BMT",
     // routs for which the documentation is missing (there may be more)
     "databases/indexes/terms/(:indexName)": "MISSING_DOCS",
+    "databases/indexes/join(/:indexName)": "MISSING_DOCS",
     "databases/indexes/cleanup": "MISSING_DOCS",
     "databases/status/buckets/report": "MISSING_DOCS",
     "databases/indexes/indexErrors": "MISSING_DOCS",

@@ -51,6 +51,75 @@ export class IndexesStubs {
         return [stats, null];
     }
 
+    static getJoinDefinition(): Raven.Client.Documents.Indexes.JoinDefinition {
+        return {
+            OuterIndex: "Orders/ByCompany",
+            OuterCollection: null,
+            OuterField: "Company",
+            InnerIndex: "Companies/ByName",
+            InnerCollection: null,
+            InnerField: null,
+            Fields: [
+                { Field: "Country", Kind: "Exact" },
+                { Field: "Rank", Kind: "Long" },
+                { Field: "Title", Kind: "Text" },
+            ],
+            Groupings: [{ Field: "IsActive", Value: "true" }],
+        };
+    }
+
+    static getJoinStats(type: "Join" | "AutoJoin" = "Join"): IndexStats {
+        const stats = IndexesStubs.getGenericStats();
+        const joinIndex = IndexesStubs.getJoinDefinition();
+
+        stats.Name =
+            type === "Join" ? "Orders/WithCompany" : "Auto/Orders/ByCompany/Join/Companies/ByName/OnCompanyToId";
+        stats.Type = type;
+        stats.Join = {
+            OuterIndex: joinIndex.OuterIndex,
+            InnerIndex: joinIndex.InnerIndex,
+            PendingReason: null,
+            OuterBatches: 12,
+            InnerBatches: 3,
+            Refreshes: 9,
+            NoOpRefreshes: 4,
+            Builds: 2,
+            IdsProcessed: 1500,
+            ListUpdates: 320,
+            LastRefreshBreakdown: "read 1 ms, apply 2 ms",
+            RebuildsByReason: { Initial: 1, OuterIndexReset: 1 },
+            Served: 240,
+            FallbackTotal: 7,
+            Fallbacks: { "KindNotServed:Or": 5, Building: 2 },
+            QueryWaits: 3,
+            QueryWaitTotalInMs: 120,
+            QueryWaitMaxInMs: 60,
+        };
+
+        return stats;
+    }
+
+    static getJoinIndex(type: "Join" | "AutoJoin" = "Join"): [IndexStats, IndexProgress] {
+        return [IndexesStubs.getJoinStats(type), null];
+    }
+
+    static getJoinIndexDefinition(): Raven.Client.Documents.Indexes.IndexDefinition {
+        return {
+            Name: "Orders/WithCompany",
+            Type: "Join",
+            SourceType: "Documents",
+            LockMode: "Unlock",
+            Priority: "Normal",
+            State: "Normal",
+            Maps: [],
+            Fields: {},
+            Configuration: {},
+            AdditionalSources: {},
+            AdditionalAssemblies: [],
+            Join: IndexesStubs.getJoinDefinition(),
+        } as Raven.Client.Documents.Indexes.IndexDefinition;
+    }
+
     static getUpToDateIndex(): [IndexStats, IndexProgress] {
         const stats = IndexesStubs.getGenericStats();
         stats.Name = "UpToDateIndex";
@@ -184,6 +253,7 @@ export class IndexesStubs {
                         OutputReduceToCollection: null,
                         PatternForOutputReduceToCollectionReferences: null,
                         PatternReferencesCollectionName: null,
+                        Join: null,
                         Name: "Product/Search",
                         Reduce: null,
                         Type: "Map",

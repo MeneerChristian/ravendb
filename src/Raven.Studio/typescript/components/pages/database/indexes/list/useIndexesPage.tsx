@@ -530,9 +530,7 @@ export function useIndexesPage(stale: boolean, isImportOpen: boolean) {
 
     const confirmSetLockModeSelectedIndexes = useCallback(
         async (lockMode: IndexLockMode) => {
-            const indexes = getSelectedIndexes().filter(
-                (index) => index.type !== "AutoMap" && index.type !== "AutoMapReduce"
-            );
+            const indexes = getSelectedIndexes().filter((index) => !IndexUtils.isAutoIndex(index));
 
             const defaultActiveKey = indexes.length <= 12 ? ["0"] : [];
 

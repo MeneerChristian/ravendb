@@ -49,6 +49,7 @@ export function IndexesPage({ queryParams }: ReactQueryParamsProps<IndexesPagePr
 
     const { forCurrentDatabase: urls } = useAppUrls();
     const newIndexUrl = urls.newIndex();
+    const newJoinUrl = urls.editJoin()();
 
     const {
         loading,
@@ -231,6 +232,13 @@ export function IndexesPage({ queryParams }: ReactQueryParamsProps<IndexesPagePr
                                             as={CustomDropdownToggle}
                                         />
                                         <Dropdown.Menu>
+                                            <Dropdown.Item
+                                                href={newJoinUrl}
+                                                title="Create a join index that keeps the JOIN of two indexes up to date"
+                                            >
+                                                <Icon icon="link" />
+                                                <span>New join index</span>
+                                            </Dropdown.Item>
                                             <Dropdown.Item
                                                 onClick={toggleIsImportIndexModalOpen}
                                                 title="Import indexes from a file"

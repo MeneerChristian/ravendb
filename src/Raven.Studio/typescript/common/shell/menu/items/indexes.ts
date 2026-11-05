@@ -6,6 +6,7 @@ import IndexesPage = require("components/pages/database/indexes/list/IndexesPage
 import IndexCleanup = require("components/pages/database/indexes/cleanup/IndexCleanup");
 import IndexErrors = require("components/pages/database/indexes/errors/IndexErrors");
 import IndexTerms = require("components/pages/database/indexes/list/terms/IndexTerms");
+import JoinIndexPage = require("components/pages/database/indexes/join/JoinIndexPage");
 
 export = getIndexesMenuItem;
 
@@ -123,6 +124,18 @@ function getIndexesMenuItem(appUrls: computedAppUrls) {
             shardingMode: "allShards",
             route: 'databases/indexes/edit(/:indexName)',
             moduleId: require('viewmodels/database/indexes/editIndex'),
+            css: 'icon-edit',
+            nav: false,
+            itemRouteToHighlight: 'databases/indexes',
+            search: {
+                isExcluded: true
+            }
+        }),
+        new leafMenuItem({
+            title: 'Join Index',
+            shardingMode: "allShards",
+            route: 'databases/indexes/join(/:indexName)',
+            moduleId: reactUtils.bridgeToReact(JoinIndexPage.default, "shardedView"),
             css: 'icon-edit',
             nav: false,
             itemRouteToHighlight: 'databases/indexes',
