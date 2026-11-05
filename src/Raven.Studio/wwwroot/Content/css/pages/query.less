@@ -282,6 +282,26 @@
         }
     }
 
+    // counters reported by a part of the query (for example the statistics of a join)
+    .timing-counters {
+        padding-left: 22px;
+
+        .timing-counter {
+            margin-top: 0;
+
+            .name {
+                display: inline-block;
+                width: 178px;
+            }
+
+            .value {
+                display: inline-block;
+                text-align: right;
+                width: 85px;
+            }
+        }
+    }
+
     &.timings {
 
         svg {
@@ -341,6 +361,8 @@
         .color-def(~'filter', @color-5-1);
         .color-def(~'terms', @color-3-1);
         .color-def(~'aggregateBy', @color-2-2);
+        .color-def(~'join', @color-4-3);
+        .color-def(~'scan', @color-3-3);
     }
 
     .toggle {

@@ -33,6 +33,12 @@
         <small class="name word-break" data-bind="text: name"></small>
         <small class="duration" data-bind="text: duration.toLocaleString() + ' ms'"></small>
     </div>
+    <div class="timing-counters" data-bind="foreach: counters">
+        <div class="timing-counter d-flex align-items-start lh-base">
+            <small class="name word-break text-muted" data-bind="text: name"></small>
+            <small class="value" data-bind="text: value"></small>
+        </div>
+    </div>
     <div data-bind="foreach: children">
         <div class="legend-item" data-bind="template: { name: 'timing-item-template' }, visible: visible">
         </div>

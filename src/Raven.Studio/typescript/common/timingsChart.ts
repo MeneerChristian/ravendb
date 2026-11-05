@@ -2,11 +2,13 @@
 
 import d3 = require("d3");
 import typeUtils = require("common/typeUtils");
+import timingCounters = require("common/timingCounters");
 
 interface graphNode extends d3.layout.partition.Node {
     name: string;
     duration: number;
     visible: boolean;
+    counters: timingCounters.TimingCounter[];
 } 
 
 class timingsChart {
@@ -178,7 +180,8 @@ class timingsChart {
                     name: timingsChart.fakeFill,
                     duration: remainingTime,
                     children: null as any,
-                    visible: false
+                    visible: false,
+                    counters: []
                 });
             }
         }
@@ -187,7 +190,8 @@ class timingsChart {
             name: name,
             duration: data.DurationInMs,
             children: children as any,
-            visible: true
+            visible: true,
+            counters: timingCounters.formatTimingCounters(data.Counters)
         }
     }
     

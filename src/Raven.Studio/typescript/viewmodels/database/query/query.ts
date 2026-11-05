@@ -29,6 +29,7 @@ import actionColumn = require("widgets/virtualGrid/columns/actionColumn");
 import explainQueryDialog = require("viewmodels/database/query/explainQueryDialog");
 import explainQueryCommand = require("commands/database/index/explainQueryCommand");
 import timingsChart = require("common/timingsChart");
+import timingCounters = require("common/timingCounters");
 import generalUtils = require("common/generalUtils");
 import timeSeriesColumn = require("widgets/virtualGrid/columns/timeSeriesColumn");
 import timeSeriesPlotDetails = require("viewmodels/common/timeSeriesPlotDetails");
@@ -246,6 +247,7 @@ class query extends shardViewModelBase {
     timings = ko.observable<Raven.Client.Documents.Queries.Timings.QueryTimings>();
     
     queryPlan = ko.observable<Raven.Client.Documents.Queries.Timings.QueryInspectionNode>();
+    joinSummaries = ko.pureComputed(() => timingCounters.summarizeJoinTimings(this.timings()));
 
     canDeleteDocumentsMatchingQuery: KnockoutComputed<boolean>;
     deleteDocumentDisableReason: KnockoutComputed<string>;

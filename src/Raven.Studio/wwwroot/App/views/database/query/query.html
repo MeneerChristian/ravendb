@@ -139,6 +139,11 @@
                                 . Showing <strong>stored index fields</strong> only.
                             </span>
                             <span data-bind="visible: queriedIndexEntries">. Showing <strong>raw index entries</strong>.</span>
+                            <!-- ko foreach: joinSummaries -->
+                            <span class="margin-left-sm" data-bind="attr: { title: text }">
+                                <i class="icon-link"></i><span data-bind="text: served ? ' Join index served ' + alias : ' Join index not used for ' + alias"></span>
+                            </span>
+                            <!-- /ko -->
                         </span>
                     </small>
                     <small data-bind="visible: queryStats()">
@@ -228,6 +233,11 @@
                         <label for="log-scale" class="properties-label" title="Use logarithmic scale">
                             Use logarithmic scale
                         </label>
+                    </div>
+                    <div class="join-summaries" data-bind="foreach: joinSummaries">
+                        <div class="padding padding-sm" data-bind="css: served ? 'bg-success' : 'bg-info'">
+                            <i class="icon-link"></i> <span data-bind="text: text"></span>
+                        </div>
                     </div>
                     <div class="from-cache bg-info padding padding-sm" data-bind="visible: $root.fromCache">
                         <i class="icon-info"></i> <span>Using cached timinigs</span>
@@ -328,6 +338,12 @@
         <i data-bind="attr: { 'class': 'item-rect ' + $root.timingsGraph.getColorClass(name) }"></i>
         <small class="name word-break" data-bind="text: name"></small>
         <small class="duration" data-bind="text: duration.toLocaleString() + ' ms'"></small>
+    </div>
+    <div class="timing-counters" data-bind="foreach: counters">
+        <div class="timing-counter d-flex align-items-start lh-base">
+            <small class="name word-break text-muted" data-bind="text: name"></small>
+            <small class="value" data-bind="text: value"></small>
+        </div>
     </div>
     <div data-bind="foreach: children">
         <div class="legend-item" data-bind="template: { name: 'timing-item-template' }, visible: visible">
