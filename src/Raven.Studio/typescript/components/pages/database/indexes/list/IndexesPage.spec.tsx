@@ -1,5 +1,6 @@
 import { rtlRender } from "test/rtlTestUtils";
 import React from "react";
+import { within } from "@testing-library/react";
 import { composeStories } from "@storybook/react-webpack5";
 
 import * as stories from "./IndexesPage.stories";
@@ -11,6 +12,7 @@ const {
     FaultyIndexSingleNode,
     LicenseLimits: CommunityLimits,
     JoinIndexes,
+    JoinIndexStates,
 } = composeStories(stories);
 
 describe("IndexesPage", function () {
@@ -54,6 +56,75 @@ describe("IndexesPage", function () {
 
         // an auto index has no lock mode
         expect(screen.getAllByText("Locked (Error)")).toHaveLength(1);
+    });
+
+    describe("join index rows", () => {
+        async function findRow(screen: ReturnType<typeof rtlRender>["screen"], name: string) {
+            const title = await screen.findByText(name);
+            return title.closest(".rich-panel-item") as HTMLElement;
+        }
+
+        it("shows the state of a join index that is ready, and says nothing about a reason", async () => {
+            const { screen } = rtlRender(<JoinIndexStates />);
+
+            const row = await findRow(screen, "Joins/Ready");
+            expect(within(row).getByTestId("join-list-state")).toHaveTextContent("Ready");
+            expect(within(row).queryByTestId("join-list-reason")).not.toBeInTheDocument();
+        });
+
+        it("shows the refusal reason of a join index that went to the error state", async () => {
+            const { screen } = rtlRender(<JoinIndexStates />);
+
+            const row = await findRow(screen, "Joins/Refused");
+            expect(within(row).getByTestId("join-list-state")).toHaveTextContent("Refused");
+            expect(within(row).getByTestId("join-list-reason")).toHaveTextContent(
+                "The join index is in the error state: The outer index 'Orders/ByCompany' has a definition a join index cannot read"
+            );
+        });
+
+        it("shows the pending reason of a join index that waits for an index it joins", async () => {
+            const { screen } = rtlRender(<JoinIndexStates />);
+
+            const row = await findRow(screen, "Joins/Pending");
+            expect(within(row).getByTestId("join-list-state")).toHaveTextContent("Pending");
+            expect(within(row).getByTestId("join-list-reason")).toHaveTextContent(
+                "The join index waits: The inner index 'Companies/ByName' is disabled"
+            );
+        });
+
+        it("shows that the lists of a join index are being built when no generation is published", async () => {
+            const { screen } = rtlRender(<JoinIndexStates />);
+
+            const row = await findRow(screen, "Joins/Building");
+            expect(within(row).getByTestId("join-list-state")).toHaveTextContent("Building");
+        });
+
+        it("shows that the published generation is partial", async () => {
+            const { screen } = rtlRender(<JoinIndexStates />);
+
+            const row = await findRow(screen, "Joins/Partial");
+            expect(within(row).getByTestId("join-list-state")).toHaveTextContent("Partial");
+        });
+
+        it("shows the storage mode of the definition of each join index", async () => {
+            const { screen } = rtlRender(<JoinIndexStates />);
+
+            const ready = await findRow(screen, "Joins/Ready");
+            const refused = await findRow(screen, "Joins/Refused");
+            const pending = await findRow(screen, "Joins/Pending");
+
+            expect(await within(ready).findByTestId("join-list-storage-mode")).toHaveTextContent("Auto");
+            expect(await within(refused).findByTestId("join-list-storage-mode")).toHaveTextContent("Expanded");
+            expect(await within(pending).findByTestId("join-list-storage-mode")).toHaveTextContent("Indirect");
+        });
+
+        it("shows no join index details on a row of another index type", async () => {
+            const { screen } = rtlRender(<SampleDataCluster />);
+
+            const row = await findRow(screen, "Orders/ByCompany");
+            expect(within(row).queryByTestId("join-list-state")).not.toBeInTheDocument();
+            expect(within(row).queryByTestId("join-list-storage-mode")).not.toBeInTheDocument();
+        });
     });
 
     it("can show search engine - corax", async () => {

@@ -1,3 +1,5 @@
+import { IndexNodeJoinInfo, IndexSharedInfo } from "components/models/indexes";
+import IndexState = Raven.Client.Documents.Indexes.IndexState;
 import IndexDefinition = Raven.Client.Documents.Indexes.IndexDefinition;
 import JoinDefinition = Raven.Client.Documents.Indexes.JoinDefinition;
 import JoinFieldKind = Raven.Client.Documents.Indexes.JoinFieldKind;
@@ -185,4 +187,53 @@ function formatKindDetail(detail: string): string {
         default:
             return detail;
     }
+}
+
+export type JoinListState = "refused" | "pending" | "disabled" | "building" | "partial" | "ready";
+
+export interface JoinListStatus {
+    state: JoinListState;
+    // the refusal or the pending reason of the node that is in the worst state; null when it has none
+    reason: string | null;
+}
+
+// the worst state first: that is the one a user has to act on
+const joinListStateOrder: JoinListState[] = ["refused", "pending", "disabled", "building", "partial", "ready"];
+
+export function getJoinListStatus(index: IndexSharedInfo): JoinListStatus | null {
+    let worst: JoinListStatus = null;
+
+    for (const node of index.nodesInfo) {
+        const details = node.details;
+        if (!details?.joinIndex) {
+            continue;
+        }
+
+        const status = getJoinNodeStatus(details.joinIndex, details.state);
+        if (!worst || joinListStateOrder.indexOf(status.state) < joinListStateOrder.indexOf(worst.state)) {
+            worst = status;
+        }
+    }
+
+    return worst;
+}
+
+function getJoinNodeStatus(joinIndex: IndexNodeJoinInfo, indexState: IndexState): JoinListStatus {
+    if (joinIndex.refusedReason) {
+        return { state: "refused", reason: joinIndex.refusedReason };
+    }
+    if (joinIndex.pendingReason) {
+        return { state: "pending", reason: joinIndex.pendingReason };
+    }
+    if (indexState === "Disabled") {
+        return { state: "disabled", reason: null };
+    }
+    if (joinIndex.generation <= 0) {
+        return { state: "building", reason: null };
+    }
+    if (joinIndex.isPartial) {
+        return { state: "partial", reason: null };
+    }
+
+    return { state: "ready", reason: null };
 }

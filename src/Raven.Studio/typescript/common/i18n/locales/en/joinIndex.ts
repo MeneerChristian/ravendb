@@ -68,6 +68,27 @@ export default {
         notAvailable:
             "The join index '{{name}}' has no terms: it answers JOINs of the indexes it joins and its entries are not queried directly.",
     },
+    list: {
+        state: "State",
+        states: {
+            refused: "Refused",
+            pending: "Pending",
+            disabled: "Disabled",
+            building: "Building",
+            partial: "Partial",
+            ready: "Ready",
+        },
+        refused: "The join index is in the error state: {{reason}}",
+        pending: "The join index waits: {{reason}}",
+        storageMode: "Storage",
+        storageModeHelp:
+            "How the lists of the join index hold what a sub-query matches. Auto leaves the choice between Expanded and Indirect to the server; the server does not report which one it chose",
+        storageModes: {
+            Auto: "Auto",
+            Expanded: "Expanded",
+            Indirect: "Indirect",
+        },
+    },
     stats: {
         header: "Join index statistics",
         unavailable: "Statistics are not available",

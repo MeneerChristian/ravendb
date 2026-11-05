@@ -5,7 +5,16 @@ import { waitFor } from "@testing-library/react";
 import { mockServices } from "test/mocks/services/MockServices";
 import * as stories from "./JoinIndexPage.stories";
 
-const { StaticJoin, IndirectJoin, AutoJoin, NewJoin, PartialJoin, NotBuiltJoin, MissingJoin, ShardedDatabase } = composeStories(stories);
+const {
+    StaticJoin,
+    IndirectJoin,
+    AutoJoin,
+    NewJoin,
+    PartialJoin,
+    NotBuiltJoin,
+    MissingJoin,
+    ShardedDatabase,
+} = composeStories(stories);
 
 describe("JoinIndexPage", () => {
     it("shows the definition of a static join index", async () => {

@@ -5,9 +5,32 @@ import {
     joinDefinitionFromForm,
     joinFormFromDefinition,
     joinOuterIdKey,
+    getJoinListStatus,
     utf8ByteLength,
 } from "./joinUtils";
 import { IndexesStubs } from "test/stubs/IndexesStubs";
+import { IndexNodeJoinInfo, IndexSharedInfo } from "components/models/indexes";
+
+function joinIndex(
+    ...nodes: { joinIndex?: Partial<IndexNodeJoinInfo>; state?: "Normal" | "Disabled" }[]
+): IndexSharedInfo {
+    return {
+        nodesInfo: nodes.map((node) => ({
+            details: {
+                state: node.state ?? "Normal",
+                joinIndex: node.joinIndex
+                    ? ({
+                          pendingReason: null,
+                          refusedReason: null,
+                          generation: 3,
+                          isPartial: false,
+                          ...node.joinIndex,
+                      } as IndexNodeJoinInfo)
+                    : undefined,
+            },
+        })),
+    } as IndexSharedInfo;
+}
 
 describe("joinUtils", () => {
     it("round-trips a definition through the form", () => {
@@ -101,6 +124,51 @@ describe("joinUtils", () => {
         it("shows a reason that it does not know as it is", () => {
             expect(formatJoinFallbackReason("SomethingNew")).toBe("SomethingNew");
             expect(formatJoinFallbackReason("KindNotServed:Brand")).toContain("Brand");
+        });
+    });
+
+    describe("getJoinListStatus", () => {
+        it("is ready when a generation is published and nothing is wrong", () => {
+            expect(getJoinListStatus(joinIndex({ joinIndex: {} }))).toEqual({ state: "ready", reason: null });
+        });
+
+        it("is building until a generation is published", () => {
+            expect(getJoinListStatus(joinIndex({ joinIndex: { generation: 0 } }))?.state).toBe("building");
+        });
+
+        it("is partial when the published generation is partial", () => {
+            expect(getJoinListStatus(joinIndex({ joinIndex: { isPartial: true } }))?.state).toBe("partial");
+        });
+
+        it("carries the pending and the refusal reason", () => {
+            expect(getJoinListStatus(joinIndex({ joinIndex: { pendingReason: "waits" } }))).toEqual({
+                state: "pending",
+                reason: "waits",
+            });
+            expect(getJoinListStatus(joinIndex({ joinIndex: { refusedReason: "refused" } }))).toEqual({
+                state: "refused",
+                reason: "refused",
+            });
+        });
+
+        it("reports the refusal before the pending reason", () => {
+            expect(
+                getJoinListStatus(joinIndex({ joinIndex: { refusedReason: "refused", pendingReason: "waits" } }))
+            ).toEqual({ state: "refused", reason: "refused" });
+        });
+
+        it("is disabled when the index is disabled and has no reason", () => {
+            expect(getJoinListStatus(joinIndex({ state: "Disabled", joinIndex: {} }))?.state).toBe("disabled");
+        });
+
+        it("reports the worst state of the nodes", () => {
+            const index = joinIndex({ joinIndex: {} }, { joinIndex: { generation: 0 } }, { joinIndex: { isPartial: true } });
+            expect(getJoinListStatus(index)?.state).toBe("building");
+        });
+
+        it("is null for a node without statistics and for an index that is not a join index", () => {
+            expect(getJoinListStatus(joinIndex({}))).toBeNull();
+            expect(getJoinListStatus(joinIndex())).toBeNull();
         });
     });
 });

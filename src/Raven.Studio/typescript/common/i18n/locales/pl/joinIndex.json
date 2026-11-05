@@ -65,6 +65,26 @@
     "terms": {
         "notAvailable": "Indeks łączący '{{name}}' nie ma terminów: obsługuje JOIN-y indeksów, które łączy, a jego wpisy nie są odpytywane bezpośrednio."
     },
+    "list": {
+        "state": "Stan",
+        "states": {
+            "refused": "Odrzucony",
+            "pending": "Oczekuje",
+            "disabled": "Wyłączony",
+            "building": "W budowie",
+            "partial": "Częściowy",
+            "ready": "Gotowy"
+        },
+        "refused": "Indeks łączący jest w stanie błędu: {{reason}}",
+        "pending": "Indeks łączący czeka: {{reason}}",
+        "storageMode": "Przechowywanie",
+        "storageModeHelp": "Sposób, w jaki listy przechowują to, co pasuje do podzapytania. Auto zostawia serwerowi wybór między Expanded i Indirect; serwer nie podaje, który wybrał",
+        "storageModes": {
+            "Auto": "Auto",
+            "Expanded": "Expanded",
+            "Indirect": "Indirect"
+        }
+    },
     "stats": {
         "header": "Statystyki indeksu łączącego",
         "unavailable": "Statystyki są niedostępne",

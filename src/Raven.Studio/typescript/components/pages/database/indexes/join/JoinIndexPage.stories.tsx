@@ -11,7 +11,9 @@ export default {
     decorators: [withStorybookContexts, withBootstrap5],
 } satisfies Meta;
 
-function init(options: { auto?: boolean; sharded?: boolean; indirect?: boolean; partial?: boolean; notBuilt?: boolean } = {}) {
+function init(
+    options: { auto?: boolean; sharded?: boolean; indirect?: boolean; partial?: boolean; notBuilt?: boolean } = {}
+) {
     const { databases } = mockStore;
     const { indexesService } = mockServices;
 

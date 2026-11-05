@@ -140,6 +140,14 @@ function mapToIndexNodeInfo(stats: IndexStats, location: databaseLocationSpecifi
             faulty: stats.Type === "Faulty",
             lastIndexingTime: stats.LastIndexingTime ? new Date(stats.LastIndexingTime) : null,
             lastQueryingTime: stats.LastQueryingTime ? new Date(stats.LastQueryingTime) : null,
+            joinIndex: stats.Join
+                ? {
+                      pendingReason: stats.Join.PendingReason ?? null,
+                      refusedReason: stats.Join.RefusedReason ?? null,
+                      generation: stats.Join.Generation,
+                      isPartial: stats.Join.IsPartial,
+                  }
+                : undefined,
         },
         progress: null,
         createdTimestamp: genUtils.isServerMinDate(stats.CreatedTimestamp) ? null : new Date(stats.CreatedTimestamp),

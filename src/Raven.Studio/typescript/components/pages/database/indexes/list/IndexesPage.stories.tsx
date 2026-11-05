@@ -132,6 +132,53 @@ export const JoinIndexes: StoryFn = () => {
     return <IndexesPage />;
 };
 
+export const JoinIndexStates: StoryFn = () => {
+    commonInit("singleNode");
+
+    const { indexesService } = mockServices;
+
+    const variants: {
+        name: string;
+        mode: Raven.Client.Documents.Indexes.JoinStorageMode;
+        customize?: (joinIndex: Raven.Client.Documents.Indexes.JoinIndexStats) => void;
+    }[] = [
+        { name: "Joins/Ready", mode: "Auto" },
+        {
+            name: "Joins/Refused",
+            mode: "Expanded",
+            customize: (x) =>
+                (x.RefusedReason = "The outer index 'Orders/ByCompany' has a definition a join index cannot read"),
+        },
+        {
+            name: "Joins/Pending",
+            mode: "Indirect",
+            customize: (x) => (x.PendingReason = "The inner index 'Companies/ByName' is disabled"),
+        },
+        { name: "Joins/Building", mode: "Auto", customize: (x) => (x.Generation = 0) },
+        { name: "Joins/Partial", mode: "Expanded", customize: (x) => (x.IsPartial = true) },
+    ];
+
+    const stats = variants.map((variant) => {
+        const joinStats = IndexesStubs.getJoinStats("Join");
+        joinStats.Name = variant.name;
+        variant.customize?.(joinStats.Join);
+        return joinStats;
+    });
+    const definitions = variants.map((variant) => {
+        const definition = IndexesStubs.getJoinIndexDefinition();
+        definition.Name = variant.name;
+        // the server does not send the storage mode of a join index when it is Auto
+        definition.Join.StorageMode = variant.mode === "Auto" ? undefined : variant.mode;
+        return definition;
+    });
+
+    indexesService.withGetStats(stats);
+    indexesService.withGetProgress([]);
+    indexesService.withGetDefinitions(definitions);
+
+    return <IndexesPage />;
+};
+
 export const SampleDataSingleNode: StoryFn = () => {
     commonInit("singleNode");
     configureIndexService();

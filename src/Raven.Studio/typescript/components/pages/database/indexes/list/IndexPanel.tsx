@@ -7,6 +7,7 @@ import { useEventsCollector } from "hooks/useEventsCollector";
 import indexStalenessReasons from "viewmodels/database/indexes/indexStalenessReasons";
 import app from "durandal/app";
 import { IndexDistribution, JoinedIndexProgress } from "./IndexDistribution";
+import { JoinListDetails, JoinListReason } from "./JoinListDetails";
 import {
     RichPanel,
     RichPanelActions,
@@ -485,6 +486,7 @@ export function IndexPanelInternal(props: IndexPanelProps, ref: ForwardedRef<HTM
                         <Icon icon="search" />
                         {index.searchEngine}
                     </RichPanelDetailItem>
+                    {IndexUtils.isJoinIndex(index) && <JoinListDetails index={index} />}
 
                     {!isAnyFaulty && (
                         <InlineDetails
@@ -494,6 +496,7 @@ export function IndexPanelInternal(props: IndexPanelProps, ref: ForwardedRef<HTM
                         />
                     )}
                 </RichPanelDetails>
+                {IndexUtils.isJoinIndex(index) && <JoinListReason index={index} />}
                 <div className="px-3 pb-2">
                     <Collapse in={!panelCollapsed}>
                         <div>

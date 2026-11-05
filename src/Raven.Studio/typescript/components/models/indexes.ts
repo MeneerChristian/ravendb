@@ -50,6 +50,13 @@ export interface IndexingProgress extends Progress {
     processedPerSecond: number;
 }
 
+export interface IndexNodeJoinInfo {
+    pendingReason: string | null;
+    refusedReason: string | null;
+    generation: number;
+    isPartial: boolean;
+}
+
 export interface IndexNodeInfoDetails {
     errorCount: number;
     entriesCount: number;
@@ -59,6 +66,8 @@ export interface IndexNodeInfoDetails {
     faulty: boolean;
     lastIndexingTime: Date;
     lastQueryingTime: Date;
+    // only the nodes of a join index have it
+    joinIndex?: IndexNodeJoinInfo;
 }
 
 export type IndexGroupBy = "Collection" | "None";
