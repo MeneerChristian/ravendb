@@ -147,11 +147,33 @@ public class JoinIndirectDiagBenchmark(ITestOutputHelper output) : RavenTestBase
         throw new TimeoutException("the indexes stayed busy");
     }
 
+    private static long CgroupWriteBytes()
+    {
+        try
+        {
+            long sum = 0;
+            foreach (string line in File.ReadLines("/sys/fs/cgroup/io.stat"))
+            {
+                foreach (string part in line.Split(' '))
+                {
+                    if (part.StartsWith("wbytes=", StringComparison.Ordinal))
+                        sum += long.Parse(part.AsSpan(7));
+                }
+            }
+
+            return sum;
+        }
+        catch
+        {
+            return -1;
+        }
+    }
+
     private static double Mb(long bytes) => bytes / 1048576.0;
 
     private static double Ms(long ticks) => ticks * 1000.0 / Stopwatch.Frequency;
 
-    private static string ResidentText(JoinResident resident)
+    internal static string ResidentText(JoinResident resident)
     {
         if (resident == null)
             return "residentMB=n/a";
@@ -174,6 +196,7 @@ public class JoinIndirectDiagBenchmark(ITestOutputHelper output) : RavenTestBase
         long establishes = resident?.Establishes ?? 0, applied = resident?.PatchesApplied ?? 0, tooLarge = resident?.PatchTooLarge ?? 0, warmUps = resident?.WarmUps ?? 0;
         using var sampler = new NativeSampler();
         using var refreshSampler = new RefreshAllocSampler(j);
+        long ioBefore = CgroupWriteBytes();
         var watch = Stopwatch.StartNew();
         await write();
         double storeMs = watch.Elapsed.TotalMilliseconds;
@@ -181,7 +204,8 @@ public class JoinIndirectDiagBenchmark(ITestOutputHelper output) : RavenTestBase
         double wallMs = watch.Elapsed.TotalMilliseconds - 1000;
         sampler.Dispose();
         refreshSampler.Dispose();
-        Report($"[{shape}] cell {cell} n={n} warm={warm}: storeMs={storeMs:F0} wallMs~={wallMs:F0} joinBusyMs={Ms(j.Counters.TotalRefreshTicks - refreshTicks):F0} refreshes={j.Counters.Refreshes - refreshes} noOps={j.Counters.NoOps - noOps} partial={j.Counters.PartialRefreshes - partial} " +
+        double ioMb = ioBefore < 0 ? -1 : Mb(CgroupWriteBytes() - ioBefore);
+        Report($"[{shape}] cell {cell} n={n} warm={warm}: cgroupWriteMB={ioMb:F1} storeMs={storeMs:F0} wallMs~={wallMs:F0} joinBusyMs={Ms(j.Counters.TotalRefreshTicks - refreshTicks):F0} refreshes={j.Counters.Refreshes - refreshes} noOps={j.Counters.NoOps - noOps} partial={j.Counters.PartialRefreshes - partial} " +
                $"refreshAllocMB={Mb(j.Counters.RefreshAllocatedBytes - refreshAlloc):F1} refreshAllocSampledMB={Mb(refreshSampler.Sum):F1} processAllocMB={Mb(GC.GetTotalAllocatedBytes(true) - gcAlloc):F1} gc0={GC.CollectionCount(0) - gc0} gc2={GC.CollectionCount(2) - gc2} nativePeakAboveStartMB={Mb(sampler.Peak - sampler.Start):F1} nativePeakThreads={sampler.PeakThreads} " +
                $"queuedOps={j.Counters.QueuedOps - queued} listUpdates={j.Counters.ListUpdates - listUpdates} flushes={j.Counters.Flushes - flushes} keyListChanges={j.Counters.KeyListChanges - keyListChanges} " +
                $"keyLookups={j.Counters.KeyLookups - keyLookups} keyAtomUpdates={j.Counters.KeyAtomUpdates - keyAtomUpdates} outerKeyReads={j.Counters.OuterKeyReads - outerKeyReads} commits={j.Counters.Commits - commits} {ResidentText(resident)} " +
@@ -253,7 +277,7 @@ public class JoinIndirectDiagBenchmark(ITestOutputHelper output) : RavenTestBase
             Join = new JoinDefinition
             {
                 OuterIndex = JoinIndexHarness.OuterName, OuterField = "ContextId", InnerIndex = JoinIndexHarness.InnerName,
-                StorageMode = arm == "Expanded" ? JoinStorageMode.Expanded : JoinStorageMode.Indirect
+                StorageMode = arm == "Expanded" ? JoinStorageMode.Expanded : arm == "Auto" ? JoinStorageMode.Auto : JoinStorageMode.Indirect
             }.AddField("Country").AddField("Name").AddGrouping("IsActive", "true")
         };
 
@@ -262,6 +286,8 @@ public class JoinIndirectDiagBenchmark(ITestOutputHelper output) : RavenTestBase
         await h.PutJoinAsync(definition);
         await WaitQuietAsync(h);
         JoinIndex joinIndex = h.Join(Join);
+        var joinStats = h.Store.Maintenance.Send(new GetIndexStatisticsOperation(Join)).Join;
+        Report($"[{shape}] join index stats: StorageMode={joinStats?.StorageMode} ResolvedStorageMode={joinStats?.ResolvedStorageMode} AutoModeReason={joinStats?.AutoModeReason}");
         if (arm == "Off")
             joinIndex.UseResidentCache(null);
 
@@ -419,7 +445,7 @@ public class JoinIndirectDiagBenchmark(ITestOutputHelper output) : RavenTestBase
                 int queries = int.Parse(Environment.GetEnvironmentVariable("RAVEN_JOIN_DIAG_QUERIES") ?? "30");
                 foreach ((string name, string country) in new[] { ("pct1", "t5"), ("onekey", hubCountry) })
                 {
-                    for (int round = 0; round <= reps; round++)
+                    for (int round = 0; round <= (int.TryParse(Environment.GetEnvironmentVariable("RAVEN_JOIN_DIAG_QROUNDS"), out int qr) ? qr : reps); round++)
                     {
                         foreach (bool fallback in new[] { false, true })
                         {
@@ -431,6 +457,7 @@ public class JoinIndirectDiagBenchmark(ITestOutputHelper output) : RavenTestBase
                                     oracle.Run(rql);
 
                                 long servedBefore = oracle.Info.Served;
+                                var cacheBefore = h.Join(Join).Resident?.Cache.GetStats();
                                 long alloc = GC.GetTotalAllocatedBytes(true);
                                 long total = 0;
                                 var samples = new List<double>();
@@ -442,7 +469,8 @@ public class JoinIndirectDiagBenchmark(ITestOutputHelper output) : RavenTestBase
                                 }
 
                                 double[] sorted = samples.OrderBy(x => x).ToArray();
-                                Report($"[{shape}] query {name} country={country} mode={(fallback ? "rql-join" : "join")} round={round} warm={round == 0} n={queries} total={total} served={oracle.Info.Served - servedBefore} medMs={sorted[sorted.Length / 2]:F3} minMs={sorted[0]:F3} maxMs={sorted[^1]:F3} allocKBperQuery={(GC.GetTotalAllocatedBytes(true) - alloc) / 1024.0 / queries:F1}");
+                                var cacheAfter = h.Join(Join).Resident?.Cache.GetStats();
+                                Report($"[{shape}] query {name} country={country} mode={(fallback ? "rql-join" : "join")} round={round} warm={round == 0} n={queries} hitsPerQuery={(cacheAfter == null ? 0 : (cacheAfter.Value.Hits - cacheBefore.Value.Hits) / (double)queries):F1} missesPerQuery={(cacheAfter == null ? 0 : (cacheAfter.Value.Misses - cacheBefore.Value.Misses) / (double)queries):F1} total={total} served={oracle.Info.Served - servedBefore} medMs={sorted[sorted.Length / 2]:F3} minMs={sorted[0]:F3} maxMs={sorted[^1]:F3} allocKBperQuery={(GC.GetTotalAllocatedBytes(true) - alloc) / 1024.0 / queries:F1}");
                             }
                             finally
                             {
