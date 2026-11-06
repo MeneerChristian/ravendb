@@ -8,14 +8,23 @@ using FastTests.Server.Documents.Indexing.Joins.Query;
 using FastTests.Server.Documents.Indexing.Joins.Refresh;
 using Raven.Client.Documents.Indexes;
 using Raven.Client.Documents.Operations.Indexes;
+using Raven.Client.Exceptions;
 using Raven.Client.Exceptions.Documents.Indexes;
 using Raven.Client.ServerWide.Operations;
 using Raven.Server.Config;
 using Raven.Server.Documents.Indexes.Joins;
+using Raven.Server.Documents.Indexes.Joins.Auto;
+using Raven.Server.Documents.Indexes.Joins.Refresh;
 using Raven.Server.Documents.Indexes.Joins.Serving.Resident;
+using Sparrow;
 using Xunit;
 
 namespace FastTests.Server.Documents.Indexing.Joins.Fuzz;
+
+/// <summary>A fuzz class whose join indexes have the storage mode Auto: the mode is decided by the rows per key of the outer entries when the file is built (Join.IndirectEnabled is on).</summary>
+public interface IAutoModeTest
+{
+}
 
 /// <summary>The first thing that differed: the round of the plan, the phase and what was seen.</summary>
 internal sealed record FuzzFailure(int Round, string Phase, string Message);
@@ -32,6 +41,20 @@ internal sealed class JoinFuzzRunner(RavenTestBase test, ITestOutputHelper outpu
     public long ResidentListsChecked { get; private set; }
 
     public string Summary { get; private set; } = "";
+
+    private static readonly object SummaryGate = new();
+
+    private int _seed;
+
+    private bool _dense;
+
+    private readonly Dictionary<JoinStorageMode, int> _resolved = [];
+
+    private readonly SortedSet<int> _rowsPerKey = [];
+
+    private bool IsAuto => test is IAutoModeTest && _shapeIsAuto;
+
+    private bool _shapeIsAuto;
 
     private JoinStorageMode ExpectedMode(FuzzShape shape) => test is IIndirectModeTest && shape != FuzzShape.OuterId ? JoinStorageMode.Indirect : JoinStorageMode.Expanded;
 
@@ -56,6 +79,16 @@ internal sealed class JoinFuzzRunner(RavenTestBase test, ITestOutputHelper outpu
             [RavenConfiguration.GetKey(x => x.Join.MaxInnerListChangesPerOuterEntry)] = s.MaxInnerListChanges.ToString(),
             [RavenConfiguration.GetKey(x => x.Join.MinAtomEntriesForDirectWrite)] = s.MinAtomEntriesForDirectWrite.ToString()
         };
+        _shapeIsAuto = s.Shape != FuzzShape.OuterId;
+        _seed = s.Seed;
+        _dense = s.Dense;
+        _resolved.Clear();
+        _rowsPerKey.Clear();
+        if (IsAuto)
+        {
+            settings[RavenConfiguration.GetKey(x => x.Join.IndirectEnabled)] = true.ToString();
+            settings[RavenConfiguration.GetKey(x => x.Join.AutoMinimumAvailableMemory)] = "100";
+        }
 
         using JoinIndexHarness h = await JoinIndexHarness.CreateAsync(test, settings, putJoin: false, runInMemory: s.Persistent == false, indexes: IndexesOf(s));
         IndexDefinition definition = s.Shape switch
@@ -65,16 +98,29 @@ internal sealed class JoinFuzzRunner(RavenTestBase test, ITestOutputHelper outpu
             FuzzShape.OuterId => JoinIndexHarness.FieldJoinIndexDefinition(outerId: true),
             _ => throw new ArgumentOutOfRangeException()
         };
-        definition.Join.StorageMode = ExpectedMode(s.Shape);
-        await h.PutJoinAsync(definition);
-        ApplyResident(h, s);
-        Assert.Equal(ExpectedMode(s.Shape), h.Join().Plan.BuildMode);
+        if (IsAuto)
+            SetAutoInputs(h);
+        else
+        {
+            definition.Join.StorageMode = ExpectedMode(s.Shape);
+            await h.PutJoinAsync(definition);
+            ApplyResident(h, s);
+            Assert.Equal(ExpectedMode(s.Shape), h.Join().Plan.BuildMode);
+        }
 
         var oracle = new JoinIndexQueryOracle(h);
         for (int r = 0; r < plan.Rounds.Count; r++)
         {
             FuzzRound round = plan.Rounds[r];
-            FuzzFailure failure = await WriteAsync(h, s, round, r) ?? await StaleQueriesAsync(oracle, s, round, r) ?? await CheckAsync(h, oracle, s, round, r);
+            FuzzFailure failure = await WriteAsync(h, s, round, r);
+            if (failure == null && IsAuto && r == 0)
+            {
+                // the first build sees the data of the preload, so that the rule has rows to count
+                definition.Join.StorageMode = Enum.TryParse(Environment.GetEnvironmentVariable("RAVEN_JOIN_FUZZ_AUTO_FORCE"), out JoinStorageMode forced) ? forced : JoinStorageMode.Auto;
+                await h.PutJoinAsync(definition);
+            }
+
+            failure ??= await StaleQueriesAsync(oracle, s, round, r) ?? await CheckAsync(h, oracle, s, round, r);
             if (failure != null)
                 return failure;
         }
@@ -161,6 +207,9 @@ internal sealed class JoinFuzzRunner(RavenTestBase test, ITestOutputHelper outpu
                 await h.Store.Maintenance.Server.SendAsync(new ToggleDatabasesStateOperation(h.Store.Database, disable: true));
                 await h.Store.Maintenance.Server.SendAsync(new ToggleDatabasesStateOperation(h.Store.Database, disable: false));
                 await h.AttachAsync();
+                if (IsAuto)
+                    SetAutoInputs(h);
+
                 ApplyResident(h, s);
                 break;
             case FuzzAdminKind.PauseJoin:
@@ -192,7 +241,34 @@ internal sealed class JoinFuzzRunner(RavenTestBase test, ITestOutputHelper outpu
         }
     }
 
-    /// <summary>A join index that a refresh found too costly to refresh is made again by the server (deleted and created): for a moment it does not exist.</summary>
+    /// <summary>What the server tells the choice of the mode, so that the mode depends on the rows per key only and not on the memory of the machine or on the caches of other tests of the process.</summary>
+    private static void SetAutoInputs(JoinIndexHarness h)
+    {
+        AutoJoinManager hooks = h.Database.IndexStore.AutoJoins;
+        hooks.AvailableMemoryForTesting = () => new Size(64L << 30, SizeUnit.Bytes);
+        hooks.ResidentInputsForTesting = () => new JoinOptions.ResidentInputs(1L << 30, false);
+    }
+
+    /// <summary>The mode that the build resolved must be the one of the rule for the rows per key that it counted (the threshold is <c>Join.AutoIndirectMinRowsPerKey</c>, 30).</summary>
+    private FuzzFailure CheckAutoMode(JoinIndexHarness h, int r)
+    {
+        JoinIndexStats stats = h.Stats().Join;
+        JoinStorageMode resolved = stats.ResolvedStorageMode ?? JoinStorageMode.Auto;
+        _resolved[resolved] = _resolved.GetValueOrDefault(resolved) + 1;
+
+        // the rows per key are those the build counted: a file that was opened again after a restart has no count, only its mode
+        if (stats.RowsPerKey is not { } rows)
+            return stats.StorageMode == JoinStorageMode.Auto && resolved is JoinStorageMode.Indirect or JoinStorageMode.Expanded ? null : new FuzzFailure(r, "AutoMode", $"mode {stats.StorageMode} resolved to {resolved}");
+
+        _rowsPerKey.Add((int)rows);
+        JoinStorageMode expected = rows >= 30 ? JoinStorageMode.Indirect : JoinStorageMode.Expanded;
+        if (stats.StorageMode != JoinStorageMode.Auto || resolved != expected)
+            return new FuzzFailure(r, "AutoMode", $"mode {stats.StorageMode} resolved to {stats.ResolvedStorageMode} with {stats.RowsPerKey?.ToString() ?? "no"} rows per key, the rule says {expected}");
+
+        return null;
+    }
+
+    /// <summary>A join index that a refresh found too costly to refresh is made again by the server (deleted and created): for a moment it does not exist, and a call that found it before may reach it disposed.</summary>
     private static async Task RetryWhileMissingAsync(Func<Task> action)
     {
         for (int i = 0; ; i++)
@@ -202,8 +278,9 @@ internal sealed class JoinFuzzRunner(RavenTestBase test, ITestOutputHelper outpu
                 await action();
                 return;
             }
-            catch (IndexDoesNotExistException) when (i < 1500)
+            catch (Exception e) when (i < 1500 && (e is IndexDoesNotExistException || e is RavenException && e.ToString().Contains("was already disposed")))
             {
+                // the index is gone, or it was disposed between the lookup of the handler and its call
                 await Task.Delay(20);
             }
         }
@@ -284,6 +361,9 @@ internal sealed class JoinFuzzRunner(RavenTestBase test, ITestOutputHelper outpu
         }
 
         ApplyResident(h, s);
+        if (IsAuto && Environment.GetEnvironmentVariable("RAVEN_JOIN_FUZZ_AUTO_FORCE") == null && CheckAutoMode(h, r) is { } autoFailure)
+            return autoFailure;
+
         var differences = new List<string>();
         foreach (FuzzQuery q in new[] { JoinFuzzQueries.Probe }.Concat(round.Queries))
         {
@@ -315,10 +395,21 @@ internal sealed class JoinFuzzRunner(RavenTestBase test, ITestOutputHelper outpu
         JoinIndexStats stats = h.Stats().Join;
         JoinIndex joinIndex = h.Join();
         var text = new StringBuilder();
+        if (IsAuto)
+            text.Append($"auto=[{string.Join(", ", _resolved.Select(x => x.Key + "=" + x.Value))}] rowsPerKey=[{string.Join(",", _rowsPerKey)}] ");
+
         text.Append($"queries={Queries} served={Served} residentListsChecked={ResidentListsChecked} fallbacks=[{string.Join(", ", stats.Fallbacks.Select(x => x.Key + "=" + x.Value))}] ");
         text.Append($"refreshes={joinIndex.Counters.Refreshes} partial={joinIndex.Counters.PartialRefreshes} builds={joinIndex.Counters.Builds} rebuilds=[{string.Join(", ", joinIndex.Counters.RebuildsByReason.Select(x => x.Key + "=" + x.Value))}] ");
         text.Append($"residentHits={stats.ResidentHits} residentMisses={stats.ResidentMisses} residentEpochMisses={stats.ResidentEpochMisses}");
         Summary = text.ToString();
         output.WriteLine(Summary);
+        string directory = Environment.GetEnvironmentVariable("RAVEN_JOIN_FUZZ_OUT");
+        if (IsAuto && string.IsNullOrWhiteSpace(directory) == false)
+        {
+            // one line per run, so that a batch run can be counted: how many runs had a build on each side of the threshold
+            Directory.CreateDirectory(directory);
+            lock (SummaryGate)
+                File.AppendAllText(Path.Combine(directory, "auto-summary.txt"), $"seed={_seed} dense={_dense} {text}{Environment.NewLine}");
+        }
     }
 }

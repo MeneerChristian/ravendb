@@ -16,7 +16,7 @@ namespace FastTests.Server.Documents.Indexing.Joins.Fuzz;
 /// are deleted and made again), restarts the database, resets the join index or one of its indexes, pauses the join index, then waits for the indexes, checks the invariant of the lists and compares the answers of the join index with those of the server.
 /// <para>
 /// Settings: RAVEN_JOIN_FUZZ_SEEDS (a comma separated list, replaces the fixed seeds 1 to 25), RAVEN_JOIN_FUZZ_EXTRA (this many more seeds from 1001), RAVEN_JOIN_FUZZ_ROUNDS (rounds per run, 8),
-/// RAVEN_JOIN_FUZZ_MINIMIZE (0 turns the minimization of a failure off), RAVEN_JOIN_FUZZ_OUT (a directory that gets a file for every failure).
+/// RAVEN_JOIN_FUZZ_MINIMIZE (0 turns the minimization of a failure off), RAVEN_JOIN_FUZZ_DENSE (1: the seeds that are 0, 1 or 2 modulo 4 run with 200 to 300 conversations on a few keys, as the Auto class does always), RAVEN_JOIN_FUZZ_OUT (a directory that gets a file for every failure).
 /// </para>
 /// </summary>
 public abstract class JoinIndexFuzzTestsBase(ITestOutputHelper output) : RavenTestBase(output)
@@ -54,7 +54,7 @@ public abstract class JoinIndexFuzzTestsBase(ITestOutputHelper output) : RavenTe
 
     private protected async Task RunAsync(FuzzShape shape, int seed)
     {
-        FuzzSettings settings = FuzzSettings.For(seed, shape, Rounds);
+        FuzzSettings settings = FuzzSettings.For(seed, shape, Rounds, this is IAutoModeTest || Environment.GetEnvironmentVariable("RAVEN_JOIN_FUZZ_DENSE") == "1");
         _output.WriteLine($"{GetType().Name}: {settings}");
         FuzzPlan plan = FuzzPlan.Create(settings);
         var runner = new JoinFuzzRunner(this, _output);
@@ -161,4 +161,9 @@ public class JoinIndexFuzzTestsIndirectCacheDefault(ITestOutputHelper output) : 
 public class JoinIndexFuzzTestsIndirectCacheTiny(ITestOutputHelper output) : JoinIndexFuzzTestsBase(output), IIndirectModeTest, IResidentModeTest
 {
     public ResidentMode ResidentMode => ResidentMode.Tiny;
+}
+
+/// <summary>The storage mode of the join index is Auto: Indirect is chosen at the build when a key has 30 rows or more (the seeds that are 0, 1 or 2 modulo 4 have 25 to 40 rows per key, the others a few), else Expanded. The first build sees the preload; every reset and restart builds again.</summary>
+public class JoinIndexFuzzTestsAuto(ITestOutputHelper output) : JoinIndexFuzzTestsBase(output), IAutoModeTest
+{
 }

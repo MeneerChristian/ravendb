@@ -101,7 +101,16 @@ internal sealed class FuzzSettings
 
     public int Rounds { get; init; }
 
-    public static FuzzSettings For(int seed, FuzzShape shape, int rounds)
+    /// <summary>
+    /// The rows per key of the outer entries (the Auto mode counts them at the build, the threshold is 30), by the seed modulo 4 when density is asked for: 0 many (about 40), 1 just above the threshold (about 33), 2 just below it (about 25), 3 spread (a few).
+    /// Without density every seed is spread.
+    /// </summary>
+    public bool Dense { get; init; }
+
+    /// <summary>The number of different codes (field join) or the number of contexts that the keys are drawn from (id join), before the few that do not exist. 0: the defaults.</summary>
+    public int KeySpace { get; init; }
+
+    public static FuzzSettings For(int seed, FuzzShape shape, int rounds, bool dense = false)
     {
         // the thresholds come from a generator of their own: the writes of the plan do not depend on them
         var random = new Random(seed * 7919 + 13);
@@ -112,6 +121,8 @@ internal sealed class FuzzSettings
         int[] patchDocuments = [1, 5, 40, 5_000];
         int[] contexts = [6, 16, 40];
         int[] conversations = [12, 40, 90];
+        int level = dense && shape != FuzzShape.OuterId ? seed & 3 : 3;
+        dense = level < 3;
         return new FuzzSettings
         {
             Seed = seed,
@@ -124,14 +135,16 @@ internal sealed class FuzzSettings
             MinAtomEntriesForDirectWrite = atomDirect[random.Next(atomDirect.Length)],
             MaxPatchDocuments = patchDocuments[random.Next(patchDocuments.Length)],
             Contexts = contexts[random.Next(contexts.Length)],
-            Conversations = conversations[random.Next(conversations.Length)],
-            Rounds = rounds
+            Conversations = level switch { 0 or 1 => 300, 2 => 200, _ => conversations[random.Next(conversations.Length)] },
+            Rounds = rounds,
+            Dense = dense,
+            KeySpace = level switch { 0 => 2, 1 => 3, 2 => 2, _ => 0 }
         };
     }
 
     public override string ToString() => $"seed={Seed} shape={Shape} arrays={Arrays} persistent={Persistent} MaxIdsPerCommit={MaxIds} MaxUnindexedIdsPerCommit={MaxUnindexedIds} " +
                                          $"MaxInnerListChangesPerOuterEntry={MaxInnerListChanges} MinAtomEntriesForDirectWrite={MinAtomEntriesForDirectWrite} MaxPatchDocuments={MaxPatchDocuments} " +
-                                         $"contexts={Contexts} conversations={Conversations} rounds={Rounds}";
+                                         $"contexts={Contexts} conversations={Conversations} rounds={Rounds} dense={Dense}";
 }
 
 internal sealed class FuzzPlan
@@ -169,7 +182,10 @@ internal sealed class FuzzPlan
         for (int r = 0; r <= s.Rounds; r++)
         {
             (string name, int[] weights) = r == 0 ? ("preload", Themes[0].Weights) : Themes[random.Next(Themes.Length)];
-            int count = r == 0 ? s.Contexts + s.Conversations / 2 : name switch
+            if (r == 0 && s.Dense)
+                weights = [60, 0, 0, 0, 10, 0, 0, 0];
+
+            int count = r == 0 ? (s.Dense ? 2 * s.Conversations + s.Contexts : s.Contexts + s.Conversations / 2) : name switch
             {
                 "wipeInner" => inner.Count,
                 "wipeOuter" => outer.Count,
@@ -362,16 +378,17 @@ internal sealed class FuzzPlan
         switch (s.Shape)
         {
             case FuzzShape.InnerId:
+                int space = s.KeySpace > 0 ? s.KeySpace : s.Contexts;
                 if (s.Arrays)
-                    return JoinIndexHarness.RandomKeys(random, s.Contexts);
+                    return JoinIndexHarness.RandomKeys(random, space);
 
-                int context = random.Next(2) == 0 ? 0 : random.Next(s.Contexts + 4);
+                int context = random.Next(2) == 0 ? 0 : random.Next(space + 4);
                 return random.Next(12) == 0 ? null : [$"contexts/{context}"];
             case FuzzShape.Field:
                 if (s.Arrays)
-                    return JoinIndexHarness.RandomCodes(random, 4);
+                    return JoinIndexHarness.RandomCodes(random, 4, s.KeySpace > 0 ? s.KeySpace : 7);
 
-                string code = JoinIndexHarness.RandomCode(random);
+                string code = JoinIndexHarness.RandomCode(random, s.KeySpace > 0 ? s.KeySpace : 7);
                 return code == null ? null : [code];
             default:
                 return null;
@@ -385,9 +402,9 @@ internal sealed class FuzzPlan
         {
             case FuzzShape.Field:
                 if (s.Arrays)
-                    return JoinIndexHarness.RandomCodes(random, 4);
+                    return JoinIndexHarness.RandomCodes(random, 4, s.KeySpace > 0 ? s.KeySpace : 7);
 
-                string code = JoinIndexHarness.RandomCode(random);
+                string code = JoinIndexHarness.RandomCode(random, s.KeySpace > 0 ? s.KeySpace : 7);
                 return code == null ? null : [code];
             case FuzzShape.OuterId:
                 return s.Arrays ? JoinIndexHarness.RandomConversationIds(random, 4, s.Conversations) : JoinIndexHarness.RandomConversationIds(random, 1, s.Conversations);
