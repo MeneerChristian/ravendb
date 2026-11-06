@@ -40,7 +40,7 @@ internal unsafe struct JoinOuterKeyLists : IResidentListSource, IDisposable
     }
 
     // the term of a key reference is the key of the file: its entry in the tree of the key field holds the id of the term, which is what a posting list is read by
-    private static bool TryFindTerm(JoinReader file, CompactTree tree, long keyRef, out long termId)
+    internal static bool TryFindTerm(JoinReader file, CompactTree tree, long keyRef, out long termId)
     {
         Span<byte> term = stackalloc byte[Raven.Client.Documents.Indexes.JoinLimits.MaxTermLength];
         int length = file.CopyKey(keyRef, term);

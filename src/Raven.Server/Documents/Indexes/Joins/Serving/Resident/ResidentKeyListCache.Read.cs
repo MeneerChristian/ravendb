@@ -2,6 +2,7 @@ using System;
 using System.Buffers;
 using System.Numerics;
 using System.Threading;
+using Sparrow.Server;
 
 namespace Raven.Server.Documents.Indexes.Joins.Serving.Resident;
 
@@ -189,6 +190,81 @@ public sealed unsafe partial class ResidentKeyListCache
         {
             _lock.ExitWriteLock();
         }
+    }
+
+    private const long MaxHeadIds = 512 * 1024;
+
+    /// <summary>
+    /// The first <paramref name="perList"/> entries of every key from the resident lists, one run after the other in <paramref name="ids"/> (ascending in each run), <paramref name="ends"/> being where each run ends,
+    /// and <paramref name="total"/> the number of entries of all the lists. False, with nothing read, when the epoch is not the snapshot of the reader or one of the keys has no resident list.
+    /// The memory belongs to <paramref name="allocator"/>.
+    /// </summary>
+    public bool TryReadHeads(Guid outerEnvironmentId, long outerTransactionId, long atomCode, ReadOnlySpan<long> keyRefs, int perList, ByteStringContext allocator, out long* ids, out int* ends, out long total)
+    {
+        ids = null;
+        ends = null;
+        total = 0;
+        _rates?.RecordRead(atomCode);
+        using ReadLease lease = TryBeginRead(outerEnvironmentId, outerTransactionId);
+        if (lease.IsValid == false)
+            return false;
+
+        long need = 0;
+        for (int i = 0; i < keyRefs.Length; i++)
+        {
+            int count = CountOfShared(keyRefs[i]);
+            if (count < 0)
+            {
+                Interlocked.Increment(ref _misses);
+                return false;
+            }
+
+            need += Math.Min(count, perList);
+            total += count;
+        }
+
+        if (need > MaxHeadIds)
+            return false;
+
+        allocator.Allocate((int)(Math.Max(need, 1) * sizeof(long)), out ByteString idMemory);
+        allocator.Allocate(keyRefs.Length * sizeof(int), out ByteString endMemory);
+        var idBuffer = (long*)idMemory.Ptr;
+        var endBuffer = (int*)endMemory.Ptr;
+        int written = 0;
+        for (int i = 0; i < keyRefs.Length; i++)
+        {
+            ref Slot s = ref _slots[Find(keyRefs[i])];
+            s.Referenced = 1;
+            int take = Math.Min(s.Count, perList);
+            if (s.Form == 0)
+            {
+                var source = (uint*)s.Data;
+                for (int j = 0; j < take; j++)
+                    idBuffer[written + j] = source[j];
+            }
+            else
+            {
+                var source = (ulong*)s.Data;
+                int got = 0;
+                for (int w = 0; w < s.Capacity && got < take; w++)
+                {
+                    ulong word = source[w];
+                    while (word != 0 && got < take)
+                    {
+                        idBuffer[written + got++] = ((long)w << 6) + BitOperations.TrailingZeroCount(word);
+                        word &= word - 1;
+                    }
+                }
+            }
+
+            written += take;
+            endBuffer[i] = written;
+        }
+
+        Interlocked.Add(ref _hits, keyRefs.Length);
+        ids = idBuffer;
+        ends = endBuffer;
+        return true;
     }
 
     // the lists that a union reads from the store are inserted this many at a time, and not more ids than a pooled buffer holds, so the write lock is taken once for them and not once for each

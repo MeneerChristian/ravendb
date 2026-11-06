@@ -39,13 +39,16 @@ internal static unsafe class JoinKeyUnion
             case JoinEntriesMatch entries:
                 restarted = entries.Restarted();
                 return true;
+            case JoinLazyKeysMatch lazy:
+                restarted = lazy.Restarted();
+                return true;
             default:
                 restarted = null;
                 return false;
         }
     }
 
-    public static IQueryMatch Create(IndexSearcher outer, JoinReader snapshot, ReadOnlySpan<long> keys, string outerField, JoinResidentRead resident = default, Action<ResidentUnion> onResident = null)
+    public static IQueryMatch Create(IndexSearcher outer, JoinReader snapshot, ReadOnlySpan<long> keys, string outerField, JoinResidentRead resident = default, Action<ResidentUnion> onResident = null, bool disjoint = false)
     {
         if (keys.Length == 0)
             return outer.EmptyMatch();
@@ -54,6 +57,17 @@ internal static unsafe class JoinKeyUnion
         CompactTree tree = outer.GetTermsFor(field);
         if (tree == null)
             return outer.EmptyMatch();
+
+        // the entries of one key are its posting list in the outer index: ascending, without repeats, counted by its header. It is streamed as it is, nothing is copied or set in a bitmap
+        if (keys.Length == 1)
+            return JoinOuterKeyLists.TryFindTerm(snapshot, tree, keys[0], out long termId) ? outer.TermQueryOfTermId(termId) : outer.EmptyMatch();
+
+        if (disjoint && resident.IsUsable && keys.Length <= MaxLazyKeys)
+        {
+            IQueryMatch lazy = CreateLazy(outer, snapshot, keys, outerField, resident, onResident);
+            if (lazy != null)
+                return lazy;
+        }
 
         FieldMetadata metadata = outer.FieldMetadataBuilder(outerField);
         long bitmapBytes = (outer.LastEntryId + 1 + 63) / 64 * sizeof(ulong);
@@ -112,6 +126,31 @@ internal static unsafe class JoinKeyUnion
         {
             scratch.Dispose();
         }
+    }
+
+    private const int MaxLazyKeys = 16 * 1024;
+
+    /// <summary>The entries that a page reads are taken from the first entries of the lists, which are copied. Reading more is the union made the usual way.</summary>
+    internal const int LazyEntriesPerList = 64;
+
+    // Null when a list is not resident or the cache is not at the snapshot of the reader: the union is made the usual way
+    private static IQueryMatch CreateLazy(IndexSearcher outer, JoinReader snapshot, ReadOnlySpan<long> keys, string outerField, JoinResidentRead resident, Action<ResidentUnion> onResident)
+    {
+        resident.Resident.Follow(resident, outer.LastEntryId);
+        if (resident.Cache.TryReadHeads(resident.Scope, resident.OuterTransactionId, resident.AtomCode, keys, LazyEntriesPerList, outer.Allocator, out long* ids, out int* ends, out long total) == false)
+            return null;
+
+        onResident?.Invoke(new ResidentUnion { EpochHit = true, KeysFromCache = keys.Length });
+        if (total == 0)
+            return outer.EmptyMatch();
+
+        // the keys outlive this call: the usual union is made from them when a reader takes more entries than the copies hold
+        outer.Allocator.Allocate(keys.Length * sizeof(long), out ByteString keyMemory);
+        keys.CopyTo(new Span<long>(keyMemory.Ptr, keys.Length));
+        var keyCopy = (long*)keyMemory.Ptr;
+        int keyCount = keys.Length;
+        return new JoinLazyKeysMatch(outer.Allocator, ids, ends, keyCount, LazyEntriesPerList, total,
+            () => Create(outer, snapshot, new ReadOnlySpan<long>(keyCopy, keyCount), outerField, resident, onResident, disjoint: false));
     }
 
     // The bitmap is the words that the cache ORs the lists into: the resident lists when the snapshot of the query is the epoch of the cache, the store (the outer index of this very snapshot) for the rest

@@ -173,9 +173,11 @@ internal static class JoinServing
         if (indirect && target.Resident != null && snapshot is JoinIndexSnapshot file)
             resident = target.Resident.ReadOf(request.Outer.EnvironmentId, request.Outer.TransactionId, file.Seed, predicate.Kind == JoinPredicateKind.Any ? JoinReader.AtomOfAny() : 0, request.Outer.Consumed);
 
+        // no outer entry is in the lists of two keys when no row has two keys, in the outer snapshot that the file was built for, which is the one of the query
+        bool disjointKeys = indirect && fieldJoin && severalKeys == false && target.Generation.Outer.CompareTo(request.Outer.Consumed) == GenerationComparison.Equal;
         var memo = new KeyMatchMemo();
         return new JoinServed(
-            (outer, scoreNeeded) => CreateMatch(outer, scoreNeeded, snapshot, predicate, request, boost, fieldJoin ? severalKeys : severalJoined, verifyGroups, resident, memo),
+            (outer, scoreNeeded) => CreateMatch(outer, scoreNeeded, snapshot, predicate, request, boost, fieldJoin ? severalKeys : severalJoined, verifyGroups, resident, memo, disjointKeys),
             () => $"join index '{target.Name}' generation {serial}, {predicate}",
             request.Timings == null ? null : new Dictionary<string, long> { ["JoinIndexServed"] = 1, ["JoinIndexGeneration"] = serial },
             // a single list or a union of terms holds existing entries once each; an AND, an OR or a NOT of lists may repeat entries, which the server removes when it intersects the match with all entries.
@@ -260,7 +262,7 @@ internal static class JoinServing
     }
 
     private static IQueryMatch CreateMatch(IndexSearcher outer, bool scoreNeeded, JoinReader snapshot, JoinPredicate predicate, JoinServeRequest request, float boost, bool severalJoined,
-        bool verifyGroups, JoinResidentRead resident, KeyMatchMemo memo)
+        bool verifyGroups, JoinResidentRead resident, KeyMatchMemo memo, bool disjointKeys)
     {
         if (scoreNeeded && severalJoined)
             throw new InvalidOperationException("The score of the join was asked for and an outer entry is joined with several documents, which the join index cannot add.");
@@ -286,7 +288,7 @@ internal static class JoinServing
                     request.Timings?.AddCounter("JoinResidentKeys", union.KeysFromCache);
                     request.Timings?.AddCounter("JoinStoreKeys", union.KeysFromStore);
                     request.Timings?.AddCounter("JoinResidentEpochHit", union.EpochHit ? 1 : 0);
-                });
+                }, disjointKeys);
 
                 if (request.Timings != null)
                 {
