@@ -91,7 +91,21 @@ public sealed class JoinIndex : Index<JoinIndexDefinition, JoinIndexField>
 
     internal JoinDefinition Join => Definition.IndexDefinition.Join;
 
-    internal JoinPlan Plan => _plan ??= new JoinPlan(Join, Options.ResolveMode(Join));
+    internal JoinPlan Plan
+    {
+        get
+        {
+            JoinPlan plan = Volatile.Read(ref _plan);
+            if (plan != null)
+                return plan;
+
+            // the plan holds the mode that the build chose: every thread must get the plan that the refresh chooses on
+            lock (_planLock)
+                return _plan ??= new JoinPlan(Join, Options.ResolveMode(Join));
+        }
+    }
+
+    private readonly object _planLock = new();
 
     /// <summary>
     /// For a join index whose mode is left to the build: looks at the outer index (the entries and the distinct keys of its key field) and the memory now, and sets the mode of the file that is built. Does nothing
@@ -136,10 +150,22 @@ public sealed class JoinIndex : Index<JoinIndexDefinition, JoinIndexField>
 
     private readonly JoinMemory _memory = new();
 
-    internal JoinIncrementalRefresh Engine => _engine ??= new JoinIncrementalRefresh(Plan, Options, DocumentDatabase.DocumentsStorage, Counters)
+    internal JoinIncrementalRefresh Engine
     {
-        AvailableMemoryBytes = () => _memory.AvailableBytes(DocumentDatabase.ServerStore.Server.MetricCacher.GetValue<MemoryInfoResult>(MetricCacher.Keys.Server.MemoryInfo).AvailableMemoryForProcessing.GetValue(SizeUnit.Bytes))
-    };
+        get
+        {
+            JoinIncrementalRefresh engine = Volatile.Read(ref _engine);
+            if (engine != null)
+                return engine;
+
+            JoinPlan plan = Plan;
+            lock (_planLock)
+                return _engine ??= new JoinIncrementalRefresh(plan, Options, DocumentDatabase.DocumentsStorage, Counters)
+                {
+                    AvailableMemoryBytes = () => _memory.AvailableBytes(DocumentDatabase.ServerStore.Server.MetricCacher.GetValue<MemoryInfoResult>(MetricCacher.Keys.Server.MemoryInfo).AvailableMemoryForProcessing.GetValue(SizeUnit.Bytes))
+                };
+        }
+    }
 
     protected override void OnInitialization()
     {

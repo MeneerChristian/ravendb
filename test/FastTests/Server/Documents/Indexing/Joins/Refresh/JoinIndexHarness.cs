@@ -335,6 +335,14 @@ public sealed class JoinIndexHarness : IDisposable
         }
     }
 
+    /// <summary>Waits until the indexes have indexed everything that was written, so that what a join index is built from (the entries of the outer index, and the mode that Auto chooses from them) is the data of the test.</summary>
+    public async Task WaitUntilIndexesAreCurrentAsync(TimeSpan? timeout = null)
+    {
+        DateTime until = DateTime.UtcNow + (timeout ?? TimeSpan.FromSeconds(60));
+        await Task.Run(() => WaitUntilNotStale(until));
+        Assert.False(Store.Maintenance.Send(new GetIndexesStatisticsOperation()).Any(x => x.IsStale), "the indexes are still stale");
+    }
+
     private void WaitUntilNotStale(DateTime until)
     {
         while (DateTime.UtcNow < until)

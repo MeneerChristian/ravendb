@@ -151,6 +151,7 @@ public class JoinAutoModeTests(ITestOutputHelper output) : RavenTestBase(output)
         for (int i = 0; i < keys * rowsPerKey; i++)
             h.PutConversation(i, idJoin ? $"contexts/{i % keys}" : $"k{i % keys}", "t" + i % 3);
 
+        await h.WaitUntilIndexesAreCurrentAsync();
         await h.PutJoinAsync(idJoin ? JoinIndexHarness.JoinIndexDefinition() : JoinIndexHarness.FieldJoinIndexDefinition());
         await h.AssertCurrentAsync();
         JoinIndex joinIndex = h.Join();
@@ -289,6 +290,46 @@ public class JoinAutoModeTests(ITestOutputHelper output) : RavenTestBase(output)
             Assert.Equal(JoinStorageMode.Auto, joinIndex.StorageMode);
             Assert.Equal(JoinStorageMode.Expanded, joinIndex.ResolvedStorageMode);
             Assert.InRange(joinIndex.RowsPerKey.Value, 1, 29);
+        }
+    }
+
+    private static void ForgetThePlan(JoinIndex joinIndex)
+    {
+        // the plan and the engine are made again on first use, from the definition, as the first users of a join index find them
+        foreach (string name in new[] { "_plan", "_engine" })
+            typeof(JoinIndex).GetField(name, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic).SetValue(joinIndex, null);
+    }
+
+    [RavenFact(RavenTestCategory.Indexes)]
+    public async Task TheFirstUsersOfThePlanOnSeveralThreadsGetTheSamePlan()
+    {
+        (_, JoinIndex joinIndex) = await BuildAsync(this, keys: 3, rowsPerKey: 40, idJoin: true);
+        using (_harness)
+        {
+            const int threads = 8;
+            for (int round = 0; round < 200; round++)
+            {
+                ForgetThePlan(joinIndex);
+                using var barrier = new Barrier(threads);
+                var plans = new JoinPlan[threads];
+                var workers = new Thread[threads];
+                for (int t = 0; t < threads; t++)
+                {
+                    int slot = t;
+                    workers[t] = new Thread(() =>
+                    {
+                        barrier.SignalAndWait();
+                        plans[slot] = joinIndex.Plan;
+                    });
+                    workers[t].Start();
+                }
+
+                foreach (Thread worker in workers)
+                    worker.Join();
+
+                for (int t = 1; t < threads; t++)
+                    Assert.True(ReferenceEquals(plans[0], plans[t]), $"round {round}: the threads got different plans");
+            }
         }
     }
 }
