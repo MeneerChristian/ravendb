@@ -71,6 +71,9 @@ internal sealed class JoinRefreshWork(JoinIndex index) : IIndexingWork
         JoinPlan plan = index.Plan;
         if (JoinFileRows.Exists(indexContext.Transaction.InnerTransaction) == false)
             index.ChooseBuildMode(outer, plan);
+        else if (plan.Definition.StorageMode == JoinStorageMode.Auto && JoinFileRows.ReadMode(indexContext.Transaction.InnerTransaction) is { } fileMode && fileMode != plan.BuildMode
+                 && fileMode is JoinStorageMode.Expanded or JoinStorageMode.Indirect)
+            plan.ChooseBuildMode(fileMode);
 
         var file = new JoinIndexFile(indexContext.Transaction.InnerTransaction, plan.SchemaOfFile(indexContext.Transaction.InnerTransaction));
         JoinIndexGeneration published = file.Published;
