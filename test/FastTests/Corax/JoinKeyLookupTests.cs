@@ -177,6 +177,23 @@ public class JoinKeyLookupTests : StorageTest
         }
     }
 
+    [RavenTheory(RavenTestCategory.Corax)]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void JoinFirstEntriesOfKeysThatAreNotInTheTreeIsEmpty(bool countTotal, bool membershipByKey)
+    {
+        using var searcher = new IndexSearcher(Env, CreateKnownFields(Allocator));
+        var metadata = searcher.GetFieldMetadata("Owner");
+        using var keys = new JoinTermScores(searcher.Allocator);
+        for (var i = 0; i < 100; i++)
+            keys.Add(Encoding.UTF8.GetBytes($"missing/{i}"), 1f);
+
+        Assert.True(searcher.TryJoinFirstEntries(metadata, keys, keysAreIndexedTerms: false, useEncodedKeys: false, membershipByKey, where: null, take: 10, countTotal, out var match));
+        Assert.Equal(0, match.TotalResults);
+        Assert.Equal(0, match.Fill(new long[16]));
+    }
+
     [RavenFact(RavenTestCategory.Corax)]
     public void TheAnalyzerThatChangesTheOrderStartsAgainFromTheRoot()
     {

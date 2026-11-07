@@ -393,6 +393,13 @@ public partial class IndexSearcher
                     }
                 }
 
+                if (found.Count == 0)
+                {
+                    Probed = true;
+                    TotalKnown = true;
+                    return;
+                }
+
                 // keys that differ in case only are looked up as the same term, which is counted once
                 var terms = found.ToSpan();
                 Sort.Run(terms);
